@@ -1,0 +1,319 @@
+"""Run-scoped match and dependency facts shared by candidate attempts and graph construction."""
+
+from collections.abc import Callable, Hashable, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from types import TracebackType
+from typing import Any, TypeVar
+from uuid import uuid4
+
+from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_collection import Features
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import COLUMN_SEPARATOR
+from mloda.core.abstract_plugins.components.input_data.match_cache import run_cached
+from mloda.core.abstract_plugins.components.input_data.reader_probe import current_reader_probe_scope
+from mloda.core.abstract_plugins.components.link import Link
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.components.var_scope import VarScope
+from mloda.core.abstract_plugins.components.property_spec import unforwarded_keys
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.abstract_plugins.implementation import current_implementations
+from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
+from mloda.core.prepare.resolution_types import EvaluationResult
+
+
+T = TypeVar("T")
+EnvironmentKey = tuple[Any, ...]
+_CACHE = object()
+_ENVIRONMENT = object()
+_CYCLE = object()
+_PLUGINS = object()
+_FLAT_CONTAINERS = frozenset({list, tuple, set, frozenset})
+_SCALAR_TYPES = frozenset({int, str, float, bool, bytes, type(None)})
+_RUN: ContextVar[Any] = ContextVar("input_chain_run", default=None)
+
+
+def input_resolution_scope(run: Any) -> VarScope[Any]:
+    """A nested Engine has its own collector and extenders even inside an outer match cache."""
+    return VarScope(_RUN, run)
+
+
+@dataclass(frozen=True, eq=False)
+class _Identity:
+    """Keep an unhashable run resource alive as well as distinguishing it by identity."""
+
+    value: Any
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Identity) and self.value is other.value
+
+
+def resolution_key(value: Any, seen: frozenset[int] = frozenset(), *, options_key: Any = None) -> Any:
+    """Snapshot resolution inputs; Feature/Options equality intentionally omits some of them."""
+    if isinstance(value, (Feature, Options, dict, list, tuple, set, frozenset)):
+        if id(value) in seen:
+            return _CYCLE
+        seen = seen | {id(value)}
+    if type(value) in _FLAT_CONTAINERS:
+        element_types = set(map(type, value))
+        if element_types and element_types <= _SCALAR_TYPES:
+            copy = tuple if type(value) in (list, tuple) else frozenset
+            if len(element_types) == 1:
+                (element_type,) = element_types
+                return type(value), element_type, copy(value)
+            return type(value), copy(zip(map(type, value), value))
+    if isinstance(value, Feature):
+        return (
+            Feature,
+            str(value.name),
+            resolution_key(value.options, seen) if options_key is None else options_key,
+            value.feature_group_scope,
+            resolution_key(value.required_declarations, seen),
+            value.domain,
+            None if value.compute_frameworks is None else frozenset(value.compute_frameworks),
+            value.implementation_pin,
+            value.data_type,
+            value.forward_group,
+            value.forward_group_exclude,
+            value.inherit_context_keys,
+            value.link,
+        )
+    if isinstance(value, Options):
+        # Includes context, forwarding/provenance flags, and provider-owned Options subclass fields.
+        return type(value), resolution_key(value.__dict__, seen)
+    if isinstance(value, dict):
+        return type(value), frozenset((resolution_key(k, seen), resolution_key(v, seen)) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return type(value), tuple(resolution_key(v, seen) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return type(value), frozenset(resolution_key(v, seen) for v in value)
+    try:
+        hash(value)
+    except Exception:  # Swallows: an optional memo key must not reject an otherwise valid provider value.
+        # repr() is only a hash fallback elsewhere; it cannot establish value equality for a cache.
+        return type(value), _Identity(value)
+    return type(value), value
+
+
+def _plugin_universe(accessible_plugins: FeatureGroupEnvironmentMapping) -> frozenset[Any]:
+    # The mapping is fixed after pre-filtering; the length key only catches a group added or removed in place.
+    return frozenset((group, frozenset(frameworks)) for group, frameworks in accessible_plugins.items())
+
+
+def resolution_environment(
+    accessible_plugins: FeatureGroupEnvironmentMapping,
+    links: set[Link] | None,
+    data_access_collection: DataAccessCollection | None,
+    excluded: Mapping[type[FeatureGroup], str] | None = None,
+) -> EnvironmentKey:
+    """A nested or standalone resolution must not borrow another run's grants or plugin universe."""
+    environment = (
+        _Identity(_RUN.get()),
+        run_cached(
+            (_PLUGINS, _Identity(accessible_plugins), len(accessible_plugins)),
+            lambda: _plugin_universe(accessible_plugins),
+        ),
+        None if links is None else frozenset(links),
+        _Identity(data_access_collection),
+        _Identity(current_reader_probe_scope()),
+        frozenset(current_implementations()),
+        frozenset((excluded or {}).items()),
+    )
+    return run_cached((_ENVIRONMENT, environment), lambda: environment)
+
+
+@dataclass(frozen=True)
+class _InputFactFailure:
+    error: Exception
+    traceback: TracebackType | None
+
+
+def cached_input_fact(environment: EnvironmentKey, kind: str, key: Hashable, compute: Callable[[], T]) -> T:
+    """Memoize successes and exact exceptions without choosing their containment policy."""
+
+    def capture() -> T | _InputFactFailure:
+        try:
+            return compute()
+        except Exception as exc:  # Swallows: store the exact exception until this helper immediately re-raises it.
+            return _InputFactFailure(exc, exc.__traceback__)
+
+    outcome = run_cached((_CACHE, environment, kind, key), capture)
+    if isinstance(outcome, _InputFactFailure):
+        raise outcome.error.with_traceback(outcome.traceback)
+    return outcome
+
+
+def _cached_success(environment: EnvironmentKey, kind: str, key: Hashable, compute: Callable[[], T]) -> T:
+    """Memoize successes only; a raise propagates live so a retry recomputes from the plugin's own frame."""
+    return run_cached((_CACHE, environment, kind, key), compute)
+
+
+@dataclass(frozen=True)
+class _NameOutcome:
+    name: FeatureName
+    part: str | None
+    options: Options
+
+
+def normalize_input_name(
+    environment: EnvironmentKey,
+    feature: Feature,
+    feature_group: FeatureGroup,
+    output_part: tuple[str, str] | None,
+    *,
+    options_key: Any = None,
+) -> None:
+    requested = feature.name
+    if options_key is None:
+        options_key = resolution_key(feature.options)
+    key = type(feature_group), str(requested), options_key, output_part
+
+    def compute() -> _NameOutcome:
+        options = feature.options._fork()
+        name = FeatureName(output_part[0]) if output_part is not None else requested
+        try:
+            name = feature_group.set_feature_name(options, name)
+        except Exception:  # Swallows nothing: adopt the fork's options, then raise live so no failure is cached.
+            feature.options._adopt(options)
+            raise
+        part = output_part[1] if output_part is not None else None
+        if output_part is None and name != requested and requested.startswith(f"{name}{COLUMN_SEPARATOR}"):
+            part = requested[len(name) + 1 :]
+        return _NameOutcome(name, part, options)
+
+    outcome = _cached_success(environment, "name", key, compute)
+    feature.options._adopt(outcome.options)
+    feature.name = outcome.name
+    if outcome.part is not None:
+        feature.record_part(outcome.part)
+
+
+@dataclass
+class _InputTemplate:
+    feature: Feature
+    source: Feature
+    materialized: bool = False
+
+
+@dataclass(frozen=True)
+class _InputDeclaration:
+    entries: tuple[_InputTemplate | str, ...] | None
+    options: Options
+
+
+def _copy_input(feature: Feature, *, fresh_identity: bool = False) -> Feature:
+    fresh = feature.copy_for_plan()
+    if fresh_identity:
+        fresh.uuid = uuid4()
+    return fresh
+
+
+def declared_inputs(
+    environment: EnvironmentKey,
+    feature_group: type[FeatureGroup],
+    options: Options,
+    feature_name: FeatureName,
+    *,
+    materialize: bool = False,
+) -> tuple[Feature | str, ...] | None:
+    """Snapshot declarations for preflight; real expansion retains the provider's live input references."""
+    key = feature_group, str(feature_name), resolution_key(options)
+
+    def compute() -> _InputDeclaration:
+        forked = options._fork()
+        try:
+            returned = feature_group().input_features(forked, feature_name)
+            if returned is None:
+                return _InputDeclaration(None, forked)
+            entries: list[Feature | str] = list(returned)
+            if isinstance(returned, (set, frozenset)):
+                entries.sort(key=lambda item: str(item.name) if isinstance(item, Feature) else str(item))
+            return _InputDeclaration(
+                tuple(
+                    _InputTemplate(_copy_input(item), item) if isinstance(item, Feature) else item for item in entries
+                ),
+                forked,
+            )
+        except Exception:  # Swallows nothing: adopt the fork's options, then raise live so no failure is cached.
+            options._adopt(forked)
+            raise
+
+    outcome = _cached_success(environment, "declaration", key, compute)
+    options._adopt(outcome.options)
+    if outcome.entries is None:
+        return None
+    entries: list[Feature | str] = []
+    for item in outcome.entries:
+        if isinstance(item, _InputTemplate):
+            if materialize and not item.materialized:
+                item.materialized = True
+                feature = item.source
+                if feature.options is outcome.options:
+                    feature.options = options
+            else:
+                # Replaying a cached declaration for another parent must not reuse its graph UUID or domain.
+                feature = _copy_input(item.feature, fresh_identity=True)
+            entries.append(feature)
+        else:
+            entries.append(item)
+    return tuple(entries)
+
+
+def input_features_collection(
+    feature_group: type[FeatureGroup],
+    entries: tuple[Feature | str, ...],
+    parent: Feature,
+) -> Features:
+    """Use Features' real inheritance, including context directives and parent-domain propagation."""
+    for entry in entries:
+        if isinstance(entry, Feature) and entry.connection is not None:
+            raise ValueError(
+                f"{feature_group.get_class_name()}.input_features returned '{entry.name}' with a "
+                "connection; register it in the DataAccessCollection and set the 'connection_handle' option."
+            )
+    return Features(
+        list(entries),
+        child_options=parent.options,
+        child_uuid=parent.uuid,
+        parent_domain=parent.domain.name if parent.domain is not None else None,
+        consumer_local_keys=unforwarded_keys(feature_group.PROPERTY_MAPPING),
+    )
+
+
+@dataclass(frozen=True)
+class InputChainOutcome:
+    viable: bool
+    computing: bool
+    reason: str = ""
+    refusals: tuple[Exception, ...] = ()
+    # A back edge is provisionally viable, but cannot seed a completed-success memo.
+    pending: frozenset[Hashable] = frozenset()
+    variants: tuple[str, ...] = ()
+    allow_variants: tuple[str, ...] = ()
+
+
+def input_variant_block(result: EvaluationResult) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The union of variants an unresolvable input was blocked by, and the allow list only if it fixes every block."""
+    if result.failure_kind != "none":
+        return (), ()
+    blocked = [elimination for elimination in result.eliminations.values() if elimination.variants]
+    variants = tuple(sorted({name for elimination in blocked for name in elimination.variants}))
+    if not all(elimination.allow_variants for elimination in blocked):
+        return variants, ()
+    return variants, tuple(sorted({name for elimination in blocked for name in elimination.allow_variants}))
+
+
+@dataclass
+class InputChainState:
+    active: set[Hashable] = field(default_factory=set)
+    active_features: dict[Hashable, set[Hashable]] = field(default_factory=dict)
+    completed: dict[Hashable, InputChainOutcome] = field(default_factory=dict)
+
+
+def input_chain_state(environment: EnvironmentKey) -> InputChainState:
+    return cached_input_fact(environment, "chains", (), InputChainState)

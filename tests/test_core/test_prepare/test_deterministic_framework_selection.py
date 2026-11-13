@@ -1,0 +1,2384 @@
+"""One compute framework wins every reduction, whatever the set iteration order.
+Set iteration over class objects is id-based, so the reduction ranks candidates first
+and breaks remaining ties by class name.
+"""
+
+import copy
+import importlib
+import inspect
+import sqlite3
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+from uuid import uuid4
+from typing import Any, ClassVar
+from unittest.mock import MagicMock, create_autospec
+
+import pandas as pd
+import pyarrow as pa
+import pytest
+
+from mloda.provider import FeatureSet, DataCreatorFeatureGroup
+from mloda.user import DataAccessCollection, DataType, GlobalFilter, Index, Options, PluginCollector, mloda
+
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.framework_transformer.base_transformer import BaseTransformer
+from mloda.core.abstract_plugins.components.framework_transformer.cfw_transformer import ComputeFrameworkTransformer
+from mloda.core.abstract_plugins.components.input_data.file_source import FileSource
+from mloda.core.abstract_plugins.components.link import JoinSpec, Link
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework, framework_rank_key
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.api.plan_info import PlanStep
+from mloda.core.core.engine import Engine
+from mloda.core.core.step.feature_group_step import FeatureGroupStep
+from mloda.core.prepare.accessible_plugins import EnvironmentPreconditionError, PreFilterPlugins
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+from mloda_plugins.feature_group.input_data.file_formats.csv_fg import CsvFG
+from tests.helpers.probe_runner import run_probes
+
+_PROBE = Path(__file__).with_name("determinism_probe.py")
+# Each probe is a fresh interpreter importing PyArrowTable, so the count is what the gate budget allows.
+_PROBE_PROCESSES = 5
+_PROBE_EXPECTED = {"feature": "PyArrowTable", "trekker_left": "PyArrowTable", "trekker_right": "PyArrowTable"}
+
+
+def _throwaway_frameworks() -> tuple[type[ComputeFramework], ...]:
+    """Defined per call and unavailable, so discovery never sees them; Zz sorts behind every shipped name."""
+
+    class ZzZuluThrowawayFramework(ComputeFramework):
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class ZzAlfaThrowawayFramework(ComputeFramework):
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class ZzTangoThrowawayFramework(ComputeFramework):
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class ZzBravoThrowawayFramework(ComputeFramework):
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    # Definition order deliberately disagrees with name order.
+    return (ZzZuluThrowawayFramework, ZzAlfaThrowawayFramework, ZzTangoThrowawayFramework, ZzBravoThrowawayFramework)
+
+
+def _same_name_frameworks() -> tuple[type[ComputeFramework], type[ComputeFramework]]:
+    """Two frameworks sharing a class name, separated only by qualname."""
+
+    def alfa() -> type[ComputeFramework]:
+        class ZzSharedNameThrowawayFramework(ComputeFramework):
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        return ZzSharedNameThrowawayFramework
+
+    def bravo() -> type[ComputeFramework]:
+        class ZzSharedNameThrowawayFramework(ComputeFramework):
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        return ZzSharedNameThrowawayFramework
+
+    return alfa(), bravo()
+
+
+def _same_name_and_qualname_frameworks() -> tuple[type[ComputeFramework], type[ComputeFramework]]:
+    """Two frameworks identical in class name and qualname, separated only by module."""
+
+    def make(module: str) -> type[ComputeFramework]:
+        class ZzSharedModuleThrowawayFramework(ComputeFramework):
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        ZzSharedModuleThrowawayFramework.__module__ = module
+        return ZzSharedModuleThrowawayFramework
+
+    return make("zz_module_b"), make("zz_module_a")
+
+
+def _pick(
+    candidates: Iterable[type[ComputeFramework]], positions: dict[type[ComputeFramework], int] | None = None
+) -> type[ComputeFramework]:
+    return min(candidates, key=framework_rank_key(positions or {}))
+
+
+def test_rank_key_ignores_input_order() -> None:
+    forward = _pick([PandasDataFrame, PyArrowTable])
+    backward = _pick([PyArrowTable, PandasDataFrame])
+
+    assert forward is backward
+    assert forward is PandasDataFrame
+
+
+def test_rank_key_returns_the_expected_name() -> None:
+    zulu, alfa, tango, bravo = _throwaway_frameworks()
+    expectations: list[tuple[tuple[type[ComputeFramework], ...], str]] = [
+        ((zulu, alfa), "ZzAlfaThrowawayFramework"),
+        ((zulu, tango), "ZzTangoThrowawayFramework"),
+        ((tango, bravo), "ZzBravoThrowawayFramework"),
+        ((zulu, tango, bravo), "ZzBravoThrowawayFramework"),
+        ((zulu, alfa, tango, bravo), "ZzAlfaThrowawayFramework"),
+    ]
+
+    for group, expected in expectations:
+        assert _pick(set(group)).get_class_name() == expected
+
+
+def test_rank_key_breaks_a_shared_class_name_by_qualname() -> None:
+    """A shared class name would otherwise fall back to input order, which for a set is id-based."""
+    alfa, bravo = _same_name_frameworks()
+
+    forward = _pick([alfa, bravo])
+    backward = _pick([bravo, alfa])
+
+    assert forward is backward
+    assert forward is alfa
+    assert ".alfa." in forward.__qualname__, forward.__qualname__
+
+
+def test_rank_key_breaks_a_shared_name_and_qualname_by_module() -> None:
+    module_b, module_a = _same_name_and_qualname_frameworks()
+    assert module_a.__qualname__ == module_b.__qualname__
+
+    for order in ([module_b, module_a], [module_a, module_b]):
+        assert _pick(order) is module_a
+
+
+def test_the_throwaway_frameworks_stay_out_of_plugin_discovery() -> None:
+    """get_cfw_subclasses is what planning consults; nothing this module defines may reach it."""
+    held = set(_throwaway_frameworks()) | set(_same_name_frameworks()) | set(_same_name_and_qualname_frameworks())
+
+    discovered = PreFilterPlugins.get_cfw_subclasses()
+
+    assert not discovered & held, f"test-only frameworks reached discovery: {discovered & held}"
+    leaked = sorted(cfw.get_class_name() for cfw in discovered if cfw.__module__ == __name__)
+    assert leaked == [], f"test-only frameworks leaked into plugin discovery: {leaked}"
+
+
+def test_a_link_between_unrestricted_roots_joins_both_sides_on_the_expected_framework() -> None:
+    steps = _plan(["lku_out"], _LKU_GROUPS, [PandasDataFrame, PyArrowTable], links=_lku_links())
+
+    assert _compute_names(steps, LkuLeftRoot) == {"PandasDataFrame"}
+    assert _compute_names(steps, LkuRightRoot) == {"PandasDataFrame"}
+    assert [step.compute_framework_name for step in steps if step.step_kind == "join"] == ["PandasDataFrame"]
+
+
+def test_throwaway_framework_pairs_reduce_to_the_expected_framework() -> None:
+    zulu, alfa, tango, bravo = _throwaway_frameworks()
+    expectations: list[tuple[tuple[type[ComputeFramework], type[ComputeFramework]], str]] = [
+        ((zulu, alfa), "ZzAlfaThrowawayFramework"),
+        ((zulu, tango), "ZzTangoThrowawayFramework"),
+        ((tango, bravo), "ZzBravoThrowawayFramework"),
+    ]
+
+    for (left, right), expected in expectations:
+        assert _pick({left, right}).get_class_name() == expected
+        assert _pick([right, left], {}).get_class_name() == expected
+
+
+def test_a_link_between_unrestricted_roots_follows_a_non_default_preference() -> None:
+    steps = _plan(["lku_out"], _LKU_GROUPS, [PyArrowTable, PandasDataFrame], links=_lku_links())
+
+    assert _compute_names(steps, LkuLeftRoot) == {"PyArrowTable"}
+    assert _compute_names(steps, LkuRightRoot) == {"PyArrowTable"}
+    assert [step.compute_framework_name for step in steps if step.step_kind == "join"] == ["PyArrowTable"]
+
+
+def test_a_link_keeps_single_framework_sides_declared() -> None:
+    steps = _plan(["lkm_out"], _LKM_GROUPS, [PandasDataFrame, PyArrowTable], links=_lkm_links())
+
+    (join,) = [step for step in steps if step.step_kind == "join"]
+    assert join.declared_left_framework_names == ("PandasDataFrame",)
+    assert join.declared_right_framework_names == ("PyArrowTable",)
+
+
+def test_feature_compute_framework_raises_on_an_unchosen_multi_framework_set() -> None:
+    feature = Feature("determinism_feature")
+    feature.compute_frameworks = {PyArrowTable, PandasDataFrame}
+
+    with pytest.raises(ValueError):
+        feature.get_compute_framework()
+
+
+def test_feature_compute_framework_raises_on_every_unchosen_pair() -> None:
+    zulu, alfa, tango, bravo = _throwaway_frameworks()
+
+    for left, right in ((zulu, alfa), (zulu, tango), (tango, bravo)):
+        feature = Feature("determinism_feature")
+        feature.compute_frameworks = {left, right}
+
+        with pytest.raises(ValueError):
+            feature.get_compute_framework()
+
+
+def test_feature_compute_framework_keeps_a_single_framework() -> None:
+    feature = Feature("determinism_single_feature")
+    feature.compute_frameworks = {PyArrowTable}
+
+    assert feature.get_compute_framework() is PyArrowTable
+
+
+def test_feature_compute_framework_rejects_an_empty_set() -> None:
+    feature = Feature("determinism_empty_feature")
+    feature.compute_frameworks = set()
+
+    with pytest.raises(ValueError, match="determinism_empty_feature"):
+        feature.get_compute_framework()
+
+
+# Fresh interpreters cost roughly a second each, so this one needs more than the suite-wide per-test budget.
+@pytest.mark.timeout(60)
+def test_fresh_interpreters_reduce_to_the_same_frameworks() -> None:
+    outputs = run_probes(_PROBE, _PROBE_PROCESSES)
+
+    assert len(outputs) == _PROBE_PROCESSES, f"expected {_PROBE_PROCESSES} probe results, got {len(outputs)}"
+    for position, output in enumerate(outputs):
+        assert output == _PROBE_EXPECTED, f"probe {position} reduced to {output}, expected {_PROBE_EXPECTED}"
+
+
+# ---------------------------------------------------------------------------
+# Connection-aware default
+# ---------------------------------------------------------------------------
+
+_BASE = "mloda_plugins.compute_framework.base_implementations"
+# (module, class name, expected requirement name); the modules guard their backend imports
+_REQUIREMENTS: list[tuple[str, str, str]] = [
+    (f"{_BASE}.pandas.dataframe", "PandasDataFrame", "NONE"),
+    (f"{_BASE}.polars.dataframe", "PolarsDataFrame", "NONE"),
+    (f"{_BASE}.polars.lazy_dataframe", "PolarsLazyDataFrame", "NONE"),
+    (f"{_BASE}.pyarrow.table", "PyArrowTable", "NONE"),
+    (f"{_BASE}.python_dict.python_dict_framework", "PythonDictFramework", "NONE"),
+    (f"{_BASE}.spark.spark_framework", "SparkFramework", "SELF_MANAGED"),
+    (f"{_BASE}.iceberg.iceberg_framework", "IcebergFramework", "SELF_MANAGED"),
+    (f"{_BASE}.duckdb.duckdb_framework", "DuckDBFramework", "REQUIRED"),
+    (f"{_BASE}.sqlite.sqlite_framework", "SqliteFramework", "REQUIRED"),
+]
+
+
+def _load_framework(module: str, name: str) -> type[ComputeFramework]:
+    framework: type[ComputeFramework] = getattr(importlib.import_module(module), name)
+    return framework
+
+
+@pytest.mark.parametrize(("module", "name", "expected"), _REQUIREMENTS)
+def test_connection_requirement_per_shipped_framework(module: str, name: str, expected: str) -> None:
+    from mloda.provider import ConnectionRequirement
+
+    framework = _load_framework(module, name)
+
+    assert framework.connection_requirement() is ConnectionRequirement[expected]
+
+
+_RESULT_FRAMEWORK_OVERRIDES = {
+    "DuckDBFramework": "PyArrowTable",
+    "SqliteFramework": "PyArrowTable",
+    "IcebergFramework": "PyArrowTable",
+    "PolarsLazyDataFrame": "PolarsDataFrame",
+}
+
+
+@pytest.mark.parametrize(("module", "name", "_requirement"), _REQUIREMENTS)
+def test_result_framework_per_shipped_framework(module: str, name: str, _requirement: str) -> None:
+    framework = _load_framework(module, name)
+    expected = _load_framework(
+        _MODULE_OF[_RESULT_FRAMEWORK_OVERRIDES.get(name, name)], _RESULT_FRAMEWORK_OVERRIDES.get(name, name)
+    )
+
+    assert framework.result_framework() is expected
+
+
+def test_connection_requirement_members() -> None:
+    from mloda.provider import ConnectionRequirement
+
+    assert [member.name for member in ConnectionRequirement] == ["NONE", "SELF_MANAGED", "REQUIRED"]
+
+
+_MODULE_OF = {name: module for module, name, _ in _REQUIREMENTS}
+_RANK_CASES: list[tuple[list[str], str]] = [
+    (["DuckDBFramework", "PyArrowTable"], "PyArrowTable"),
+    (["PyArrowTable", "DuckDBFramework"], "PyArrowTable"),
+    (["SqliteFramework", "DuckDBFramework"], "DuckDBFramework"),
+    (["DuckDBFramework", "SqliteFramework"], "DuckDBFramework"),
+    (["DuckDBFramework", "SparkFramework"], "SparkFramework"),
+    (["SparkFramework", "PyArrowTable"], "PyArrowTable"),
+]
+
+
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    _RANK_CASES,
+    ids=[f"{'+'.join(i)}->{e}" for i, e in _RANK_CASES],
+)
+def test_rank_key_orders_by_connection_rank_then_name(inputs: list[str], expected: str) -> None:
+    frameworks = [_load_framework(_MODULE_OF[name], name) for name in inputs]
+
+    assert _pick(frameworks).get_class_name() == expected
+
+
+# --- planning and run ---------------------------------------------------------------------------
+
+
+class _ConnAwareRoot(DataCreatorFeatureGroup):
+    """Data-creator root named by NAME; subclasses differ only by class name and NAME."""
+
+    NAME: ClassVar[str] = ""
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {cls.NAME} if cls.NAME else set()
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({cls.NAME: [1, 2, 3]})
+
+
+class ConnAwareDuckPyArrowRootFG(_ConnAwareRoot):
+    NAME = "conn_aware_duck_pa_root"
+
+
+class ConnAwareSqliteRootFG(_ConnAwareRoot):
+    NAME = "conn_aware_sqlite_root"
+
+
+class ConnAwareNoConnRootFG(_ConnAwareRoot):
+    NAME = "conn_aware_noconn_root"
+
+
+class ConnAwarePinnedRootFG(_ConnAwareRoot):
+    NAME = "conn_aware_pinned_root"
+
+
+@pytest.fixture
+def sqlite_conn() -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(":memory:")
+    yield conn
+    conn.close()
+
+
+def _frameworks() -> list[type[ComputeFramework]]:
+    pytest.importorskip("duckdb")
+    duckdb_fw = _load_framework(f"{_BASE}.duckdb.duckdb_framework", "DuckDBFramework")
+    sqlite_fw = _load_framework(f"{_BASE}.sqlite.sqlite_framework", "SqliteFramework")
+    return [duckdb_fw, sqlite_fw]
+
+
+def _compute_framework_names(
+    feature: Feature | str,
+    fg: type[FeatureGroup],
+    frameworks: list[type[ComputeFramework]],
+    data_access_collection: DataAccessCollection | None = None,
+) -> list[str | None]:
+    steps = mloda.explain(
+        [feature],
+        compute_frameworks=frameworks,
+        plugin_collector=PluginCollector.enabled_feature_groups({fg}),
+        data_access_collection=data_access_collection,
+    )
+    return [step.compute_framework_name for step in steps if step.step_kind == "compute"]
+
+
+def test_run_all_unrestricted_root_avoids_unconnected_duckdb() -> None:
+    pytest.importorskip("duckdb")
+    duckdb_fw = _load_framework(f"{_BASE}.duckdb.duckdb_framework", "DuckDBFramework")
+
+    result = mloda.run_all(
+        ["conn_aware_duck_pa_root"],
+        compute_frameworks=[PyArrowTable, duckdb_fw],
+        plugin_collector=PluginCollector.enabled_feature_groups({ConnAwareDuckPyArrowRootFG}),
+    )
+
+    assert len(result) == 1
+    assert isinstance(result[0], pa.Table)
+
+
+def test_root_with_sqlite_connection_plans_on_sqlite(sqlite_conn: sqlite3.Connection) -> None:
+    feature = Feature("conn_aware_sqlite_root")
+
+    names = _compute_framework_names(
+        feature, ConnAwareSqliteRootFG, _frameworks(), DataAccessCollection(connections={sqlite_conn})
+    )
+
+    assert names == ["SqliteFramework"]
+
+
+def test_root_without_any_connection_keeps_duckdb() -> None:
+    names = _compute_framework_names("conn_aware_noconn_root", ConnAwareNoConnRootFG, _frameworks())
+
+    assert names == ["DuckDBFramework"]
+
+
+def test_pinned_duckdb_feature_keeps_its_pin(sqlite_conn: sqlite3.Connection) -> None:
+    feature = Feature("conn_aware_pinned_root", compute_framework="DuckDBFramework")
+
+    names = _compute_framework_names(
+        feature, ConnAwarePinnedRootFG, _frameworks(), DataAccessCollection(connections={sqlite_conn})
+    )
+
+    assert names == ["DuckDBFramework"]
+
+
+def test_pinned_duckdb_feature_with_a_resolvable_duckdb_dac_connection_stays_on_duckdb() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    feature = Feature("conn_aware_pinned_root", compute_framework="DuckDBFramework")
+
+    names = _compute_framework_names(
+        feature, ConnAwarePinnedRootFG, _frameworks(), DataAccessCollection(connections={duckdb.connect()})
+    )
+
+    assert names == ["DuckDBFramework"]
+
+
+class MoveErrorRootFG(_ConnAwareRoot):
+    NAME = "move_error_root"
+
+
+def _assert_move_error(raised: pytest.ExceptionInfo[ValueError], key: str, framework: str) -> None:
+    message = str(raised.value)
+    assert key in message
+    assert framework in message
+    assert "DataAccessCollection" in message
+    assert "connection_handle" in message
+
+
+def test_a_duckdb_connection_under_a_group_class_name_raises_the_move_error() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    feature = Feature("move_error_root", options={"MoveErrorRootFG": duckdb.connect()})
+
+    with pytest.raises(ValueError) as raised:
+        _compute_framework_names(feature, MoveErrorRootFG, _frameworks())
+
+    _assert_move_error(raised, "MoveErrorRootFG", "DuckDBFramework")
+
+
+def test_a_sqlite_connection_under_a_group_class_name_raises_the_move_error(sqlite_conn: sqlite3.Connection) -> None:
+    feature = Feature("move_error_root", options={"MoveErrorRootFG": sqlite_conn})
+
+    with pytest.raises(ValueError) as raised:
+        _compute_framework_names(feature, MoveErrorRootFG, _frameworks())
+
+    _assert_move_error(raised, "MoveErrorRootFG", "SqliteFramework")
+
+
+def test_a_duckdb_connection_under_a_source_group_pointer_key_raises_the_move_error() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    key = CsvFG.pointer_keys()[0]
+    feature = Feature("move_error_csv_col", options={key: duckdb.connect()})
+
+    with pytest.raises(ValueError) as raised:
+        _compute_framework_names(feature, CsvFG, _frameworks())
+
+    _assert_move_error(raised, key, "DuckDBFramework")
+
+
+def test_a_non_connection_value_under_a_group_class_name_does_not_raise() -> None:
+    feature = Feature("move_error_root", options={"MoveErrorRootFG": "some_pointer"})
+
+    names = _compute_framework_names(feature, MoveErrorRootFG, _frameworks())
+
+    assert len(names) == 1
+
+
+# --- run-level framework preference -------------------------------------------------------------
+
+
+class PreferencePandasPyArrowRootFG(_ConnAwareRoot):
+    NAME = "preference_pd_pa_root"
+
+
+class PreferenceRequiredRootFG(_ConnAwareRoot):
+    NAME = "preference_required_root"
+
+
+class PreferenceUnavailableRootFG(_ConnAwareRoot):
+    NAME = "preference_unavailable_root"
+
+
+def test_preference_first_listed_among_candidates_wins() -> None:
+    assert _pick([PandasDataFrame, PyArrowTable], {PyArrowTable: 0, PandasDataFrame: 1}) is PyArrowTable
+    assert _pick([PyArrowTable, PandasDataFrame], {PandasDataFrame: 0, PyArrowTable: 1}) is PandasDataFrame
+
+
+def test_preference_ranks_unlisted_candidates_after_listed_in_default_order() -> None:
+    zulu, alfa, _, bravo = _throwaway_frameworks()
+
+    assert _pick({alfa, zulu, bravo}, {zulu: 0}) is zulu
+    assert _pick({alfa, bravo, PandasDataFrame}, {zulu: 0}) is PandasDataFrame
+
+
+def test_unlisted_candidates_rank_after_every_listed_one_when_positions_repeat() -> None:
+    zulu, alfa, _, bravo = _throwaway_frameworks()
+
+    assert _pick({alfa, zulu, bravo}, {zulu: 1, bravo: 1}) is bravo
+    assert _pick({alfa, zulu, PandasDataFrame}, {zulu: 1, bravo: 1}) is zulu
+
+
+def test_a_shared_position_is_broken_by_the_module() -> None:
+    module_b, module_a = _same_name_and_qualname_frameworks()
+    positions: dict[type[ComputeFramework], int] = {module_b: 0, module_a: 0, PandasDataFrame: 1}
+
+    assert _pick({module_b, module_a, PandasDataFrame}, positions) is module_a
+
+
+def test_no_preference_leaves_the_default_unchanged() -> None:
+    assert _pick([PyArrowTable, PandasDataFrame], {}) is PandasDataFrame
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        (["PyArrowTable", "PandasDataFrame"], ["PyArrowTable"]),
+        (["PandasDataFrame", "PyArrowTable"], ["PandasDataFrame"]),
+    ],
+)
+def test_planning_follows_the_listed_order(order: list[Any], expected: list[str | None]) -> None:
+    frameworks = [_load_framework(_MODULE_OF[name], name) for name in order]
+
+    names = _compute_framework_names("preference_pd_pa_root", PreferencePandasPyArrowRootFG, frameworks)
+
+    assert names == expected
+
+
+def test_required_framework_listed_first_without_connection_still_loses() -> None:
+    sqlite_fw = _load_framework(_MODULE_OF["SqliteFramework"], "SqliteFramework")
+
+    names = _compute_framework_names("preference_required_root", PreferenceRequiredRootFG, [sqlite_fw, PandasDataFrame])
+
+    assert names == ["PandasDataFrame"]
+
+
+def test_unavailable_framework_listed_first_falls_back_to_the_next_listed() -> None:
+    unavailable = _throwaway_frameworks()[0]
+
+    names = _compute_framework_names(
+        "preference_unavailable_root", PreferenceUnavailableRootFG, [unavailable, PyArrowTable, PandasDataFrame]
+    )
+
+    assert names == ["PyArrowTable"]
+
+
+class PreferencePinnedPandasRootFG(_ConnAwareRoot):
+    NAME = "preference_pinned_pandas_root"
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pd.DataFrame({cls.NAME: [1, 2, 3]})
+
+
+def test_feature_pinned_to_pandas_still_runs_on_pandas_under_a_pyarrow_first_run_list() -> None:
+    feature = Feature("preference_pinned_pandas_root", compute_framework="PandasDataFrame")
+
+    result = mloda.run_all(
+        [feature],
+        compute_frameworks=["PyArrowTable", "PandasDataFrame"],
+        plugin_collector=PluginCollector.enabled_feature_groups({PreferencePinnedPandasRootFG}),
+    )
+
+    assert len(result) == 1
+    assert isinstance(result[0], pd.DataFrame)
+
+
+# --- central choice: Feature.chosen_compute_framework and explicit positions ----------------------
+
+
+def _two_framework_feature(name: str = "chosen_feature") -> Feature:
+    feature = Feature(name)
+    feature.compute_frameworks = {PyArrowTable, PandasDataFrame}
+    return feature
+
+
+def test_chosen_compute_framework_defaults_to_none() -> None:
+    assert _two_framework_feature().chosen_compute_framework is None
+
+
+def test_get_compute_framework_returns_the_chosen_one() -> None:
+    feature = _two_framework_feature()
+    feature.chosen_compute_framework = PyArrowTable
+
+    assert feature.get_compute_framework() is PyArrowTable
+
+
+def test_chosen_compute_framework_is_not_part_of_identity() -> None:
+    plain = _two_framework_feature()
+    chosen = _two_framework_feature()
+    chosen.chosen_compute_framework = PyArrowTable
+
+    assert plain == chosen
+    assert hash(plain) == hash(chosen)
+    assert plain.similarity_hash(frozenset()) == chosen.similarity_hash(frozenset())
+    assert plain.base_similarity_hash(frozenset()) == chosen.base_similarity_hash(frozenset())
+
+
+def test_copy_keeps_the_chosen_compute_framework() -> None:
+    feature = _two_framework_feature()
+    feature.chosen_compute_framework = PyArrowTable
+
+    assert copy.copy(feature).chosen_compute_framework is PyArrowTable
+
+
+@pytest.mark.parametrize(
+    ("positions", "candidates", "expected"),
+    [
+        ({PyArrowTable: 0, PandasDataFrame: 1}, [PandasDataFrame, PyArrowTable], PyArrowTable),
+        ({PandasDataFrame: 0, PyArrowTable: 1}, [PyArrowTable, PandasDataFrame], PandasDataFrame),
+        ({}, [PyArrowTable, PandasDataFrame], PandasDataFrame),
+        (None, [PyArrowTable, PandasDataFrame], PandasDataFrame),
+        ({PyArrowTable: 0}, [PandasDataFrame, PyArrowTable], PyArrowTable),
+    ],
+    ids=["pa_first", "pd_first", "empty", "none", "unlisted_after_listed"],
+)
+def test_rank_key_follows_explicit_positions(
+    positions: dict[type[ComputeFramework], int] | None,
+    candidates: list[type[ComputeFramework]],
+    expected: type[ComputeFramework],
+) -> None:
+    assert _pick(candidates, positions) is expected
+
+
+def test_rank_key_positions_tie_breaks_by_module_after_name() -> None:
+    module_b, module_a = _same_name_and_qualname_frameworks()
+
+    assert _pick({module_b, module_a}, {module_b: 0, module_a: 0}) is module_a
+
+
+def test_rank_key_positions_rank_connection_before_name() -> None:
+    sqlite_fw = _load_framework(_MODULE_OF["SqliteFramework"], "SqliteFramework")
+
+    assert _pick([sqlite_fw, PyArrowTable], {sqlite_fw: 0, PyArrowTable: 0}) is PyArrowTable
+
+
+def test_framework_rank_key_orders_by_position_then_default() -> None:
+    zulu, alfa, _, bravo = _throwaway_frameworks()
+    key = framework_rank_key({zulu: 0, bravo: 1})
+
+    candidates: list[type[ComputeFramework]] = [alfa, bravo, zulu, PandasDataFrame]
+
+    assert sorted(candidates, key=key) == [zulu, bravo, PandasDataFrame, alfa]
+
+
+def test_framework_rank_key_without_positions_is_the_default_order() -> None:
+    key = framework_rank_key({})
+
+    candidates: list[type[ComputeFramework]] = [PyArrowTable, PandasDataFrame]
+
+    assert sorted(candidates, key=key) == [PandasDataFrame, PyArrowTable]
+
+
+# --- the ContextVar is gone; the engine takes the preference ---------------------------------------
+
+
+def test_the_preference_contextvar_no_longer_exists() -> None:
+    module = importlib.import_module("mloda.core.abstract_plugins.compute_framework")
+
+    assert not hasattr(module, "framework_preference")
+    assert not hasattr(module, "_framework_position")
+
+
+def test_engine_takes_a_framework_preference_keyword() -> None:
+    assert "framework_preference" in inspect.signature(Engine.__init__).parameters
+
+
+# --- central choice wiring: plans through the public API ------------------------------------------
+
+
+class _PlanRoot(DataCreatorFeatureGroup):
+    """Data-creator root; FW_NAME restricts it, None leaves it unrestricted."""
+
+    NAMES: ClassVar[tuple[str, ...]] = ()
+    FW_NAME: ClassVar[str | None] = None
+    INDEXES: ClassVar[tuple[str, ...]] = ()
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return set(cls.NAMES)
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({name: [1, 2, 3] for name in cls.NAMES})
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return None if cls.FW_NAME is None else {_load_framework(_MODULE_OF[cls.FW_NAME], cls.FW_NAME)}
+
+    @classmethod
+    def index_columns(cls) -> list[Index] | None:
+        return [Index((name,)) for name in cls.INDEXES] or None
+
+
+class _PlanConsumer(FeatureGroup):
+    """Consumer of INPUTS producing OUTPUT; FW_NAME restricts it, None leaves it unrestricted."""
+
+    INPUTS: ClassVar[tuple[str, ...]] = ()
+    OUTPUT: ClassVar[str] = ""
+    FW_NAME: ClassVar[str | None] = None
+    RULE: ClassVar[tuple[str, ...]] = ()
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(name) for name in self.INPUTS}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return data
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        if cls.RULE:
+            return {_load_framework(_MODULE_OF[name], name) for name in cls.RULE}
+        return None if cls.FW_NAME is None else {_load_framework(_MODULE_OF[cls.FW_NAME], cls.FW_NAME)}
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {cls.OUTPUT} if cls.OUTPUT else set()
+
+
+def _target(name: str) -> type[ComputeFramework]:
+    if name.startswith("Polars"):
+        pytest.importorskip("polars")
+    return _load_framework(_MODULE_OF[name], name)
+
+
+_TARGETS = [
+    pytest.param("PyArrowTable", id="pyarrow"),
+    pytest.param("PolarsDataFrame", id="polars"),
+    pytest.param("PolarsLazyDataFrame", id="polars_lazy"),
+]
+
+
+def _plan(
+    features: list[Feature | str],
+    groups: set[type[FeatureGroup]],
+    frameworks: list[type[ComputeFramework]],
+    links: set[Link] | None = None,
+    output_framework: type[ComputeFramework] | None = None,
+) -> list[PlanStep]:
+    return mloda.explain(
+        features,
+        compute_frameworks=frameworks,
+        links=links,
+        output_framework=output_framework,
+        plugin_collector=PluginCollector.enabled_feature_groups(groups),
+    )
+
+
+def _compute_steps(steps: list[PlanStep], group: type[FeatureGroup]) -> list[PlanStep]:
+    return [step for step in steps if step.step_kind == "compute" and step.feature_group is group]
+
+
+def _compute_names(steps: list[PlanStep], group: type[FeatureGroup]) -> set[str | None]:
+    return {step.compute_framework_name for step in _compute_steps(steps, group)}
+
+
+def _transforms(steps: list[PlanStep]) -> list[PlanStep]:
+    return [step for step in steps if step.step_kind == "transform"]
+
+
+# P1: an unrestricted root feeds a consumer restricted to the target.
+class P1Root(_PlanRoot):
+    NAMES = ("p1_root",)
+
+
+class P1ConsumerPyArrowTable(_PlanConsumer):
+    INPUTS = ("p1_root",)
+    OUTPUT = "p1_out"
+    FW_NAME = "PyArrowTable"
+
+
+class P1ConsumerPolarsDataFrame(P1ConsumerPyArrowTable):
+    FW_NAME = "PolarsDataFrame"
+
+
+class P1ConsumerPolarsLazyDataFrame(P1ConsumerPyArrowTable):
+    FW_NAME = "PolarsLazyDataFrame"
+
+
+# P3: a source restricted to the target feeds an unrestricted consumer.
+class P3SourcePyArrowTable(_PlanRoot):
+    NAMES = ("p3_src",)
+    FW_NAME = "PyArrowTable"
+
+
+class P3SourcePolarsDataFrame(P3SourcePyArrowTable):
+    FW_NAME = "PolarsDataFrame"
+
+
+class P3SourcePolarsLazyDataFrame(P3SourcePyArrowTable):
+    FW_NAME = "PolarsLazyDataFrame"
+
+
+class P3Consumer(_PlanConsumer):
+    INPUTS = ("p3_src",)
+    OUTPUT = "p3_out"
+
+
+# P2: a link joins two unrestricted roots; the link child is restricted to the target.
+class P2RootA(_PlanRoot):
+    NAMES = ("p2_a",)
+
+
+class P2RootB(_PlanRoot):
+    NAMES = ("p2_b",)
+
+
+class P2ChildPyArrowTable(_PlanConsumer):
+    INPUTS = ("p2_a", "p2_b")
+    OUTPUT = "p2_out"
+    FW_NAME = "PyArrowTable"
+
+
+class P2ChildPolarsDataFrame(P2ChildPyArrowTable):
+    FW_NAME = "PolarsDataFrame"
+
+
+class P2ChildPolarsLazyDataFrame(P2ChildPyArrowTable):
+    FW_NAME = "PolarsLazyDataFrame"
+
+
+_P1_CONSUMERS: dict[str, type[FeatureGroup]] = {
+    "PyArrowTable": P1ConsumerPyArrowTable,
+    "PolarsDataFrame": P1ConsumerPolarsDataFrame,
+    "PolarsLazyDataFrame": P1ConsumerPolarsLazyDataFrame,
+}
+_P3_SOURCES: dict[str, type[FeatureGroup]] = {
+    "PyArrowTable": P3SourcePyArrowTable,
+    "PolarsDataFrame": P3SourcePolarsDataFrame,
+    "PolarsLazyDataFrame": P3SourcePolarsLazyDataFrame,
+}
+_P2_CHILDREN: dict[str, type[FeatureGroup]] = {
+    "PyArrowTable": P2ChildPyArrowTable,
+    "PolarsDataFrame": P2ChildPolarsDataFrame,
+    "PolarsLazyDataFrame": P2ChildPolarsLazyDataFrame,
+}
+
+
+@pytest.mark.parametrize("target", _TARGETS)
+def test_p1_unrestricted_root_moves_onto_the_restricted_consumers_framework(target: str) -> None:
+    framework = _target(target)
+
+    steps = _plan(["p1_out"], {P1Root, _P1_CONSUMERS[target]}, [PandasDataFrame, framework])
+
+    assert _compute_names(steps, P1Root) == {target}
+    assert _transforms(steps) == []
+
+
+@pytest.mark.parametrize("target", _TARGETS)
+def test_p3_unrestricted_consumer_moves_onto_the_restricted_sources_framework(target: str) -> None:
+    framework = _target(target)
+
+    steps = _plan(["p3_out"], {P3Consumer, _P3_SOURCES[target]}, [PandasDataFrame, framework])
+
+    assert _compute_names(steps, P3Consumer) == {target}
+    assert _transforms(steps) == []
+
+
+@pytest.mark.parametrize("target", _TARGETS)
+def test_p2_link_between_unrestricted_roots_joins_on_the_restricted_childs_framework(target: str) -> None:
+    framework = _target(target)
+    links = {Link.inner(JoinSpec(P2RootA, "p2_idx"), JoinSpec(P2RootB, "p2_idx"))}
+
+    steps = _plan(["p2_out"], {P2RootA, P2RootB, _P2_CHILDREN[target]}, [PandasDataFrame, framework], links=links)
+
+    assert [step.compute_framework_name for step in steps if step.step_kind == "join"] == [target]
+    assert _compute_names(steps, P2RootA) == {target}
+    assert _compute_names(steps, P2RootB) == {target}
+    assert _transforms(steps) == []
+
+
+# P4: two unlinked roots on one framework feed a consumer on another; nothing joins them.
+class P4RootA(_PlanRoot):
+    NAMES = ("p4_root_a",)
+    FW_NAME = "PandasDataFrame"
+
+
+class P4RootB(_PlanRoot):
+    NAMES = ("p4_root_b",)
+    FW_NAME = "PandasDataFrame"
+
+
+class P4Consumer(_PlanConsumer):
+    INPUTS = ("p4_root_a", "p4_root_b")
+    OUTPUT = "p4_out"
+    FW_NAME = "PyArrowTable"
+
+
+def test_p4_unlinked_parents_raise_the_missing_links_error() -> None:
+    with pytest.raises(ValueError, match="Link") as raised:
+        _plan(["p4_out"], {P4RootA, P4RootB, P4Consumer}, [PandasDataFrame, PyArrowTable], links=set())
+
+    assert "P4RootA" in str(raised.value)
+    assert "P4RootB" in str(raised.value)
+
+
+# A feature both requested and consumed keeps one read.
+class RcRoot(_PlanRoot):
+    NAMES = ("rc_root",)
+
+
+class RcConsumer(_PlanConsumer):
+    INPUTS = ("rc_root",)
+    OUTPUT = "rc_out"
+    FW_NAME = "PyArrowTable"
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({"rc_out": data["rc_root"]})
+
+
+def test_a_feature_requested_and_consumed_has_one_step_on_the_consumers_framework() -> None:
+    steps = _plan(["rc_root", "rc_out"], {RcRoot, RcConsumer}, [PandasDataFrame, PyArrowTable])
+
+    assert len(_compute_steps(steps, RcRoot)) == 1
+    assert _compute_names(steps, RcRoot) == {"PyArrowTable"}
+    assert _transforms(steps) == []
+
+
+_RC_GROUPS: set[type[FeatureGroup]] = {RcRoot, RcConsumer}
+_RC_FRAMEWORKS: list[type[ComputeFramework]] = [PandasDataFrame, PyArrowTable]
+_RC_REQUESTS = [pytest.param(["rc_root"], id="alone"), pytest.param(["rc_root", "rc_out"], id="together")]
+
+
+def _run_rc(features: list[Feature | str], output_framework: str | type[ComputeFramework] | None = None) -> Any:
+    return mloda.run_all(
+        features,
+        compute_frameworks=_RC_FRAMEWORKS,
+        plugin_collector=PluginCollector.enabled_feature_groups(_RC_GROUPS),
+        output_framework=output_framework,
+    )
+
+
+@pytest.mark.parametrize("output", ["PandasDataFrame", PandasDataFrame], ids=["name", "class"])
+@pytest.mark.parametrize("features", _RC_REQUESTS)
+def test_output_framework_returns_every_frame_in_that_framework(output: Any, features: list[Feature | str]) -> None:
+    result = _run_rc(features, output)
+
+    assert len(result) == len(features)
+    assert all(isinstance(frame, pd.DataFrame) for frame in result)
+    for step, frame in result.frames():
+        assert step.result_framework is PandasDataFrame
+        assert type(frame) is step.result_framework.expected_data_framework()
+
+
+@pytest.mark.parametrize(
+    ("features", "expected_names"),
+    [(["rc_root"], None), (["rc_root", "rc_out"], {"PyArrowTable"})],
+    ids=["alone", "together"],
+)
+def test_result_framework_names_the_type_each_frame_comes_back_in(
+    features: list[Feature | str], expected_names: set[str] | None
+) -> None:
+    result = _run_rc(features)
+
+    for step, frame in result.frames():
+        assert step.result_framework is not None
+        assert type(frame) is step.result_framework.expected_data_framework()
+    if expected_names is not None:
+        assert {step.result_framework_name for step, _ in result.frames()} == expected_names
+
+
+def test_stream_all_honors_output_framework() -> None:
+    stream = mloda.stream_all(
+        ["rc_root", "rc_out"],
+        compute_frameworks=_RC_FRAMEWORKS,
+        plugin_collector=PluginCollector.enabled_feature_groups(_RC_GROUPS),
+        output_framework="PandasDataFrame",
+    )
+
+    frames = list(stream)
+
+    assert len(frames) == 2
+    assert all(isinstance(frame, pd.DataFrame) for frame in frames)
+
+
+_TFS_DAC = pytest.mark.parametrize("with_dac", [False, True], ids=["no_dac", "dac_without_connection"])
+
+
+@_TFS_DAC
+@pytest.mark.parametrize("entry", ["prepare", "run_all"])
+def test_a_required_connection_output_framework_without_a_connection_raises_at_planning(
+    entry: str, with_dac: bool, tmp_path: Path
+) -> None:
+    sqlite_fw = _load_framework(_MODULE_OF["SqliteFramework"], "SqliteFramework")
+
+    with pytest.raises(EnvironmentPreconditionError, match="SqliteFramework") as raised:
+        getattr(mloda, entry)(
+            ["rc_root"],
+            compute_frameworks=_RC_FRAMEWORKS,
+            data_access_collection=DataAccessCollection(folders={str(tmp_path)}) if with_dac else None,
+            plugin_collector=PluginCollector.enabled_feature_groups(_RC_GROUPS),
+            output_framework=sqlite_fw,
+        )
+
+    assert "RcRoot" in str(raised.value)
+    assert "DataAccessCollection" in str(raised.value)
+    assert "rc_root" in [r.feature_name for r in raised.value.partial_records]
+
+
+@_TFS_DAC
+def test_diagnose_reports_a_required_connection_output_framework_without_a_connection(
+    with_dac: bool, tmp_path: Path
+) -> None:
+    sqlite_fw = _load_framework(_MODULE_OF["SqliteFramework"], "SqliteFramework")
+
+    diagnosis = mloda.diagnose(
+        ["rc_root"],
+        compute_frameworks=_RC_FRAMEWORKS,
+        data_access_collection=DataAccessCollection(folders={str(tmp_path)}) if with_dac else None,
+        plugin_collector=PluginCollector.enabled_feature_groups(_RC_GROUPS),
+        output_framework=sqlite_fw,
+    )
+
+    assert diagnosis.complete is False
+    assert diagnosis.message is not None
+    assert "SqliteFramework" in diagnosis.message
+    assert "RcRoot" in diagnosis.message
+    assert "DataAccessCollection" in diagnosis.message
+    assert "rc_root" in [r.feature_name for r in diagnosis.records]
+
+
+def test_a_required_connection_output_framework_with_a_connection_prepares(sqlite_conn: sqlite3.Connection) -> None:
+    sqlite_fw = _load_framework(_MODULE_OF["SqliteFramework"], "SqliteFramework")
+    access = DataAccessCollection(connections={sqlite_conn})
+
+    session = mloda.prepare(
+        ["rc_root"],
+        compute_frameworks=_RC_FRAMEWORKS,
+        data_access_collection=access,
+        plugin_collector=PluginCollector.enabled_feature_groups(_RC_GROUPS),
+        output_framework=sqlite_fw,
+    )
+
+    assert session.engine is not None
+    assert session.engine.output_connection is sqlite_conn
+
+
+class TfsDbRoot(_PlanRoot):
+    NAMES = ("tfsdb_root",)
+    FW_NAME = "PyArrowTable"
+
+
+class TfsSqliteConsumer(_PlanConsumer):
+    INPUTS = ("tfsdb_root",)
+    OUTPUT = "tfsdb_sqlite_out"
+    FW_NAME = "SqliteFramework"
+
+
+class TfsDuckDBConsumer(_PlanConsumer):
+    INPUTS = ("tfsdb_root",)
+    OUTPUT = "tfsdb_duckdb_out"
+    FW_NAME = "DuckDBFramework"
+
+
+_TFS_DB_CASES = [
+    pytest.param("SqliteFramework", TfsSqliteConsumer, "tfsdb_sqlite_out", id="sqlite"),
+    pytest.param("DuckDBFramework", TfsDuckDBConsumer, "tfsdb_duckdb_out", id="duckdb"),
+]
+
+
+def _tfs_request(fw_name: str, consumer: type[FeatureGroup], with_dac: bool, tmp_path: Path) -> dict[str, Any]:
+    if fw_name == "DuckDBFramework":
+        pytest.importorskip("duckdb")
+    return {
+        "compute_frameworks": [PyArrowTable, _load_framework(_MODULE_OF[fw_name], fw_name)],
+        "plugin_collector": PluginCollector.enabled_feature_groups({TfsDbRoot, consumer}),
+        "data_access_collection": DataAccessCollection(folders={str(tmp_path)}) if with_dac else None,
+    }
+
+
+@_TFS_DAC
+@pytest.mark.parametrize(("fw_name", "consumer", "feature"), _TFS_DB_CASES)
+@pytest.mark.parametrize("entry", ["prepare", "run_all"])
+def test_a_transform_into_a_required_connection_framework_without_a_connection_raises_at_planning(
+    entry: str, fw_name: str, consumer: type[FeatureGroup], feature: str, with_dac: bool, tmp_path: Path
+) -> None:
+    kwargs = _tfs_request(fw_name, consumer, with_dac, tmp_path)
+
+    with pytest.raises(EnvironmentPreconditionError, match=fw_name) as raised:
+        getattr(mloda, entry)([feature], **kwargs)
+
+    assert "DataAccessCollection" in str(raised.value)
+    assert feature in [r.feature_name for r in raised.value.partial_records]
+
+
+@_TFS_DAC
+@pytest.mark.parametrize(("fw_name", "consumer", "feature"), _TFS_DB_CASES)
+def test_diagnose_reports_a_transform_into_a_required_connection_framework_without_a_connection(
+    fw_name: str, consumer: type[FeatureGroup], feature: str, with_dac: bool, tmp_path: Path
+) -> None:
+    kwargs = _tfs_request(fw_name, consumer, with_dac, tmp_path)
+
+    diagnosis = mloda.diagnose([feature], **kwargs)
+
+    assert diagnosis.complete is False
+    assert diagnosis.message is not None
+    assert fw_name in diagnosis.message
+    assert "DataAccessCollection" in diagnosis.message
+    names = [r.feature_name for r in diagnosis.records]
+    assert "tfsdb_root" in names
+    assert feature in names
+
+
+def test_a_same_type_hop_into_a_required_connection_framework_needs_no_connection() -> None:
+    sqlite_cls = _load_framework(_MODULE_OF["SqliteFramework"], "SqliteFramework")
+    to_cls = sqlite_cls
+    tfs = type("_Tfs", (), {"from_framework": sqlite_cls, "to_framework": to_cls, "connection_handle": None})()
+    engine = Engine.__new__(Engine)
+    engine.execution_planner = type(
+        "_Planner", (), {"tfs_collection": {"k": tfs}, "__iter__": lambda self: iter([tfs])}
+    )()
+    engine.data_access_collection = None
+    engine.resolution_records = []
+
+    assert engine._resolve_connections() == {}
+
+
+def _requested_step(feature_group: type[FeatureGroup], framework: type[ComputeFramework]) -> Any:
+    step = create_autospec(FeatureGroupStep, instance=True)
+    step.feature_group = feature_group
+    step.compute_framework = framework
+    step.features = MagicMock()
+    step.features.get_initial_requested_features.return_value = ("requested",)
+    return step
+
+
+@pytest.mark.parametrize("case", ["native_only", "mixed", "repeated"])
+def test_the_output_connection_error_names_only_converting_steps_once(case: str) -> None:
+    sqlite_cls = _load_framework(_MODULE_OF["SqliteFramework"], "SqliteFramework")
+    native = _requested_step(TfsSqliteConsumer, sqlite_cls)
+    converting = _requested_step(RcRoot, PandasDataFrame)
+    steps = {
+        "native_only": [native, _requested_step(TfsSqliteConsumer, sqlite_cls)],
+        "mixed": [native, converting],
+        "repeated": [converting, _requested_step(RcRoot, PandasDataFrame)],
+    }[case]
+    engine = Engine.__new__(Engine)
+    engine.output_framework = sqlite_cls
+    setattr(engine, "execution_planner", steps)
+    engine.data_access_collection = None
+    engine.resolution_records = []
+
+    if case == "native_only":
+        assert engine._resolve_output_connection() is None
+        return
+
+    with pytest.raises(EnvironmentPreconditionError) as raised:
+        engine._resolve_output_connection()
+
+    message = str(raised.value)
+    assert message.count("RcRoot on PandasDataFrame") == 1
+    assert "TfsSqliteConsumer" not in message
+
+
+def test_an_output_framework_outside_the_run_list_still_converts() -> None:
+    expected = PythonDictFramework.expected_data_framework()
+
+    result = _run_rc(["rc_root"], "PythonDictFramework")
+
+    assert len(result) == 1
+    assert all(type(frame) is expected for frame in result)
+
+
+# An unrelated consumer must not move a root.
+class UrRoot(_PlanRoot):
+    NAMES = ("ur_root",)
+
+
+class UrConsumer(_PlanConsumer):
+    INPUTS = ("ur_root",)
+    OUTPUT = "ur_out"
+
+
+class UrOtherSource(_PlanRoot):
+    NAMES = ("ur_other_src",)
+    FW_NAME = "PyArrowTable"
+
+
+class UrOtherConsumer(_PlanConsumer):
+    INPUTS = ("ur_other_src",)
+    OUTPUT = "ur_other_out"
+    FW_NAME = "PyArrowTable"
+
+
+def test_an_unrelated_consumer_does_not_change_the_roots_framework() -> None:
+    groups: set[type[FeatureGroup]] = {UrRoot, UrConsumer, UrOtherSource, UrOtherConsumer}
+    frameworks: list[type[ComputeFramework]] = [PandasDataFrame, PyArrowTable]
+
+    alone = _plan(["ur_out"], groups, frameworks)
+    together = _plan(["ur_out", "ur_other_out"], groups, frameworks)
+
+    assert _compute_names(alone, UrRoot) == {"PandasDataFrame"}
+    assert _compute_names(together, UrRoot) == _compute_names(alone, UrRoot)
+
+
+# Index feature requested explicitly on the host's own feature group.
+class IxLeft(_PlanRoot):
+    NAMES = ("ix_left_val", "ix_lidx")
+    INDEXES = ("ix_lidx",)
+
+
+class IxRight(_PlanRoot):
+    NAMES = ("ix_right_val", "ix_ridx")
+    INDEXES = ("ix_ridx",)
+
+
+class IxConsumer(_PlanConsumer):
+    INPUTS = ("ix_left_val", "ix_right_val")
+    OUTPUT = "ix_out"
+    FW_NAME = "PyArrowTable"
+
+
+_IX_GROUPS: set[type[FeatureGroup]] = {IxLeft, IxRight, IxConsumer}
+_IX_FEATURES: list[Feature | str] = ["ix_out", "ix_lidx", "ix_ridx"]
+
+
+def _ix_links() -> set[Link]:
+    return {Link.inner(JoinSpec(IxLeft, "ix_lidx"), JoinSpec(IxRight, "ix_ridx"))}
+
+
+def test_an_index_feature_requested_explicitly_shares_the_hosts_single_read() -> None:
+    steps = _plan(_IX_FEATURES, _IX_GROUPS, [PandasDataFrame, PyArrowTable], links=_ix_links())
+
+    for group in (IxLeft, IxRight):
+        assert len(_compute_steps(steps, group)) == 1
+        assert _compute_names(steps, group) == {"PyArrowTable"}
+    assert _transforms(steps) == []
+
+
+def test_every_feature_group_step_holds_one_chosen_framework() -> None:
+    session = mloda.prepare(
+        _IX_FEATURES,
+        compute_frameworks=[PandasDataFrame, PyArrowTable],
+        links=_ix_links(),
+        plugin_collector=PluginCollector.enabled_feature_groups(_IX_GROUPS),
+    )
+    assert session.engine is not None
+
+    steps = [step for step in session.engine.execution_planner if isinstance(step, FeatureGroupStep)]
+
+    assert len(steps) >= 3
+    for step in steps:
+        chosen = {feature.chosen_compute_framework for feature in step.features.features}
+        assert chosen == {step.compute_framework}, f"{step.feature_group.__name__}: {chosen}"
+
+
+# Link scenarios for the rewritten trekker-key intent tests.
+class LkuLeftRoot(_PlanRoot):
+    NAMES = ("lku_left",)
+
+
+class LkuRightRoot(_PlanRoot):
+    NAMES = ("lku_right",)
+
+
+class LkuChild(_PlanConsumer):
+    INPUTS = ("lku_left", "lku_right")
+    OUTPUT = "lku_out"
+
+
+class LkmLeftRoot(_PlanRoot):
+    NAMES = ("lkm_left",)
+    FW_NAME = "PandasDataFrame"
+
+
+class LkmRightRoot(_PlanRoot):
+    NAMES = ("lkm_right",)
+    FW_NAME = "PyArrowTable"
+
+
+class LkmChild(_PlanConsumer):
+    INPUTS = ("lkm_left", "lkm_right")
+    OUTPUT = "lkm_out"
+
+
+_LKU_GROUPS: set[type[FeatureGroup]] = {LkuLeftRoot, LkuRightRoot, LkuChild}
+_LKM_GROUPS: set[type[FeatureGroup]] = {LkmLeftRoot, LkmRightRoot, LkmChild}
+
+
+def _lku_links() -> set[Link]:
+    return {Link.inner(JoinSpec(LkuLeftRoot, "lku_idx"), JoinSpec(LkuRightRoot, "lku_idx"))}
+
+
+def _lkm_links() -> set[Link]:
+    return {Link.inner(JoinSpec(LkmLeftRoot, "lkm_idx"), JoinSpec(LkmRightRoot, "lkm_idx"))}
+
+
+# --- a pinned and an unpinned request of one feature share one read ------------------------------
+
+
+class PinnedUnpinnedSharedRootFG(_ConnAwareRoot):
+    NAME = "pinned_unpinned_shared_root"
+
+
+_SHARED_PLUGINS = PluginCollector.enabled_feature_groups({PinnedUnpinnedSharedRootFG})
+
+
+def _shared_root_steps(
+    features: list[Feature | str],
+    plugins: PluginCollector = _SHARED_PLUGINS,
+    global_filter: GlobalFilter | None = None,
+    links: set[Link] | None = None,
+) -> tuple[Any, list[FeatureGroupStep]]:
+    session = mloda.prepare(
+        features,
+        compute_frameworks=[PandasDataFrame, PyArrowTable],
+        plugin_collector=plugins,
+        global_filter=global_filter,
+        links=links,
+    )
+    assert session.engine is not None
+    steps = [
+        step
+        for step in session.engine.execution_planner
+        if isinstance(step, FeatureGroupStep) and step.feature_group is PinnedUnpinnedSharedRootFG
+    ]
+    return session, steps
+
+
+@pytest.mark.parametrize("pinned_first", [True, False], ids=["pinned_first", "unpinned_first"])
+def test_pinned_and_unpinned_request_share_one_step_in_the_pinned_framework(pinned_first: bool) -> None:
+    pinned = Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PyArrowTable")
+    features: list[Feature | str] = [pinned, PinnedUnpinnedSharedRootFG.NAME]
+    if not pinned_first:
+        features.reverse()
+
+    _, steps = _shared_root_steps(features)
+
+    assert [step.compute_framework for step in steps] == [PyArrowTable]
+    assert [f.chosen_compute_framework_reason for f in steps[0].features.features] == ["pinned"]
+
+    result = mloda.run_all(
+        features,
+        compute_frameworks=[PandasDataFrame, PyArrowTable],
+        plugin_collector=_SHARED_PLUGINS,
+    )
+
+    assert len(result) == 1
+    assert isinstance(result[0], pa.Table)
+    assert result[0].column_names == [PinnedUnpinnedSharedRootFG.NAME]
+    assert result[0][PinnedUnpinnedSharedRootFG.NAME].to_pylist() == [1, 2, 3]
+
+
+def _shared_pair(pinned_first: bool) -> list[Feature | str]:
+    features: list[Feature | str] = [
+        Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PyArrowTable"),
+        PinnedUnpinnedSharedRootFG.NAME,
+    ]
+    return features if pinned_first else features[::-1]
+
+
+@pytest.mark.parametrize("pinned_first", [True, False], ids=["pinned_first", "unpinned_first"])
+def test_pinned_and_unpinned_request_share_one_filtered_step(pinned_first: bool) -> None:
+    global_filter = GlobalFilter()
+    global_filter.add_filter(PinnedUnpinnedSharedRootFG.NAME, "equal", {"value": 2})
+    features = _shared_pair(pinned_first)
+
+    _, steps = _shared_root_steps(features, global_filter=global_filter)
+
+    assert [step.compute_framework for step in steps] == [PyArrowTable]
+
+    result = mloda.run_all(
+        features,
+        compute_frameworks=[PandasDataFrame, PyArrowTable],
+        plugin_collector=_SHARED_PLUGINS,
+        global_filter=global_filter,
+    )
+
+    assert len(result) == 1
+    assert result[0][PinnedUnpinnedSharedRootFG.NAME].to_pylist() == [2]
+
+
+class PinnedUnpinnedSharedOtherRootFG(_ConnAwareRoot):
+    NAME = "pinned_unpinned_shared_other"
+
+
+_SHARED_LINK_PLUGINS = PluginCollector.enabled_feature_groups(
+    {PinnedUnpinnedSharedRootFG, PinnedUnpinnedSharedOtherRootFG}
+)
+
+
+@pytest.mark.parametrize("pinned_first", [True, False], ids=["pinned_first", "unpinned_first"])
+def test_pinned_and_unpinned_request_share_one_step_with_a_link(pinned_first: bool) -> None:
+    links = {Link.inner(JoinSpec(PinnedUnpinnedSharedRootFG, "idx"), JoinSpec(PinnedUnpinnedSharedOtherRootFG, "idx"))}
+    features = [*_shared_pair(pinned_first), PinnedUnpinnedSharedOtherRootFG.NAME]
+
+    _, steps = _shared_root_steps(features, plugins=_SHARED_LINK_PLUGINS, links=links)
+
+    assert [step.compute_framework for step in steps] == [PyArrowTable]
+
+
+def _filter_pinned_to_pandas() -> GlobalFilter:
+    global_filter = GlobalFilter()
+    pandas_pin = Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PandasDataFrame")
+    global_filter.add_filter(pandas_pin, "equal", {"value": 2})
+    return global_filter
+
+
+def test_a_filter_pinned_to_another_framework_plans_alike_in_both_orders() -> None:
+    shapes = []
+    for pinned_first in (True, False):
+        _, steps = _shared_root_steps(_shared_pair(pinned_first), global_filter=_filter_pinned_to_pandas())
+        shapes.append((len(steps), {step.compute_framework for step in steps}))
+
+    assert shapes[0] == shapes[1]
+
+
+_UNPINNED_SLOT = "unpinned"
+_PIN_ORDERS = [
+    pytest.param(["pa", "pd", _UNPINNED_SLOT], id="pins_first"),
+    pytest.param([_UNPINNED_SLOT, "pa", "pd"], id="unpinned_first"),
+    pytest.param(["pa", _UNPINNED_SLOT, "pd"], id="unpinned_middle"),
+]
+
+
+@pytest.mark.parametrize("order", _PIN_ORDERS)
+def test_two_differing_pins_plus_unpinned_merge_nothing_in_any_order(order: list[str]) -> None:
+    by_slot: dict[str, Feature | str] = {
+        "pa": Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PyArrowTable"),
+        "pd": Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PandasDataFrame"),
+        _UNPINNED_SLOT: PinnedUnpinnedSharedRootFG.NAME,
+    }
+
+    _, steps = _shared_root_steps([by_slot[slot] for slot in order])
+
+    assert len(steps) == 3
+
+
+class PinnedUnpinnedSharedConsumerFG(_PlanConsumer):
+    OUTPUT = "pinned_unpinned_shared_consumer"
+    FW_NAME = "PyArrowTable"
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({cls.OUTPUT: [1, 2, 3]})
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {
+            Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PyArrowTable"),
+            Feature(PinnedUnpinnedSharedRootFG.NAME),
+        }
+
+
+_SHARED_CONSUMER_PLUGINS = PluginCollector.enabled_feature_groups(
+    {PinnedUnpinnedSharedRootFG, PinnedUnpinnedSharedConsumerFG}
+)
+
+
+def test_pinned_and_unpinned_consumer_inputs_share_one_read() -> None:
+    out = PinnedUnpinnedSharedConsumerFG.OUTPUT
+
+    _, steps = _shared_root_steps([out], plugins=_SHARED_CONSUMER_PLUGINS)
+
+    assert [step.compute_framework for step in steps] == [PyArrowTable]
+
+    result = mloda.run_all(
+        [out], compute_frameworks=[PandasDataFrame, PyArrowTable], plugin_collector=_SHARED_CONSUMER_PLUGINS
+    )
+
+    assert len(result) == 1
+    assert isinstance(result[0], pa.Table)
+    assert result[0].column_names == [out]
+    assert result[0][out].to_pylist() == [1, 2, 3]
+
+
+class PinnedInputCopyConsumerFG(_PlanConsumer):
+    OUTPUT = "pinned_input_copy_consumer"
+    FW_NAME = "PyArrowTable"
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({cls.OUTPUT: [1, 2, 3]})
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PandasDataFrame")}
+
+
+_PINNED_COPY_PLUGINS = PluginCollector.enabled_feature_groups({PinnedUnpinnedSharedRootFG, PinnedInputCopyConsumerFG})
+_COPY_ORDERS = [
+    pytest.param(["unpinned", "pa", "consumer"], id="unpinned_first"),
+    pytest.param(["pa", "unpinned", "consumer"], id="unpinned_middle"),
+    pytest.param(["consumer", "pa", "unpinned"], id="consumer_first"),
+]
+
+
+@pytest.mark.parametrize("order", _COPY_ORDERS)
+def test_unpinned_request_folds_into_exact_pinned_twin_despite_pinned_input_copy(order: list[str]) -> None:
+    by_slot: dict[str, Feature | str] = {
+        "unpinned": PinnedUnpinnedSharedRootFG.NAME,
+        "pa": Feature(PinnedUnpinnedSharedRootFG.NAME, compute_framework="PyArrowTable"),
+        "consumer": PinnedInputCopyConsumerFG.OUTPUT,
+    }
+
+    _, steps = _shared_root_steps([by_slot[slot] for slot in order], plugins=_PINNED_COPY_PLUGINS)
+
+    assert sorted(step.compute_framework.__name__ for step in steps) == ["PandasDataFrame", "PyArrowTable"]
+
+
+def _fold_copy(frameworks: set[type[ComputeFramework]], data_type: DataType | None, requested: bool) -> Feature:
+    copy_ = Feature(PinnedUnpinnedSharedRootFG.NAME, data_type=data_type, initial_requested_data=requested)
+    copy_.compute_frameworks = frameworks
+    return copy_
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "nested_chain",
+        "conflicting_types",
+        "conflicting_types_swapped",
+        "untyped_request_and_typed_request",
+        "typed_request_vs_untyped_request_pinned",
+    ],
+)
+def test_narrower_fold_keeps_every_parent_alive_and_types_consistent(shape: str) -> None:
+    pa_, pd_, pdict = PyArrowTable, PandasDataFrame, PythonDictFramework
+    tied_owner = 0
+    if shape == "nested_chain":
+        copies = [
+            _fold_copy({pa_, pd_, pdict}, None, False),
+            _fold_copy({pa_, pd_}, None, False),
+            _fold_copy({pa_}, DataType.INT64, True),
+        ]
+    elif shape == "conflicting_types":
+        copies = [
+            _fold_copy({pa_}, None, False),
+            _fold_copy({pa_, pdict}, DataType.INT64, True),
+            _fold_copy({pd_, pa_, pdict}, DataType.INT32, True),
+        ]
+        tied_owner = 1
+    elif shape == "conflicting_types_swapped":
+        copies = [
+            _fold_copy({pa_}, None, False),
+            _fold_copy({pa_, pdict}, DataType.INT32, True),
+            _fold_copy({pd_, pa_, pdict}, DataType.INT64, True),
+        ]
+        tied_owner = 2
+    elif shape == "untyped_request_and_typed_request":
+        copies = [
+            _fold_copy({pa_, pdict}, None, True),
+            _fold_copy({pa_, pdict}, DataType.INT64, True),
+            _fold_copy({pa_}, None, False),
+        ]
+    else:
+        copies = [_fold_copy({pa_, pdict}, DataType.INT64, True), _fold_copy({pa_}, None, True)]
+    consumers = {copy_.uuid: uuid4() for copy_ in copies}
+    other = uuid4()
+    engine = Engine.__new__(Engine)
+    engine.feature_group_collection = {PinnedUnpinnedSharedRootFG: set(copies)}
+    engine.global_filter = None
+    engine.filter_ties = [(copies[tied_owner].uuid, other)]
+    engine.feature_link_parents = defaultdict(set)
+    for copy_ in copies:
+        engine.feature_link_parents[copy_.uuid] = set()
+        engine.feature_link_parents[consumers[copy_.uuid]] = {copy_.uuid}
+    engine.specialized_from = {}
+    engine.resolved_input_feature_names = {}
+    engine.input_feature_columns = {}
+    engine._declared_options_by_uuid = {}
+    engine._cascade_keys_at_resolution = {}
+
+    engine._fold_into_narrower_twins()
+
+    alive = {f.uuid: f for f in engine.feature_group_collection[PinnedUnpinnedSharedRootFG]}
+    for consumer in consumers.values():
+        assert engine.feature_link_parents[consumer] <= alive.keys()
+    if shape == "nested_chain":
+        assert list(alive) == [copies[2].uuid]
+        assert engine.filter_ties == [(copies[2].uuid, other)]
+    elif shape == "conflicting_types":
+        assert {u: f.data_type for u, f in alive.items()} == {
+            copies[0].uuid: DataType.INT32,
+            copies[1].uuid: DataType.INT64,
+        }
+        assert engine.filter_ties == [(copies[1].uuid, other)]
+    elif shape == "untyped_request_and_typed_request":
+        assert set(alive) == {copies[0].uuid, copies[2].uuid}
+        assert alive[copies[0].uuid].data_type is None
+        assert alive[copies[2].uuid].data_type == DataType.INT64
+        assert alive[copies[2].uuid].initial_requested_data is True
+    elif shape == "conflicting_types_swapped":
+        assert {u: f.data_type for u, f in alive.items()} == {
+            copies[0].uuid: DataType.INT32,
+            copies[2].uuid: DataType.INT64,
+        }
+        assert engine.filter_ties == [(copies[2].uuid, other)]
+    else:
+        assert set(alive) == {copies[0].uuid, copies[1].uuid}
+
+
+def test_pinned_and_unpinned_request_with_differing_options_stay_two_steps() -> None:
+    pinned = Feature(PinnedUnpinnedSharedRootFG.NAME, options={"variant": "a"}, compute_framework="PyArrowTable")
+
+    _, steps = _shared_root_steps([pinned, PinnedUnpinnedSharedRootFG.NAME])
+
+    assert len(steps) == 2
+
+
+# --- a step whose parents already run in a connection-required framework keeps it -------------------
+
+_BD_DUCK_PYARROW = ("DuckDBFramework", "PyArrowTable")
+
+
+class _BdDuckRoot(_PlanRoot):
+    """DuckDB root serving DATA as a relation; CONN (when set) is the shared connection."""
+
+    FW_NAME = "DuckDBFramework"
+    DATA: ClassVar[dict[str, list[int]]] = {}
+    CONN: ClassVar[Any] = None
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        import duckdb
+
+        from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_relation import DuckdbRelation
+
+        return DuckdbRelation.from_dict(cls.CONN or duckdb.connect(), cls.DATA)
+
+
+class BdDuckRoot(_BdDuckRoot):
+    NAMES = ("bd_root",)
+    DATA = {"bd_root": [1, 2, 3]}
+
+
+class BdArrowRoot(_PlanRoot):
+    NAMES = ("bd_arrow_root",)
+    FW_NAME = "PyArrowTable"
+
+
+class BdDuckConsumer(_PlanConsumer):
+    INPUTS = ("bd_root",)
+    OUTPUT = "bd_out"
+    RULE = _BD_DUCK_PYARROW
+    SEEN: ClassVar[list[str]] = []
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        cls.SEEN.append(type(data).__name__)
+        return data.project('"bd_root" AS "bd_out"')
+
+
+class BdArrowOutConsumer(_PlanConsumer):
+    INPUTS = ("bd_root",)
+    OUTPUT = "bd_out_np"
+    RULE = _BD_DUCK_PYARROW
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({"bd_out_np": data.to_arrow_table()["bd_root"]})
+
+
+class BdArrowRootConsumer(_PlanConsumer):
+    INPUTS = ("bd_arrow_root",)
+    OUTPUT = "bd_pa_out"
+    RULE = _BD_DUCK_PYARROW
+
+
+class BdLeftRoot(_BdDuckRoot):
+    NAMES = ("bd_l_val", "bd_lidx")
+    INDEXES = ("bd_lidx",)
+    DATA = {"bd_l_val": [10, 20, 30], "bd_lidx": [1, 2, 3]}
+
+
+class BdRightRoot(_BdDuckRoot):
+    NAMES = ("bd_r_val", "bd_ridx")
+    INDEXES = ("bd_ridx",)
+    DATA = {"bd_r_val": [4, 5, 6], "bd_ridx": [1, 2, 3]}
+
+
+class BdJoinConsumer(_PlanConsumer):
+    INPUTS = ("bd_l_val", "bd_r_val")
+    OUTPUT = "bd_join_out"
+    RULE = _BD_DUCK_PYARROW
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return data.project('"bd_l_val" AS "bd_join_out"')
+
+
+class BdMixedArrowRoot(_PlanRoot):
+    NAMES = ("bd_mx_arrow", "bd_mx_ridx")
+    INDEXES = ("bd_mx_ridx",)
+    FW_NAME = "PyArrowTable"
+
+
+class BdMixedDuckRoot(_PlanRoot):
+    NAMES = ("bd_mx_duck", "bd_mx_lidx")
+    INDEXES = ("bd_mx_lidx",)
+    FW_NAME = "DuckDBFramework"
+
+
+class BdMixedConsumer(_PlanConsumer):
+    INPUTS = ("bd_mx_duck", "bd_mx_arrow")
+    OUTPUT = "bd_mx_out"
+    RULE = _BD_DUCK_PYARROW
+
+
+class BdDacConsumer(_PlanConsumer):
+    INPUTS = ("bd_arrow_root",)
+    OUTPUT = "bd_dac_out"
+    RULE = ("DuckDBFramework", "PandasDataFrame")
+
+
+_BD_ORDERS = [
+    pytest.param(["PyArrowTable", "DuckDBFramework"], id="pyarrow_first"),
+    pytest.param(["DuckDBFramework", "PyArrowTable"], id="duckdb_first"),
+]
+
+
+def _bd_frameworks(order: list[str]) -> list[type[ComputeFramework]]:
+    pytest.importorskip("duckdb")
+    return [_load_framework(_MODULE_OF[name], name) for name in order]
+
+
+def _bd_values(frame: Any) -> dict[str, list[Any]]:
+    table = frame.to_arrow_table() if hasattr(frame, "to_arrow_table") else frame
+    return {name: table[name].to_pylist() for name in table.column_names}
+
+
+@pytest.mark.parametrize("output", [None, PyArrowTable], ids=["no_output", "pyarrow_output"])
+@pytest.mark.parametrize("order", _BD_ORDERS)
+def test_a_consumer_of_a_duckdb_native_parent_plans_on_duckdb_and_receives_the_relation(
+    order: list[str], output: type[ComputeFramework] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(BdDuckConsumer, "SEEN", seen)
+    frameworks = _bd_frameworks(order)
+    collector = PluginCollector.enabled_feature_groups({BdDuckRoot, BdDuckConsumer})
+
+    steps = _plan(["bd_out"], {BdDuckRoot, BdDuckConsumer}, frameworks, output_framework=output)
+    assert _compute_names(steps, BdDuckConsumer) == {"DuckDBFramework"}
+    assert _transforms(steps) == []
+    if output is not None and order[0] == "PyArrowTable":
+        (consumer_step,) = _compute_steps(steps, BdDuckConsumer)
+        assert consumer_step.compute_framework_reason == "converts later"
+
+    result = mloda.run_all(
+        ["bd_out"], compute_frameworks=frameworks, plugin_collector=collector, output_framework=output
+    )
+    assert seen == ["DuckdbRelation"]
+    assert isinstance(result[0], pa.Table)
+    assert _bd_values(result[0]) == {"bd_out": [1, 2, 3]}
+
+
+def test_a_borrowed_duckdb_step_returning_arrow_converts_on_the_adopted_connection() -> None:
+    result = mloda.run_all(
+        ["bd_out_np"],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        plugin_collector=PluginCollector.enabled_feature_groups({BdDuckRoot, BdArrowOutConsumer}),
+    )
+
+    assert _bd_values(result[0]) == {"bd_out_np": [1, 2, 3]}
+
+
+def test_a_join_of_duckdb_native_parents_on_one_connection_runs_on_the_adopted_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    monkeypatch.setattr(_BdDuckRoot, "CONN", duckdb.connect())
+    links = {Link.inner(JoinSpec(BdLeftRoot, "bd_lidx"), JoinSpec(BdRightRoot, "bd_ridx"))}
+
+    result = mloda.run_all(
+        ["bd_join_out"],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        links=links,
+        plugin_collector=PluginCollector.enabled_feature_groups({BdLeftRoot, BdRightRoot, BdJoinConsumer}),
+    )
+
+    assert sorted(_bd_values(result[0])["bd_join_out"]) == [10, 20, 30]
+
+
+_BD_MIXED_LINKS = {Link.inner(JoinSpec(BdMixedDuckRoot, "bd_mx_lidx"), JoinSpec(BdMixedArrowRoot, "bd_mx_ridx"))}
+
+
+@pytest.mark.parametrize("order", _BD_ORDERS)
+@pytest.mark.parametrize(
+    ("feature", "groups", "consumer", "links"),
+    [
+        pytest.param("bd_pa_out", {BdArrowRoot, BdArrowRootConsumer}, BdArrowRootConsumer, None, id="pyarrow_only"),
+        pytest.param(
+            "bd_mx_out",
+            {BdMixedDuckRoot, BdMixedArrowRoot, BdMixedConsumer},
+            BdMixedConsumer,
+            _BD_MIXED_LINKS,
+            id="duckdb_and_pyarrow",
+        ),
+    ],
+)
+def test_a_consumer_with_a_pyarrow_parent_and_no_connection_plans_on_pyarrow(
+    order: list[str],
+    feature: str,
+    groups: set[type[FeatureGroup]],
+    consumer: type[FeatureGroup],
+    links: set[Link] | None,
+) -> None:
+    steps = _plan([feature], groups, _bd_frameworks(order), links=links)
+
+    assert _compute_names(steps, consumer) == {"PyArrowTable"}
+
+
+def _bd_dac_names(connections: int | None) -> set[str | None]:
+    frameworks = _bd_frameworks(["DuckDBFramework", "PandasDataFrame", "PyArrowTable"])
+    access = None
+    if connections is not None:
+        import duckdb
+
+        access = DataAccessCollection(connections={duckdb.connect() for _ in range(connections)})
+    steps = mloda.explain(
+        ["bd_dac_out"],
+        compute_frameworks=frameworks,
+        data_access_collection=access,
+        plugin_collector=PluginCollector.enabled_feature_groups({BdArrowRoot, BdDacConsumer}),
+    )
+    return _compute_names(steps, BdDacConsumer)
+
+
+@pytest.mark.parametrize(
+    ("connections", "expected"),
+    [(1, "DuckDBFramework"), (None, "PandasDataFrame"), (2, "PandasDataFrame")],
+    ids=["one_connection", "no_dac", "two_connections"],
+)
+def test_the_dac_connection_lets_a_consumer_with_parents_run_on_duckdb(connections: int | None, expected: str) -> None:
+    assert _bd_dac_names(connections) == {expected}
+
+
+def test_a_consumer_narrowed_to_a_pinned_filter_does_not_borrow_duckdb() -> None:
+    global_filter = GlobalFilter()
+    global_filter.add_filter(Feature("bd_out", compute_framework="PyArrowTable"), "min", {"value": 2})
+
+    steps = mloda.explain(
+        ["bd_out"],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        global_filter=global_filter,
+        plugin_collector=PluginCollector.enabled_feature_groups({BdDuckRoot, BdDuckConsumer}),
+    )
+
+    assert _compute_names(steps, BdDuckConsumer) == {"PyArrowTable"}
+
+
+class BdOptLeftRoot(_PlanRoot):
+    NAMES = ("bd_o_l_val", "bd_o_lidx")
+    INDEXES = ("bd_o_lidx",)
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({"bd_o_l_val": [10, 20, 30], "bd_o_lidx": [1, 2, 3]})
+
+
+class BdOptRightRoot(_PlanRoot):
+    NAMES = ("bd_o_r_val", "bd_o_ridx")
+    INDEXES = ("bd_o_ridx",)
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({"bd_o_r_val": [4, 5, 6], "bd_o_ridx": [1, 2, 3]})
+
+
+class BdOptConsumer(_PlanConsumer):
+    OUTPUT = "bd_o_out"
+    RULE = _BD_DUCK_PYARROW
+    HANDLES: ClassVar[tuple[str, str]] = ("a", "a")
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        left, right = self.HANDLES
+        return {
+            Feature("bd_o_l_val", options=Options(context={"connection_handle": left})),
+            Feature("bd_o_r_val", options=Options(context={"connection_handle": right})),
+        }
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        if hasattr(data, "project"):
+            return data.project('"bd_o_l_val" AS "bd_o_out"')
+        return pa.table({"bd_o_out": data["bd_o_l_val"]})
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["different_connections", "one_connection"])
+def test_a_consumer_of_parents_with_dac_handles_borrows_duckdb_only_on_one_connection(
+    shared: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    monkeypatch.setattr(BdOptConsumer, "HANDLES", ("a", "a" if shared else "b"))
+    access = DataAccessCollection(connections={"a": duckdb.connect(), "b": duckdb.connect()})
+    links = {Link.inner(JoinSpec(BdOptLeftRoot, "bd_o_lidx"), JoinSpec(BdOptRightRoot, "bd_o_ridx"))}
+    groups = {BdOptLeftRoot, BdOptRightRoot, BdOptConsumer}
+    frameworks = _bd_frameworks(["DuckDBFramework", "PyArrowTable"])
+
+    steps = mloda.explain(
+        ["bd_o_out"],
+        compute_frameworks=frameworks,
+        links=links,
+        data_access_collection=access,
+        plugin_collector=PluginCollector.enabled_feature_groups(groups),
+    )
+    if not shared:
+        assert "DuckDBFramework" not in _compute_names(steps, BdOptConsumer)
+
+    result = mloda.run_all(
+        ["bd_o_out"],
+        compute_frameworks=frameworks,
+        links=links,
+        data_access_collection=access,
+        plugin_collector=PluginCollector.enabled_feature_groups(groups),
+    )
+    assert sorted(_bd_values(result[0])["bd_o_out"]) == [10, 20, 30]
+
+
+class BdDacMixConsumer(_PlanConsumer):
+    INPUTS = ("bd_l_val", "bd_mx_arrow")
+    OUTPUT = "bd_dm_out"
+    RULE = _BD_DUCK_PYARROW
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        if hasattr(data, "project"):
+            return data.project('"bd_l_val" AS "bd_dm_out"')
+        return pa.table({"bd_dm_out": data["bd_l_val"]})
+
+
+def test_a_dac_connection_differing_from_a_parents_own_connection_keeps_the_consumer_on_pyarrow() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    links = {Link.inner(JoinSpec(BdLeftRoot, "bd_lidx"), JoinSpec(BdMixedArrowRoot, "bd_mx_ridx"))}
+    groups = {BdLeftRoot, BdMixedArrowRoot, BdDacMixConsumer}
+    frameworks = _bd_frameworks(["DuckDBFramework", "PyArrowTable"])
+
+    def access() -> DataAccessCollection:
+        return DataAccessCollection(connections={duckdb.connect()})
+
+    steps = mloda.explain(
+        ["bd_dm_out"],
+        compute_frameworks=frameworks,
+        links=links,
+        data_access_collection=access(),
+        plugin_collector=PluginCollector.enabled_feature_groups(groups),
+    )
+    assert _compute_names(steps, BdDacMixConsumer) == {"PyArrowTable"}
+
+    result = mloda.run_all(
+        ["bd_dm_out"],
+        compute_frameworks=frameworks,
+        links=links,
+        data_access_collection=access(),
+        plugin_collector=PluginCollector.enabled_feature_groups(groups),
+    )
+    assert sorted(_bd_values(result[0])["bd_dm_out"]) == [10, 20, 30]
+
+
+# --- candidacy and per-root, per-handle keying from DataAccessCollection connections ----------------
+
+
+class CkRoot(_PlanRoot):
+    NAMES = ("ck_root",)
+
+
+def _ck_handle(handle: str) -> Options:
+    return Options(group={"connection_handle": handle})
+
+
+def _ck_named() -> DataAccessCollection:
+    import duckdb
+
+    return DataAccessCollection({"a": duckdb.connect(), "b": duckdb.connect()})
+
+
+def _ck_single() -> DataAccessCollection:
+    import duckdb
+
+    return DataAccessCollection({"only": duckdb.connect()})
+
+
+@pytest.mark.parametrize(
+    ("access", "options"),
+    [
+        pytest.param(_ck_single, None, id="single_match"),
+        pytest.param(_ck_named, _ck_handle("b"), id="connection_handle"),
+    ],
+)
+def test_a_root_with_a_resolvable_dac_connection_is_a_duckdb_candidate(access: Any, options: Options | None) -> None:
+    steps = mloda.explain(
+        [Feature("ck_root", options=options or Options())],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        data_access_collection=access(),
+        plugin_collector=PluginCollector.enabled_feature_groups({CkRoot}),
+    )
+
+    assert _compute_names(steps, CkRoot) == {"DuckDBFramework"}
+
+
+def test_a_global_filter_tied_to_a_host_root_takes_the_hosts_handle_among_two_connections() -> None:
+    global_filter = GlobalFilter()
+    global_filter.add_filter("ck_root", "equal", {"value": 2})
+
+    steps = mloda.explain(
+        [Feature("ck_root", options=_ck_handle("b"))],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        data_access_collection=_ck_named(),
+        global_filter=global_filter,
+        plugin_collector=PluginCollector.enabled_feature_groups({CkRoot}),
+    )
+
+    assert _compute_names(steps, CkRoot) == {"DuckDBFramework"}
+
+
+def test_two_unnamed_connections_without_a_handle_drop_duckdb_and_the_reason_names_both() -> None:
+    duckdb = pytest.importorskip("duckdb")
+
+    steps = mloda.explain(
+        ["ck_root"],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        data_access_collection=DataAccessCollection(connections={duckdb.connect(), duckdb.connect()}),
+        plugin_collector=PluginCollector.enabled_feature_groups({CkRoot}),
+    )
+
+    assert _compute_names(steps, CkRoot) == {"PyArrowTable"}
+    (step,) = _compute_steps(steps, CkRoot)
+    reason = str(step.compute_framework_reason)
+    assert "_auto_connection" not in reason
+    assert "2" in reason
+    assert "connection_handle" in reason
+    assert "DuckDBFramework: " in reason
+
+
+class CkJoinConsumer(_PlanConsumer):
+    OUTPUT = "ck_join_out"
+    RULE: ClassVar[tuple[str, ...]] = _BD_DUCK_PYARROW
+    HANDLES: ClassVar[tuple[str, str]] = ("a", "b")
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        left, right = self.HANDLES
+        return {
+            Feature("bd_l_val", options=_ck_handle(left)),
+            Feature("bd_r_val", options=_ck_handle(right)),
+        }
+
+
+_CK_LINKS = {Link.inner(JoinSpec(BdLeftRoot, "bd_lidx"), JoinSpec(BdRightRoot, "bd_ridx"))}
+_CK_GROUPS: set[type[FeatureGroup]] = {BdLeftRoot, BdRightRoot, CkJoinConsumer}
+
+
+def _ck_join(request: Feature | str, handles: tuple[str, str], monkeypatch: pytest.MonkeyPatch) -> list[PlanStep]:
+    monkeypatch.setattr(CkJoinConsumer, "HANDLES", handles)
+    return mloda.explain(
+        [request],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        links=_CK_LINKS,
+        data_access_collection=_ck_named(),
+        plugin_collector=PluginCollector.enabled_feature_groups(_CK_GROUPS),
+    )
+
+
+class CkFreeLeftRoot(_PlanRoot):
+    NAMES = ("ck_f_l_val", "ck_f_lidx")
+    INDEXES = ("ck_f_lidx",)
+
+
+class CkFreeRightRoot(_PlanRoot):
+    NAMES = ("ck_f_r_val", "ck_f_ridx")
+    INDEXES = ("ck_f_ridx",)
+
+
+class CkFreeJoinConsumer(_PlanConsumer):
+    OUTPUT = "ck_free_out"
+    RULE = _BD_DUCK_PYARROW
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {
+            Feature("ck_f_l_val", options=_ck_handle("a"), compute_framework="DuckDBFramework"),
+            Feature("ck_f_r_val", options=_ck_handle("b")),
+        }
+
+
+def test_a_join_of_duckdb_roots_on_different_handles_does_not_plan_on_duckdb() -> None:
+    groups: set[type[FeatureGroup]] = {CkFreeLeftRoot, CkFreeRightRoot, CkFreeJoinConsumer}
+    steps = mloda.explain(
+        ["ck_free_out"],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+        links={Link.inner(JoinSpec(CkFreeLeftRoot, "ck_f_lidx"), JoinSpec(CkFreeRightRoot, "ck_f_ridx"))},
+        data_access_collection=_ck_named(),
+        plugin_collector=PluginCollector.enabled_feature_groups(groups),
+    )
+
+    assert _compute_names(steps, CkFreeLeftRoot) == {"DuckDBFramework"}
+    assert _compute_names(steps, CkFreeJoinConsumer) == {"PyArrowTable"}
+
+
+def test_a_join_of_duckdb_roots_on_one_handle_may_stay_on_duckdb(monkeypatch: pytest.MonkeyPatch) -> None:
+    steps = _ck_join("ck_join_out", ("a", "a"), monkeypatch)
+
+    assert _compute_names(steps, CkJoinConsumer) == {"DuckDBFramework"}
+
+
+def test_a_pinned_duckdb_consumer_of_parents_on_two_handles_fails_at_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+    pinned = Feature("ck_join_out", compute_framework="DuckDBFramework")
+
+    with pytest.raises(Exception, match="connection") as raised:
+        _ck_join(pinned, ("a", "b"), monkeypatch)
+
+    message = str(raised.value)
+    assert "'a'" in message
+    assert "'b'" in message
+
+
+class CkDuckOnlyJoinConsumer(CkJoinConsumer):
+    OUTPUT = "ck_only_out"
+    RULE = ("DuckDBFramework",)
+
+
+def test_a_duckdb_only_consumer_of_parents_on_two_handles_fails_at_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(CkJoinConsumer, "HANDLES", ("a", "b"))
+
+    with pytest.raises(Exception, match="connection") as raised:
+        mloda.explain(
+            ["ck_only_out"],
+            compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+            links=_CK_LINKS,
+            data_access_collection=_ck_named(),
+            plugin_collector=PluginCollector.enabled_feature_groups({BdLeftRoot, BdRightRoot, CkDuckOnlyJoinConsumer}),
+        )
+
+    message = str(raised.value)
+    assert "'a'" in message
+    assert "'b'" in message
+
+
+class CkTwoFamilyRoot(_PlanRoot):
+    NAMES = ("ck_t_d1", "ck_t_d2", "ck_t_s1", "ck_t_s2")
+
+
+class CkTwoFamilyConsumer(_PlanConsumer):
+    OUTPUT = "ck_two_family_out"
+    RULE = ("DuckDBFramework", "SqliteFramework")
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        pairs = (("ck_t_d1", "d1"), ("ck_t_d2", "d2"), ("ck_t_s1", "s1"), ("ck_t_s2", "s2"))
+        return {Feature(name, options=_ck_handle(handle)) for name, handle in pairs}
+
+
+def test_emptying_a_multi_framework_domain_by_connection_conflicts_raises_the_labelled_error() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    access = DataAccessCollection(
+        {
+            "d1": duckdb.connect(),
+            "d2": duckdb.connect(),
+            "s1": sqlite3.connect(":memory:"),
+            "s2": sqlite3.connect(":memory:"),
+        }
+    )
+    frameworks = _bd_frameworks(["PyArrowTable", "DuckDBFramework", "SqliteFramework"])
+
+    with pytest.raises(ValueError, match="different connections"):
+        mloda.explain(
+            ["ck_two_family_out"],
+            compute_frameworks=frameworks,
+            data_access_collection=access,
+            plugin_collector=PluginCollector.enabled_feature_groups({CkTwoFamilyRoot, CkTwoFamilyConsumer}),
+        )
+
+
+class CkTwoHandleJoinConsumer(_PlanConsumer):
+    """Two outputs over one shared pair of parents (the handle is not forwarded), each on its own handle."""
+
+    RULE = ("DuckDBFramework",)
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"ck_j_a", "ck_j_b"}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("bd_l_val", forward_group=False), Feature("bd_r_val", forward_group=False)}
+
+
+def test_consumers_of_one_join_on_different_handles_fail_at_planning_naming_both() -> None:
+    with pytest.raises(Exception, match="connection") as raised:
+        mloda.explain(
+            [Feature("ck_j_a", options=_ck_handle("a")), Feature("ck_j_b", options=_ck_handle("b"))],
+            compute_frameworks=_bd_frameworks(["DuckDBFramework", "PyArrowTable"]),
+            links=_CK_LINKS,
+            data_access_collection=_ck_named(),
+            plugin_collector=PluginCollector.enabled_feature_groups({BdLeftRoot, BdRightRoot, CkTwoHandleJoinConsumer}),
+        )
+
+    message = str(raised.value)
+    assert "'a'" in message
+    assert "'b'" in message
+
+
+class BdDacRunConsumer(_PlanConsumer):
+    INPUTS = ("bd_arrow_root",)
+    OUTPUT = "bd_dac_run_out"
+    RULE = ("DuckDBFramework", "PandasDataFrame")
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pa.table({"bd_dac_run_out": data.to_arrow_table()["bd_arrow_root"]})
+
+
+def test_a_consumer_on_the_one_dac_connection_receives_a_duckdb_relation_and_runs() -> None:
+    duckdb = pytest.importorskip("duckdb")
+
+    result = mloda.run_all(
+        ["bd_dac_run_out"],
+        compute_frameworks=_bd_frameworks(["DuckDBFramework", "PandasDataFrame", "PyArrowTable"]),
+        data_access_collection=DataAccessCollection(connections={duckdb.connect()}),
+        plugin_collector=PluginCollector.enabled_feature_groups({BdArrowRoot, BdDacRunConsumer}),
+    )
+
+    assert _bd_values(result[0]) == {"bd_dac_run_out": [1, 2, 3]}
+
+
+class BdSqliteRoot(_PlanRoot):
+    NAMES = ("bd_sq_root",)
+    FW_NAME = "SqliteFramework"
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_relation import SqliteRelation
+
+        return SqliteRelation.from_dict(sqlite3.connect(":memory:"), {"bd_sq_root": [1, 2, 3]})
+
+
+class BdSqliteConsumer(_PlanConsumer):
+    INPUTS = ("bd_sq_root",)
+    OUTPUT = "bd_sq_out"
+    RULE = ("SqliteFramework", "PyArrowTable")
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return data.select(_raw_sql='"bd_sq_root" AS "bd_sq_out"')
+
+
+def test_a_consumer_of_a_sqlite_native_parent_plans_on_sqlite_without_a_transform() -> None:
+    frameworks = [_load_framework(_MODULE_OF[name], name) for name in ("PyArrowTable", "SqliteFramework")]
+
+    steps = _plan(["bd_sq_out"], {BdSqliteRoot, BdSqliteConsumer}, frameworks)
+
+    assert _compute_names(steps, BdSqliteConsumer) == {"SqliteFramework"}
+    assert _transforms(steps) == []
+
+
+def test_a_run_of_a_sqlite_native_consumer_returns_a_materialized_table() -> None:
+    frameworks = [_load_framework(_MODULE_OF[name], name) for name in ("PyArrowTable", "SqliteFramework")]
+
+    result = mloda.run_all(
+        ["bd_sq_out"],
+        compute_frameworks=frameworks,
+        plugin_collector=PluginCollector.enabled_feature_groups({BdSqliteRoot, BdSqliteConsumer}),
+    )
+
+    assert isinstance(result[0], pa.Table)
+    assert _bd_values(result[0]) == {"bd_sq_out": [1, 2, 3]}
+    (step, frame), *_ = result.frames()
+    assert frame is result[0]
+    assert step.result_framework_name == "PyArrowTable"
+
+
+# --- plan-time neutral-load feasibility for a file root ---------------------------------------------
+
+
+class _NlMarker:
+    """Target type of the throwaway framework; no transformer reaches it from FileSource."""
+
+
+class _NlConn:
+    """Fake connection the throwaway REQUIRED framework adopts."""
+
+
+def _nl_framework() -> type[ComputeFramework]:
+    """Defined per call so discovery of other tests never sees it for long."""
+    from mloda.provider import ConnectionRequirement
+
+    class NlRequiredThrowawayFramework(ComputeFramework):
+        @classmethod
+        def connection_requirement(cls) -> ConnectionRequirement:
+            return ConnectionRequirement.REQUIRED
+
+        @classmethod
+        def _connection_matches(cls, conn: Any) -> bool:
+            return isinstance(conn, _NlConn)
+
+        @classmethod
+        def expected_data_framework(cls) -> Any:
+            return _NlMarker
+
+    return NlRequiredThrowawayFramework
+
+
+def _nl_plan(
+    framework: type[ComputeFramework],
+    tmp_path: Path,
+    pinned: bool,
+    frameworks: list[type[ComputeFramework]] | None = None,
+) -> list[PlanStep]:
+    csv_file = tmp_path / "nl_data.csv"
+    csv_file.write_text("nl_col\n1\n2\n")
+    feature = Feature("nl_col")
+    if pinned:
+        # By class: a name lookup could hit a same-named throwaway of another test that is not yet collected.
+        feature.compute_frameworks = {framework}
+    return mloda.explain(
+        [feature],
+        compute_frameworks=frameworks if frameworks is not None else [framework, PythonDictFramework],
+        data_access_collection=DataAccessCollection(files={"nl_file": str(csv_file)}, connections={"c": _NlConn()}),
+        plugin_collector=PluginCollector.enabled_feature_groups({CsvFG}),
+    )
+
+
+def test_a_file_root_does_not_plan_on_a_required_framework_no_transformer_reaches(tmp_path: Path) -> None:
+    framework = _nl_framework()
+
+    steps = [s for s in _nl_plan(framework, tmp_path, pinned=False) if s.step_kind == "compute"]
+
+    assert [s.compute_framework_name for s in steps] == ["PythonDictFramework"]
+    reason = str(steps[0].compute_framework_reason)
+    assert "NlRequiredThrowawayFramework" in reason
+    assert "transformer" in reason
+    assert "FileSource" in reason
+
+
+def test_a_file_root_pinned_to_a_framework_no_transformer_reaches_raises_at_planning(tmp_path: Path) -> None:
+    framework = _nl_framework()
+
+    with pytest.raises(ValueError) as raised:
+        _nl_plan(framework, tmp_path, pinned=True)
+
+    message = str(raised.value)
+    assert "FileSource" in message
+    assert "_NlMarker" in message
+    assert "transformer" in message
+
+
+def test_a_file_root_whose_only_framework_no_transformer_reaches_fails_at_planning_naming_it(tmp_path: Path) -> None:
+    framework = _nl_framework()
+
+    with pytest.raises(ValueError) as raised:
+        _nl_plan(framework, tmp_path, pinned=False, frameworks=[framework])
+
+    message = str(raised.value)
+    assert "FileSource" in message
+    assert "_NlMarker" in message
+    assert "transformer" in message
+
+
+def test_a_registered_transformer_keeps_the_required_framework_a_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = ComputeFrameworkTransformer.initilize_transformer
+
+    def with_entry(self: ComputeFrameworkTransformer) -> None:
+        original(self)
+        self.transformer_map[(FileSource, _NlMarker)] = BaseTransformer  # type: ignore[type-abstract]
+
+    monkeypatch.setattr(ComputeFrameworkTransformer, "initilize_transformer", with_entry)
+    framework = _nl_framework()
+
+    steps = _nl_plan(framework, tmp_path, pinned=True)
+
+    assert [s.compute_framework_name for s in steps if s.step_kind == "compute"] == [framework.get_class_name()]

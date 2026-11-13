@@ -1,0 +1,174 @@
+"""Value objects a SourceFeatureGroup uses to declare what it claims, plus the match-time scope variable."""
+
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+from mloda.core.abstract_plugins.components.var_scope import PairScope, ResultScope, VarScope
+
+
+class NamePolicy(Enum):
+    """How a route decides that a feature name belongs to its source."""
+
+    CHECKED = "checked"
+    DECLARED = "declared"
+    OPEN = "open"
+
+
+@dataclass(frozen=True)
+class ClaimRoute:
+    """One way a source group claims features; searched routes also fire when mloda searches on its own."""
+
+    source_kind: str
+    names: NamePolicy
+    searched: bool
+    required_options: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_kind, str) or not self.source_kind:
+            raise TypeError(f"ClaimRoute.source_kind must be a non-empty str, got {self.source_kind!r}")
+        if not isinstance(self.names, NamePolicy):
+            raise TypeError(f"ClaimRoute.names must be a NamePolicy, got {self.names!r}")
+        if not isinstance(self.searched, bool):
+            raise TypeError(f"ClaimRoute.searched must be a bool, got {self.searched!r}")
+        if not isinstance(self.required_options, tuple) or not all(isinstance(o, str) for o in self.required_options):
+            raise TypeError(f"ClaimRoute.required_options must be a tuple of str, got {self.required_options!r}")
+
+
+@dataclass(frozen=True)
+class SourceMatch:
+    """A matched source: equality and hash use the credential-free source only, never the access."""
+
+    source: str
+    access: Any = field(compare=False, hash=False, repr=False, default=None)
+
+
+if TYPE_CHECKING:
+    from mloda.core.abstract_plugins.components.input_data.source_feature_group import SourceFeatureGroup
+
+    DataAccessReader = type[SourceFeatureGroup]
+else:
+    DataAccessReader = type
+
+_FEATURE_GROUP_SCOPE: ContextVar[Any] = ContextVar("mloda_feature_group_scope", default=None)
+
+
+_CONTAIN_ABORTS: ContextVar[bool] = ContextVar("mloda_contain_match_aborts", default=False)
+
+
+def aborts_are_contained() -> bool:
+    """True inside the global filter probe, where a match abort must decline instead of raise."""
+    return _CONTAIN_ABORTS.get()
+
+
+_OPEN_CLAIM: ContextVar[list[bool] | None] = ContextVar("mloda_open_claim", default=None)
+
+
+def note_open_claim() -> None:
+    """Record that the candidate being matched claimed through an open route alone; a no-op outside open_claim_scope."""
+    flag = _OPEN_CLAIM.get()
+    if flag is not None:
+        flag[:] = [True]
+
+
+def open_claim_scope() -> ResultScope[list[bool] | None, list[bool]]:
+    """Collect whether the candidate matched inside the block claimed through an open route alone."""
+    flag: list[bool] = []
+    return ResultScope(_OPEN_CLAIM, flag, flag)
+
+
+@dataclass
+class ChainCheck:
+    """The step-aside check for one feature name; answer stays None until the owner computes it."""
+
+    name: str
+    answer: bool | None = None
+    probes: dict[type, Any] = field(default_factory=dict)
+    uses: int = 0
+
+
+class ChainCheckNeeded(BaseException):  # BaseException so match seams that contain Exception let it through
+    def __init__(self, check: ChainCheck) -> None:
+        super().__init__(check.name)
+        self.check = check
+
+
+_CHAIN_CHECK: ContextVar[ChainCheck | None] = ContextVar("mloda_chain_check", default=None)
+
+
+def _check_for(name: str) -> ChainCheck | None:
+    check = _CHAIN_CHECK.get()
+    return check if check is not None and check.name == name else None
+
+
+def chain_check_installed(name: str) -> bool:
+    """True when a step-aside check is installed for name."""
+    return _check_for(name) is not None
+
+
+def chain_check_uses(name: str) -> int:
+    """How often the answer for name was consulted; 0 when no check is installed."""
+    check = _check_for(name)
+    return 0 if check is None else check.uses
+
+
+def computed_elsewhere(name: str) -> bool:
+    """True when a non-source candidate computes name; signals the owner of the check while the answer is unknown."""
+    check = _check_for(name)
+    if check is None:
+        return False
+    if check.answer is None:
+        raise ChainCheckNeeded(check)
+    check.uses += 1
+    return check.answer
+
+
+def remembered_probe(name: str, group: type, probe: Callable[[], Any]) -> Any:
+    """Run probe once per group while a check for name is installed, so a restarted collection does not repeat it."""
+    check = _check_for(name)
+    if check is None:
+        return probe()
+    if group not in check.probes:
+        check.probes[group] = probe()
+    return check.probes[group]
+
+
+def chain_check_scope(check: ChainCheck) -> VarScope[ChainCheck | None]:
+    """Install check for the block."""
+    return VarScope(_CHAIN_CHECK, check)
+
+
+_PIN_SCOPE: ContextVar[tuple[set[str], list[tuple[str, Any]]] | None] = ContextVar("mloda_pin_scope", default=None)
+
+
+def pin_is_unreported(path: str) -> bool:
+    """True unless path was already reported within pin_report_scope."""
+    scope = _PIN_SCOPE.get()
+    return scope is None or path not in scope[0]
+
+
+def note_pending_pin(path: str, rejection: Any) -> None:
+    """Note the record made for a pinned path; it counts as reported only if it survives as the harvest."""
+    scope = _PIN_SCOPE.get()
+    if scope is not None:
+        scope[1].append((path, rejection))
+
+
+def pin_report_scope(
+    reported: set[str],
+) -> ResultScope[tuple[set[str], list[tuple[str, Any]]] | None, list[tuple[str, Any]]]:
+    """Share one reported-pins set across the candidates of a resolution; yields this candidate's pending records."""
+    pending: list[tuple[str, Any]] = []
+    return ResultScope(_PIN_SCOPE, (reported, pending), pending)
+
+
+def current_feature_group_scope() -> Any:
+    """The feature_group= scope of the request being probed, or None."""
+    return _FEATURE_GROUP_SCOPE.get()
+
+
+def feature_group_scope(scope: Any, contain_aborts: bool = False) -> PairScope:
+    """Make scope (or none) current for claim matching inside the block; optionally contain match aborts."""
+    return PairScope(VarScope(_FEATURE_GROUP_SCOPE, scope), VarScope(_CONTAIN_ABORTS, contain_aborts))

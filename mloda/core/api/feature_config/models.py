@@ -1,0 +1,261 @@
+"""
+Data models for feature configuration schema.
+
+This module defines the data models used to validate and parse
+feature configuration files.
+"""
+
+import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields
+from typing import Any
+
+
+@contextmanager
+def error_prefix(prefix: str) -> Iterator[None]:
+    """Prefix a ValueError/TypeError message raised inside, re-raising the same exception object."""
+    try:
+        yield
+    except (ValueError, TypeError) as exc:
+        exc.args = (f"{prefix}: {exc}",)
+        raise
+
+
+def validate_feature_group_scope(value: Any) -> str | None:
+    """Config scope is a non-empty class-name string; the class-object form is Python-only."""
+    # Local import: feature_group pulls in the plugin machinery, which this data-model module stays free of.
+    from mloda.core.abstract_plugins.components.feature import normalize_feature_group_scope
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            "'feature_group' must be a feature group class-name string; "
+            "the class-object form is only available in Python, not in a config"
+        )
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("'feature_group' must be a non-empty feature group class-name string")
+    # Delegate the root-base-name rejection to the canonical predicate; translate its TypeError to a config ValueError.
+    try:
+        normalize_feature_group_scope(stripped)
+    except TypeError:
+        raise ValueError(
+            "'feature_group' cannot be the root FeatureGroup base class name; a concrete subclass name is required"
+        ) from None
+    return value
+
+
+def validate_feature_group_not_in_options(options: dict[str, Any] | None, container_name: str) -> None:
+    """Scope is a config field, not an option: a top-level 'feature_group' key in a container is a misplacement."""
+    if options and "feature_group" in options:
+        raise ValueError(
+            f"'feature_group' must not be a top-level key of '{container_name}'; "
+            "move it next to 'name' as a feature config field"
+        )
+
+
+def validate_context_keys(value: Any, field_name: str) -> None:
+    """A context push key field is None or a list of non-blank strings."""
+    if value is None:
+        return
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"'{field_name}' must be an array of non-empty strings")
+
+
+@dataclass
+class FeatureConfig:
+    """Model for a feature configuration with name and options."""
+
+    # metadata={"nested": True} marks the fields a nested in_features dict supports; the rest are top-level only.
+    name: str = field(metadata={"nested": True})
+    options: dict[str, Any] = field(default_factory=dict, metadata={"nested": True})
+    # A nested in_features dict reuses this field for a single source name or a further nested feature dict.
+    in_features: list[str] | dict[str, Any] | str | None = field(default=None, metadata={"nested": True})
+    group_options: dict[str, Any] | None = None
+    context_options: dict[str, Any] | None = None
+    propagate_context_keys: list[str] | None = None
+    cascade_context_keys: list[str] | None = None
+    column_index: int | None = None
+    feature_group: str | None = field(default=None, metadata={"nested": True})
+    implementation: str | list[str] | None = None
+    keep_index: bool = False
+    index: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the invariants shared by the top-level and the nested feature dict."""
+        if self.options is None:
+            self.options = {}
+        for container_field in ("options", "group_options", "context_options"):
+            container_value = getattr(self, container_field)
+            if container_value is None:
+                continue
+            if not isinstance(container_value, dict):
+                raise ValueError(f"'{container_field}' must be an object, got {type(container_value).__name__}")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(f"'name' must be a non-empty string, got {describe_offender(self.name)}")
+        if self.options and (self.group_options or self.context_options):
+            raise ValueError("Cannot use both 'options' and 'group_options'/'context_options'")
+        for key_field in ("propagate_context_keys", "cascade_context_keys"):
+            validate_context_keys(getattr(self, key_field), key_field)
+            if getattr(self, key_field) and not self.context_options:
+                raise ValueError(
+                    f"'{key_field}' requires 'context_options'; "
+                    "it is meaningless without context options and would otherwise be silently dropped"
+                )
+        if self.column_index is not None:
+            if not isinstance(self.column_index, int) or isinstance(self.column_index, bool):
+                raise ValueError(
+                    f"'column_index' must be a non-negative integer, got {describe_offender(self.column_index)}"
+                )
+            if self.column_index < 0:
+                raise ValueError("'column_index' must be a non-negative integer, got a negative integer")
+        if not isinstance(self.keep_index, bool):
+            raise ValueError(f"'keep_index' must be a boolean, got {describe_offender(self.keep_index)}")
+        if self.index is not None:
+            validate_context_keys(self.index, "index")
+            if not self.index:
+                raise ValueError("'index' must be a non-empty array of non-empty strings")
+            if len(set(self.index)) != len(self.index):
+                raise ValueError("'index' must not repeat a column")
+        validate_feature_group_scope(self.feature_group)
+        validate_feature_group_not_in_options(self.options, "options")
+        validate_feature_group_not_in_options(self.group_options, "group_options")
+        validate_feature_group_not_in_options(self.context_options, "context_options")
+
+
+FEATURE_CONFIG_FIELDS = frozenset(f.name for f in fields(FeatureConfig))
+NESTED_FIELDS = frozenset(f.name for f in fields(FeatureConfig) if f.metadata.get("nested"))
+
+
+def feature_config_error_prefix(position: int, name: Any) -> str:
+    """The 1-based item position, plus its escaped name when usable; an unusable name is the rejected field."""
+    prefix = f"feature config item {position}"
+    if isinstance(name, str) and name.strip():
+        prefix += f" ({render_user_text(name)})"
+    return prefix
+
+
+def render_user_text(text: str) -> str:
+    """Cut user text to 100 characters and JSON-escape it for a message."""
+    shown = text if len(text) <= 100 else text[:100] + "..."
+    return json.dumps(shown)
+
+
+def describe_offender(value: Any) -> str:
+    """Name a rejected dict by its keys and any other value by its type: a value may hold a credential."""
+    if isinstance(value, dict):
+        return f"a dict with keys {sorted(value)}"
+    if isinstance(value, str):
+        if not value:
+            return "an empty string"
+        if not value.strip():
+            return "a blank string"
+    return type(value).__name__
+
+
+def validate_top_level_in_features(value: Any) -> None:
+    """Top-level in_features is an array of source feature names.
+
+    Not a __post_init__ invariant: the nested in_features dict legitimately carries a string or a dict here.
+    """
+    if value is None:
+        return
+    if not isinstance(value, list):
+        raise ValueError(
+            f"'in_features' must be an array of source feature names at the top level of a feature config, got "
+            f"{describe_offender(value)}"
+        )
+    for index, element in enumerate(value):
+        if not isinstance(element, str) or not element.strip():
+            raise ValueError(
+                f"'in_features' must be an array of non-empty source feature names at the top level of a feature "
+                f"config, got element at index {index}: {describe_offender(element)}"
+            )
+
+
+def validate_nested_in_features(value: Any) -> None:
+    """A nested in_features value is a source name, a list of source names, or a further nested feature dict."""
+    if value is None:
+        return
+    if isinstance(value, dict):
+        return
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError(f"'in_features' must be a non-empty source feature name, got {describe_offender(value)}")
+        return
+    if isinstance(value, list):
+        if not value:
+            raise ValueError("'in_features' must not be an empty list; it declares the source features")
+        for index, element in enumerate(value):
+            if isinstance(element, dict):
+                raise ValueError(
+                    "'in_features' as a list holds source feature names only; a nested feature dict is supported "
+                    f"as the direct value of 'in_features', not as a list element, "
+                    f"got element at index {index}: {describe_offender(element)}"
+                )
+            if not isinstance(element, str) or not element.strip():
+                raise ValueError(
+                    f"'in_features' as a list holds non-empty source feature names, "
+                    f"got element at index {index}: {describe_offender(element)}"
+                )
+        return
+    raise ValueError(
+        f"'in_features' must be a source feature name, a list of source feature names, or a nested feature dict, "
+        f"got {describe_offender(value)}"
+    )
+
+
+def parse_nested_feature_config(item: dict[str, Any]) -> FeatureConfig:
+    """Validate a nested in_features dict through FeatureConfig, rejecting unknown and top-level-only keys."""
+    if "name" not in item:
+        raise ValueError(f"Nested in_features must have a 'name' field, keys present: {sorted(item)}")
+
+    # An unknown key is a typo, not a misplacement: let FeatureConfig raise the native TypeError naming it,
+    # before the top-level-only check can misreport it. Both checks precede __post_init__, whose invariants
+    # are top-level semantics and would otherwise give misleading advice for a nested dict.
+    if not FEATURE_CONFIG_FIELDS.issuperset(item):
+        FeatureConfig(**item)
+
+    top_level_only = sorted(key for key in item if key not in NESTED_FIELDS)
+    if top_level_only:
+        raise ValueError(
+            f"{top_level_only} is only valid at the top level of a feature config; "
+            "a nested 'in_features' dict supports 'name', 'options', 'in_features' and 'feature_group' only"
+        )
+    return FeatureConfig(**item)
+
+
+def feature_config_schema() -> dict[str, Any]:
+    """Return JSON Schema for FeatureConfig model.
+
+    FeatureConfig is the enforcement point at both levels; the schema itself is never run by a validator.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "options": {"type": "object", "default": {}},
+            "in_features": {"type": "array", "items": {"type": "string"}},
+            "group_options": {"type": "object"},
+            "context_options": {"type": "object"},
+            "propagate_context_keys": {"type": "array", "items": {"type": "string"}},
+            "cascade_context_keys": {"type": "array", "items": {"type": "string"}},
+            "column_index": {"type": "integer", "minimum": 0},
+            "feature_group": {"type": "string", "minLength": 1},
+            "keep_index": {"type": "boolean"},
+            "index": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "uniqueItems": True},
+            "implementation": {
+                "oneOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+                ]
+            },
+        },
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+
+
+FeatureConfigItem = str | FeatureConfig

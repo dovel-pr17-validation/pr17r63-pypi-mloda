@@ -1,0 +1,473 @@
+# mypy: disable-error-code="arg-type, unused-ignore, method-assign, assignment"
+"""
+Tests for ExecutionOrchestrator.compute_stream() method.
+
+compute_stream() is a generator variant of compute() that yields (UUID, Any) tuples
+as results become available, instead of accumulating them internally.
+"""
+
+from __future__ import annotations
+
+import logging
+import types
+from typing import Any, Generator, Iterator
+from unittest.mock import Mock, MagicMock
+from uuid import UUID, uuid4
+
+import pytest
+
+from mloda.core.abstract_plugins.components.error_utils import MlodaRunError
+from mloda.core.abstract_plugins.components.run_outcome import RunOutcome
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.function_extender import Extender, ExtenderHook
+from mloda.core.abstract_plugins.run_context import RunContext
+from mloda.core.prepare.execution_plan import ExecutionPlan
+from mloda.core.runtime.run import ExecutionOrchestrator
+from mloda.provider import ComputeFramework, FeatureSet, DataCreatorFeatureGroup
+from mloda.user import Feature, PluginCollector, mloda
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+
+
+class TestComputeStreamExists:
+    """Tests that compute_stream exists and has the correct interface."""
+
+    def test_compute_stream_method_exists(self) -> None:
+        """ExecutionOrchestrator should have a compute_stream method."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        assert hasattr(orchestrator, "compute_stream")
+
+    def test_compute_stream_is_callable(self) -> None:
+        """compute_stream should be callable."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        assert callable(orchestrator.compute_stream)
+
+
+class TestComputeStreamReturnsGenerator:
+    """Tests that compute_stream returns a generator."""
+
+    def test_compute_stream_returns_generator(self) -> None:
+        """compute_stream() should return a generator object."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = None
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome()
+        orchestrator.cfw_register = mock_cfw_register
+
+        # Empty execution planner so the loop finishes immediately
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+
+        result = orchestrator.compute_stream()
+
+        assert isinstance(result, types.GeneratorType)
+        # Consume to trigger finally block
+        list(result)
+
+
+class TestComputeStreamYieldsResults:
+    """Tests that compute_stream yields (UUID, Any) tuples from pop_result_data_collection."""
+
+    def test_yields_uuid_and_data_tuples(self) -> None:
+        """compute_stream should yield (UUID, Any) tuples from pop_result_data_collection."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = None
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome()
+        orchestrator.cfw_register = mock_cfw_register
+
+        expected_uuid = uuid4()
+        expected_data = {"column": [1, 2, 3]}
+
+        # Make the planner iterate once then stop (simulating all steps finishing)
+        mock_step = MagicMock()
+        step_uuid = uuid4()
+        mock_step.get_uuids.return_value = {step_uuid}
+
+        call_count = 0
+
+        def planner_iter() -> Iterator[Any]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return iter([])
+            return iter([])
+
+        mock_planner.__iter__ = Mock(side_effect=planner_iter)
+
+        # Mock pop_result_data_collection to yield one result, then empty on subsequent calls
+        pop_call_count = 0
+
+        def mock_pop() -> Generator[tuple[UUID, Any], None, None]:
+            nonlocal pop_call_count
+            pop_call_count += 1
+            if pop_call_count == 1:
+                yield expected_uuid, expected_data
+
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = mock_pop
+
+        gen = orchestrator.compute_stream()
+        results = list(gen)
+
+        assert len(results) >= 1
+        first_result = results[0]
+        assert first_result[0] == expected_uuid
+        assert first_result[1] == expected_data
+
+    def test_yields_multiple_results_across_iterations(self) -> None:
+        """compute_stream should yield multiple (UUID, Any) tuples as they become available."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = None
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome()
+        orchestrator.cfw_register = mock_cfw_register
+
+        uuid_1 = uuid4()
+        uuid_2 = uuid4()
+        data_1 = "result_data_1"
+        data_2 = "result_data_2"
+
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+
+        pop_call_count = 0
+
+        def mock_pop() -> Generator[tuple[UUID, Any], None, None]:
+            nonlocal pop_call_count
+            pop_call_count += 1
+            if pop_call_count == 1:
+                yield uuid_1, data_1
+                yield uuid_2, data_2
+
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = mock_pop
+
+        gen = orchestrator.compute_stream()
+        results = list(gen)
+
+        yielded_uuids = {r[0] for r in results}
+        assert uuid_1 in yielded_uuids
+        assert uuid_2 in yielded_uuids
+
+    def test_yielded_items_are_tuples_of_uuid_and_any(self) -> None:
+        """Each yielded item should be a tuple where first element is a UUID."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = None
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome()
+        orchestrator.cfw_register = mock_cfw_register
+
+        test_uuid = uuid4()
+        test_data = [1, 2, 3]
+
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+
+        pop_call_count = 0
+
+        def mock_pop() -> Generator[tuple[UUID, Any], None, None]:
+            nonlocal pop_call_count
+            pop_call_count += 1
+            if pop_call_count == 1:
+                yield test_uuid, test_data
+
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = mock_pop
+
+        gen = orchestrator.compute_stream()
+        results = list(gen)
+
+        assert len(results) >= 1
+        for item in results:
+            assert isinstance(item, tuple)
+            assert len(item) == 2
+            assert isinstance(item[0], UUID)
+
+
+class TestComputeStreamCleanup:
+    """Tests that compute_stream stores the run outcome and calls join in a finally block."""
+
+    def test_stores_outcome_after_full_consumption(self) -> None:
+        """compute_stream should store the run outcome after generator is fully consumed."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = None
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome(artifacts={"key": "value"})
+        orchestrator.cfw_register = mock_cfw_register
+
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = Mock(return_value=iter([]))
+        orchestrator.join = Mock()
+
+        gen = orchestrator.compute_stream()
+        list(gen)  # fully consume
+
+        assert orchestrator.outcome is mock_cfw_register.get_run_outcome.return_value
+        mock_cfw_register.get_run_outcome.assert_called_once()
+
+    def test_calls_join_after_full_consumption(self) -> None:
+        """compute_stream should call join after generator is fully consumed."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = None
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome()
+        orchestrator.cfw_register = mock_cfw_register
+
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = Mock(return_value=iter([]))
+        orchestrator.join = Mock()
+
+        gen = orchestrator.compute_stream()
+        list(gen)  # fully consume
+
+        orchestrator.join.assert_called_once()
+
+    def test_cleanup_happens_when_generator_not_fully_consumed(self) -> None:
+        """outcome and join should be called even if generator is closed early."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = None
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome()
+        orchestrator.cfw_register = mock_cfw_register
+
+        uuid_1 = uuid4()
+        uuid_2 = uuid4()
+
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+
+        pop_call_count = 0
+
+        def mock_pop() -> Generator[tuple[UUID, Any], None, None]:
+            nonlocal pop_call_count
+            pop_call_count += 1
+            if pop_call_count == 1:
+                yield uuid_1, "data_1"
+                yield uuid_2, "data_2"
+
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = mock_pop
+        orchestrator.join = Mock()
+
+        gen = orchestrator.compute_stream()
+        # Only consume one item, then close the generator
+        next(gen)
+        gen.close()
+
+        assert orchestrator.outcome is mock_cfw_register.get_run_outcome.return_value
+        mock_cfw_register.get_run_outcome.assert_called_once()
+        orchestrator.join.assert_called_once()
+
+
+class _RunCompleteProbe(Extender):
+    def __init__(self, error: Exception | None = None, raise_on_run_complete: bool = False) -> None:
+        self.run_ids: list[str | None] = []
+        self.error = error
+        self.raise_on_run_complete = raise_on_run_complete
+        self.outcomes: list[Any] = []
+
+    def wraps(self) -> set[ExtenderHook]:
+        return set()
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    def on_run_complete(self, run: Any, outcome: Any) -> None:
+        self.run_ids.append(run.run_id)
+        self.outcomes.append(outcome)
+        if self.error is not None:
+            raise self.error
+
+
+_EARLY_CLOSE_COLUMN = "early_closed_stream_col"
+
+
+class _EarlyCloseFeatureGroup(DataCreatorFeatureGroup):
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {_EARLY_CLOSE_COLUMN}
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PythonDictFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {_EARLY_CLOSE_COLUMN: [1, 2, 3]}
+
+
+def _early_close_kwargs(extenders: set[Extender]) -> dict[str, Any]:
+    return {
+        "compute_frameworks": ["PythonDictFramework"],
+        "plugin_collector": PluginCollector.enabled_feature_groups({_EarlyCloseFeatureGroup}),
+        "function_extender": extenders,
+    }
+
+
+def _early_close_session(extenders: set[Extender]) -> Any:
+    return mloda.prepare([Feature(name=_EARLY_CLOSE_COLUMN)], **_early_close_kwargs(extenders))
+
+
+class TestComputeStreamNotifiesExtenders:
+    def test_early_closed_stream_notifies_extenders_once_as_cancelled(self) -> None:
+        """Request-level replacement: the orchestrator no longer notifies, the stream does."""
+        probe = _RunCompleteProbe()
+        session = _early_close_session({probe})
+
+        stream = session.stream_run()
+        next(stream)
+        stream.close()
+
+        assert len(probe.run_ids) == 1 and probe.run_ids[0] is not None
+        assert [o.status for o in probe.outcomes] == ["cancelled"]
+
+    def test_orchestrator_exit_alone_no_longer_notifies_extenders(self) -> None:
+        probe = _RunCompleteProbe()
+        mock_planner = Mock(spec=ExecutionPlan)
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+        orchestrator = ExecutionOrchestrator(mock_planner)
+        orchestrator.__enter__({ParallelizationMode.SYNC}, {probe}, None, None, RunContext(run_id="stream-run"))
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = lambda: iter([(uuid4(), "data_1")])
+
+        gen = orchestrator.compute_stream()
+        next(gen)
+        gen.close()
+        orchestrator.__exit__(None, None, None)
+
+        assert probe.run_ids == []
+
+    def test_api_stream_closed_early_joins_workers_before_signalling_while_the_inner_generator_is_referenced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        order: list[str] = []
+        probe = _RunCompleteProbe()
+        monkeypatch.setattr(probe, "on_run_complete", lambda run, outcome: order.append("signal"))
+        monkeypatch.setattr(ExecutionOrchestrator, "join", lambda self, abandon_threads=False: order.append("join"))
+        real_compute_stream = ExecutionOrchestrator.compute_stream
+        inner_generators: list[Any] = []
+
+        def keep_inner_referenced(self: ExecutionOrchestrator) -> Any:
+            inner_generators.append(real_compute_stream(self))
+            return inner_generators[-1]
+
+        monkeypatch.setattr(ExecutionOrchestrator, "compute_stream", keep_inner_referenced)
+        session = mloda.prepare(
+            [Feature(name=_EARLY_CLOSE_COLUMN)],
+            compute_frameworks=["PythonDictFramework"],
+            plugin_collector=PluginCollector.enabled_feature_groups({_EarlyCloseFeatureGroup}),
+            function_extender={probe},
+        )
+
+        stream = session.stream_run()
+        next(stream)
+        stream.close()
+
+        assert order == ["join", "signal"]
+
+    def test_exhausted_api_stream_raises_the_opt_in_extender_failure(self) -> None:
+        failure = RuntimeError("opt-in boom")
+        probe = _RunCompleteProbe(error=failure, raise_on_run_complete=True)
+        session = _early_close_session({probe})
+
+        with pytest.raises(RuntimeError) as raised:
+            list(session.stream_run())
+
+        assert raised.value is failure
+        assert probe.run_ids
+        assert getattr(raised.value, "__notes__", None) == [f"mloda run_id: {probe.run_ids[0]}"]
+
+    def test_early_closed_api_stream_does_not_raise_the_opt_in_extender_failure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        probe = _RunCompleteProbe(error=RuntimeError("opt-in boom"), raise_on_run_complete=True)
+        session = _early_close_session({probe})
+
+        with caplog.at_level(logging.ERROR):
+            stream = session.stream_run()
+            next(stream)
+            stream.close()
+
+        assert probe.run_ids
+        assert [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    def test_sync_run_all_raises_the_opt_in_extender_failure(self) -> None:
+        failure = RuntimeError("opt-in boom")
+        probe = _RunCompleteProbe(error=failure, raise_on_run_complete=True)
+
+        with pytest.raises(RuntimeError) as raised:
+            mloda.run_all([Feature(name=_EARLY_CLOSE_COLUMN)], **_early_close_kwargs({probe}))
+
+        assert raised.value is failure
+        assert probe.run_ids
+        assert getattr(raised.value, "__notes__", None) == [f"mloda run_id: {probe.run_ids[0]}"]
+
+
+class TestComputeStreamErrorHandling:
+    """Tests for compute_stream error handling."""
+
+    def test_raises_valueerror_when_cfw_register_is_none(self) -> None:
+        """compute_stream should raise ValueError when cfw_register is None."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        orchestrator.cfw_register = None
+
+        import pytest
+
+        with pytest.raises(ValueError, match="compute framework manager not initialized"):
+            # For a generator, the ValueError may be raised on first next() call
+            gen = orchestrator.compute_stream()
+            next(gen)
+
+    @pytest.mark.parametrize("has_original", [True, False], ids=["original", "fallback"])
+    def test_raises_exception_on_cfw_error(self, has_original: bool, caplog: pytest.LogCaptureFixture) -> None:
+        """Streaming propagates original exceptions and logs only typed fallbacks at ERROR."""
+        mock_planner = Mock(spec=ExecutionPlan)
+        orchestrator = ExecutionOrchestrator(mock_planner)
+
+        mock_cfw_register = MagicMock()
+        mock_cfw_register.get_error.return_value = True
+        mock_cfw_register.get_error_exc_info.return_value = "error info"
+        mock_cfw_register.get_error_msg.return_value = "error message"
+        original = ValueError("original worker failure") if has_original else None
+        mock_cfw_register.take_error_exception.return_value = original
+        mock_cfw_register.get_run_outcome.return_value = RunOutcome()
+        orchestrator.cfw_register = mock_cfw_register
+
+        mock_planner.__iter__ = Mock(return_value=iter([]))
+
+        orchestrator.data_lifecycle_manager = MagicMock()
+        orchestrator.data_lifecycle_manager.pop_result_data_collection = Mock(return_value=iter([]))
+        orchestrator.join = Mock()
+
+        error_type = ValueError if has_original else MlodaRunError
+        with pytest.raises(error_type) as excinfo:
+            gen = orchestrator.compute_stream()
+            list(gen)
+
+        error_records = [r for r in caplog.records if r.name == "mloda.core.runtime.run" and r.levelno >= logging.ERROR]
+        if original is not None:
+            assert excinfo.value is original
+            assert not error_records
+        else:
+            assert str(excinfo.value) == "error message"
+            assert [(r.levelno, r.getMessage()) for r in error_records] == [(logging.ERROR, "error info")]

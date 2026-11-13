@@ -1,0 +1,322 @@
+## Overview
+
+The **Extender** class is an abstract base class (ABC) that provides an extensible framework for enhancing and wrapping functions with additional capabilities. It is especially useful for automating and monitoring various operations such as metadata harvesting, messaging integration, and event logging. This class offers a standardized approach to augmenting functions with critical features like performance monitoring, audit trails, and impact analysis.
+
+Extenders are configured on the session: every call that plans (the `mlodaAPI(...)` constructor, `prepare()`, `run_all()`, `stream_all()`, `explain()`, and `diagnose()`) accepts `function_extender` and snapshots it. `run()` and `stream_run()` don't take it and never re-read it: they reuse the set snapshotted when the session was planned (a session is planned exactly once), so changing `function_extender` afterwards has no effect.
+
+In the following example, we will reuse the previous feature group example and demonstrate how to monitor the execution time of the **calculate_feature** function using a custom extender.
+
+**Monitoring Execution Time**
+
+We will create a DokuExtender class to monitor and log the time taken for the calculate_feature function of the feature group to execute.
+#### 1. Define the Extender
+```python
+from typing import Any
+import time
+from mloda.steward import Extender, ExtenderHook
+import logging
+
+logger = logging.getLogger(__name__)
+```
+
+A simple DokuExtender class:
+
+```python
+class DokuExtender(Extender):
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        start = time.time()
+        result = func(*args, **kwargs)
+        logger.error(f"Time taken: {time.time() - start}")
+        return result
+```
+#### 2. Run the Example with the Extender
+We will now run the **mlodaAPI** call, including our custom **DokuExtender** to monitor the execution time of the **calculate_feature** function.
+```python
+from mloda.user import mloda
+from mloda.user import DataAccessCollection
+
+file_path = "tests/test_plugins/feature_group/src/dataset/creditcard_2023_short.csv"
+data_access_collection = DataAccessCollection(files={file_path})
+
+feature_list = ["id","V1","V2","V3"]
+
+example_feature_list = [f"ExampleB_{f}" for f in feature_list]
+
+
+mloda.run_all(
+    feature_list,
+    compute_frameworks=["PyArrowTable"],
+    data_access_collection=data_access_collection,
+    function_extender={DokuExtender()}
+)
+```
+Expected Output (Logged Execution Times)
+```text
+ERROR    test_getting_started:test_getting_started.py:29 Time taken: 0.00454258918762207
+ERROR    test_getting_started:test_getting_started.py:29 Time taken: 0.001033782958984375
+```
+
+#### 3. Summary
+
+With this simple extender, you can easily log and monitor the execution time of any functionality within feature groups. By extending the Extender class, you can wrap additional behavior such as performance monitoring, logging, or auditing around critical functions to enhance observability and traceability in your data processing workflows.
+
+When multiple extenders are provided, they are automatically chained and executed in priority order (lower values first). Each extender's `wraps()` is read once per run, so the hook set is fixed for the run; `wraps()` must return `ExtenderHook` members, otherwise the run fails at setup with a `TypeError`.
+
+#### 4. Error handling
+
+By default an exception raised inside an extender is **breaking**: it propagates and fails the feature calculation, just like a bug in any other code. This holds whether one extender or several are registered for a hook, so adding a second extender never changes the error semantics.
+
+An extender that is non-critical (for example observability or telemetry) can opt out by setting `raise_on_error = False`. When such an extender fails, the error is logged as a warning and the wrapped function still runs, so a failing extender cannot break the calculation:
+
+```python
+class MetricsExtender(Extender):
+    def __init__(self) -> None:
+        self.raise_on_error = False  # failures log a warning instead of breaking
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        result = func(*args, **kwargs)
+        record_metric(...)  # if this raises, the calculation still succeeds
+        return result
+```
+
+Only the extender's own failure is caught: an exception raised by the wrapped function (or by a downstream breaking extender) always propagates, and the wrapped function is never run twice. Concrete extenders can also expose the flag as a constructor argument (for example `MetricsExtender(raise_on_error=True)`) to let callers opt back into breaking behavior.
+
+Once the wrapped call has run, an extender's return value is discarded: it can observe or fail the calculation but not substitute a different result. An extender that never calls the wrapped function has no wrapped result to prefer, so its own return value is used instead (this is what keeps a gate's raise-to-refuse or fallback pattern below working).
+
+A gate (an authorization or identity check that refuses a call by raising) sets `never_fall_back = True` in its class body or `__init__`: its failure always propagates, whatever `raise_on_error` says, and the wrapped function never runs as a fallback. Gates always sort outermost on their hook, whatever their `priority` (`priority` still orders within the gate tier and within the rest; equal priorities order by the extender class's module and qualified name). An extender that swallows the wrapped call's exception gets it re-raised, and a gate that skips the wrapped call while another gate sits inside it raises `GateBypassError`. `never_fall_back`, `raise_on_run_complete`, `raise_on_error` and `priority` are sealed when mloda first builds the run's hook table (planning, including `explain()`/`diagnose()`): assigning or deleting them afterwards raises `AttributeError`, and reassigning them on the class no longer affects the sealed instance. An extender whose `on_run_complete` must be able to fail the run (e.g. sealing an audit log) sets `raise_on_run_complete = True` (see section 8). Registry strict mode (`"strict"`, see [Plugin Registry](../in_depth/plugin_registry.md#strict-mode)) raises `EnvironmentPreconditionError` for an unregistered gate or `raise_on_run_complete` extender instead of dropping it, and drops other unregistered extenders. A mloda run started inside a feature group's calculation (a nested run) starts from a clean step context (no outer `HookContext.current()` or compute framework), but an outer `INPUT_DATA_LOAD` gate stays closed over it in every parallelization mode: a nested load that does not pass through a `never_fall_back` `INPUT_DATA_LOAD` extender of the nested run raises `GateBypassError`.
+
+#### 5. Reading call facts via HookContext
+
+`HookContext.current()` returns the `HookContext` for the hook being dispatched (`FEATURE_GROUP_CALCULATE_FEATURE`, `VALIDATE_INPUT_FEATURE`, `VALIDATE_OUTPUT_FEATURE`, `FEATURE_GROUP_MATCHED`, `INPUT_DATA_MATCH`, `INPUT_DATA_LOAD`, `JOIN`), or `None` outside a hook call. It is set only on the thread dispatching the hook: capture it before handing work to another thread, or run that work under `contextvars.copy_context().run`. A source group load from a thread that lost the context is still dispatched through the `INPUT_DATA_LOAD` hook (gate or not) when it uses the `FeatureSet` handed to `calculate_feature`, a copy of it, or one built in the calculation thread, because each carries a per-run marker, and the load runs in a copy of the calculation's context; a nested run without its own `INPUT_DATA_LOAD` gate is refused across a hop as on the calculation thread; a gate-free run is unaffected by another run's gate. A `FeatureSet` built inside the hopped thread has no marker and falls back to the process-wide check: under a gate it is refused with `GateBypassError` (use `contextvars.copy_context().run`), including while a gated calculation runs elsewhere in the process. A thread that outlives the calculation, or a leftover or unpickled `FeatureSet` loaded after it, is refused under a gate and loads directly otherwise. Calling a source group's `load_neutral` or `Implementation` directly bypasses the hook. It carries which hook fired, the feature group's `module.qualname` and `version()` (`None` on `JOIN`, and on `FEATURE_GROUP_MATCHED` until the match resolves), the owning plugin's installed distribution version (resolved in the parent process at prepare and cached for the process's life, so a MULTIPROCESSING worker keeps reporting that value even if the package is upgraded on disk afterward; `None` when no installed distribution owns the module, on `FEATURE_GROUP_MATCHED`/`JOIN`, or outside a planned run), the requested feature names, the input feature names the engine resolved for the step at planning time (`None` for a root step; an injected filter or index feature does not break this, since the step inherits its host's resolved names; a best-effort `input_features()` re-read only for a `FeatureSet` assembled outside an execution plan), `input_feature_edges` (a `dict[str, tuple[str, ...]]` mapping each output feature name to its declared input names; `None` for a root step; a feature declaring no inputs is absent; same-named features union-merge into one entry keyed by name; injected features are absent when the engine resolved the step, but a runtime re-read, i.e. a `FeatureSet` assembled outside a plan or after option defaults materialize, may include them; the mapping is copied on construction like `carrier`), `input_check` (`None` until the core declared-input check ran for the step, then `"checked"`, `"skipped_source"` (no incoming data), or `"skipped_empty"` (schema-less empty data)), the compute framework's class name (`None` on `FEATURE_GROUP_MATCHED`), and `rows_in` (`None` when the framework can't report a count without materializing, e.g. a lazy or SQL-backed frame). `rows_in` is the framework's current data, so on `VALIDATE_OUTPUT_FEATURE` it is the freshly calculated output, not the pre-calculation input.
+
+The fields are frozen (assigning raises `FrozenInstanceError`) except `rows_out`, `output_schema`, `duration_seconds`, `status` (`credentials_read` is read-only for extenders and set by core); the dict fields (`carrier`, `declared_attributes`, `input_feature_edges`, `result_attributes`) are read-only copies (mutating raises `TypeError`; `json.dumps`, `copy` and pickle give a plain dict). Read it *after* calling `func(*args, **kwargs)` in your own `__call__` to also see `rows_out`, `output_schema`, `duration_seconds`, and `status`. `status` reflects only the wrapped call: `"success"` once it returns, `"error"` if it raised; a warning-only extender's own failure does not change it. `output_schema` is `tuple[tuple[str, str | None], ...] | None`: `(column, dtype)` pairs sorted by name, dtype a framework-specific human-readable string or `None` if that column's dtype could not be read (the name is still reported). Populated best-effort from the raw `calculate_feature` result on `FEATURE_GROUP_CALCULATE_FEATURE`, without materializing a lazy or SQL-backed result. A dict result (column to values, the interchange shape accepted before transform) is read the same way on every framework, with the Python type name of the first non-`None` value as dtype. On `VALIDATE_OUTPUT_FEATURE`, since the hook's return value carries no schema, it's read from the framework's finalized `self.data` (the native, post-transform/post-filter shape) the same way `rows_in` is, but only once `validate_output_features` returns without raising; `rows_in` is captured before that call, so it stays populated even when the call raises. `None` on `VALIDATE_INPUT_FEATURE` and every other hook, and also when the read data is in neither the dict nor the framework's native shape or has no columns, or when reading it fails. On `VALIDATE_INPUT_FEATURE`/`VALIDATE_OUTPUT_FEATURE`, `rows_out` stays `None`, since those hooks return no data. `func` is always an instrumentation wrapper around the feature group's method, not the bound classmethod: use `Extender.feature_group_name(func)` or `inspect.unwrap(func)` to reach the original. `plan_id` is the prepared session's id (stable across its runs; the only id set during `FEATURE_GROUP_MATCHED`, where `run_id` is `None`); `structure_hash` is the session's `PlanContext.structure_hash` on the calculate, validate, `JOIN` and `INPUT_DATA_LOAD` hooks, including in MULTIPROCESSING workers, `None` on `FEATURE_GROUP_MATCHED` and outside a planned run; `run_id` is minted per execution (each `run()` and each stream). `step_uuid` (a `UUID`, like `PlanStep.step_uuid`) is the compute step's `PlanStep.step_uuid` on the calculate, validate and `INPUT_DATA_LOAD` hooks, `None` on `FEATURE_GROUP_MATCHED` and `JOIN`, and for a `FeatureSet` assembled outside an execution plan; it is minted per `prepare()` and stays the same across that session's runs, so two steps with the same feature group, feature names and framework stay apart. `credential_handles` (`tuple[str, ...]`) lists the handles the compute step declares (could read) plus the one its source binds on the calculate, validate and `INPUT_DATA_LOAD` hooks, `()` on the others. `bound_credential_handle` (`str | None`) is the handle the step's source binds (`<unnamed>` for an auto handle, `<pointer>` for a credential not in the collection) on the same hooks, `None` on the others; a handle the source also binds counts as used. These three fields, plus `feature_names`, `specialized_from`, `input_features`, `input_feature_edges`, `implementation`, `implementation_version`, `divergences` and `allowed_variants`, are fixed before the step's feature group code runs, so a feature group reassigning them on its `FeatureSet` does not change them. On a framework attached to the run, the `INPUT_DATA_LOAD` context copies these identity fields from the calculate context core built for the step, whatever context is ambient. `credentials_read` (`tuple[str, ...]`) lists, sorted, the handles the step read with `read_credential` during the wrapped call, on the calculate and `INPUT_DATA_LOAD` hooks; read it after `func` returns. Reads in an artifact saver are merged into the calculate context after the saver ran, so only a context kept until then shows them. It is `()` on the other hooks, and a handle that a source only binds never appears here (a handle both declared and bound does appear when read). `tenant_id`, `project_id`, and `principal` carry the server-verified values set via `mloda.steward.verified_context()` for the scope of a run, `None` when nothing set them, and are never influenced by a feature's `Options`. Like `HookContext.current()`, that scope is thread/task-local: a caller handing the actual `prepare()`/`run()`/`run_all()`/`stream_run()`/`stream_all()` call to another thread must copy context (`contextvars.copy_context().run(...)`) for it to still apply there. `carrier` is an opaque `dict[str, str] | None` forwarded from the run call; core never interprets it. Each `HookContext` copies `carrier` on construction into a read-only mapping (mutating it raises `TypeError`; `json.dumps`, `copy` and pickle yield a plain dict). `worker_index` is `int | None`, set only inside a spawned MULTIPROCESSING worker. `declared_attributes` is a copy of the feature group's `declared_attributes(features)`, minus non-scalar values, non-finite floats and integers outside the signed 64-bit range (see [Feature Group Matching](../in_depth/feature-group-matching.md#declared-attributes-and-input-requirements)) on the feature group hooks, `None` when that call raises or returns a non-mapping or a non-str key.
+
+`result_attributes` holds scalars a feature group publishes from `calculate_feature` with `HookContext.publish_result_attributes({...})` (import from `mloda.provider`), readable after `func` returns. Validation matches `declared_attributes`, but a non-mapping or non-str key raises `TypeError` at the call. It is `None` when nothing was published and resets per wrapped call; the call is a no-op without an active hook. It targets the innermost active context and is lost across a thread hop like `current()`. Values are not verified and leave through telemetry, so never publish credentials or raw row data.
+
+`failed_rows` is a read-only tuple of `FailedRows(feature_group, column, rows, reason)` that the feature group reported with `report_failed_rows(column, rows, reason)` (import from `mloda.provider`) during the wrapped call. It is `()` when nothing was reported. `reason` is a short code (`[A-Za-z0-9_.-]`, up to 64 characters), never row data. `rows` are positions in the feature group's own output. `RunResult.failed_rows` holds the entries of a whole `run()`/`run_all()`; `stream_run`/`stream_all` expose them on `stream.failed_rows` once the stream is exhausted or closed.
+
+In plugin tests without an engine run, wrap the call in `mloda.steward.collect_failed_rows(feature_group)` and read
+`collector.entries` afterwards. For an instrumented call, `HookContext.failed_rows` holds that call's reports even if
+it raises.
+
+```python
+from mloda.provider import FailedRows, instrument, report_failed_rows
+from mloda.steward import ExtenderHook, HookContext, collect_failed_rows
+
+
+def calculate() -> list[int | None]:
+    report_failed_rows("score", [1], "missing")
+    return [1, None]
+
+
+context = HookContext(
+    hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+    feature_group_class="example.Score",
+    feature_group_version="1",
+    compute_framework_name=None,
+)
+with collect_failed_rows("example.Score") as collector:
+    result = instrument(context, calculate)()
+
+assert result == [1, None]
+assert collector.entries == [FailedRows("example.Score", "score", (1,), "missing")]
+assert context.failed_rows == tuple(collector.entries)
+```
+
+`FEATURE_GROUP_MATCHED`, `INPUT_DATA_LOAD`, and `JOIN` populate their own extra fields and leave the rest at their defaults. On `INPUT_DATA_LOAD`, `data_access_identity` and `data_access_format` carry a string identity and format for the data-access handle/value: the source group's `data_access_identity(match)` classmethod decides it, and the default is `match.source`. Core's file and document groups publish their path without URI user info, query and fragment, with every `/`- or `::`-separated part whose percent-decoded form holds `;`, `?` or `#` followed by more text, or that still changes after four percent-decoding rounds, cut to its clean head plus `;***`, whatever the parameter names (so such a source is not unique per file, and text before the marker, such as a Hive `key=value` part, is kept); `SqliteFG` publishes `<absolute path>::<table>` (the path alone when the catalog is unreadable), never credential values. Both this field and `PlanStep.data_access_identity` also mask every credential value registered in the session's `DataAccessCollection` (8+ characters under a credential-shaped key) to `***`, override output included. Values under other keys (such as `dsn`, `url` or a reader's own pointer key) are masked in errors and logs (see below) but stay in the identity; this is defence in depth and does not catch secrets the collection does not hold. A group whose paths carry tokens should override the method. An override must not raise: it runs when an `INPUT_DATA_LOAD` extender is registered, where its exception aborts the load, and once per compute step at plan build (`PlanStep.data_access_identity` is computed there). Extenders must record this field, never the raw `data_access` argument, which may carry credentials. `data_access_dataset_version` stays `None`, since no dataset versioning exists yet. `reader_class` is the source group that loads the data, and `declared_attributes` holds that group's declarations instead of the feature group's; read the class from `reader_class` rather than unwrapping `func`. `reader_class` is `None` on every hook except `INPUT_DATA_LOAD` and `INPUT_DATA_MATCH`. `data_access_loader` and `implementation` name the `Implementation` that ran as `module:qualname` (not the `module.qualname` form of `feature_group_class`), or `"neutral"`; `implementation_version` is its `version()`, `None` when that cannot be computed. On the same hooks, `divergences` carries the step's stamped, scrubbed divergence records, `contract_version` its group's `CONTRACT_VERSION`, and `allowed_variants` the sorted rule variants the step's features allow. On other hooks they are `()`, `None` and `()`. `implementation` and `implementation_version` are also set on `CALCULATE_FEATURE`, `VALIDATE_INPUT_FEATURE` and `VALIDATE_OUTPUT_FEATURE` for a source group step and for an operation group step (the `Implementation` selected for the step, `None` when none serves it, never `"neutral"`); a plain feature group step and every other hook leave them `None`. `INPUT_DATA_LOAD` brackets the source group's load (its `Implementation` or `load_neutral`), and a group may return an `InputDataDescriptor` instead of reading (the neutral form of core's file source groups, such as `CsvFG`, is a `FileSource`): then `duration_seconds`, `status` and `rows_out` (`None`) describe resolving the descriptor, the compute framework reads the file after `calculate_feature` returns, and no hook times that read. A gate on this hook still blocks the read, since the framework only reads a descriptor the group returned, and an extender can tell the cases apart with `isinstance(result, InputDataDescriptor)` (from `mloda.provider`). On `JOIN`, `join_type`, `join_keys` and `asof_config` come from the `Link` being merged (`asof_config` is the link's `AsOfJoinConfig`, exported from `mloda.steward`; `None` for non-asof links), and `join_left_feature_group` / `join_right_feature_group` name the link's declared left and right feature group classes (`module.qualname`, the declared class even for a polymorphic link, in declared orientation regardless of which side the merge writes into). On `FEATURE_GROUP_MATCHED`, `plan_feature_count` counts completed resolutions (a raising one is not recorded) and `plan_node_count` deduplicated plan nodes, both before this match; the two are not comparable, since injected filter and index features become plan nodes without a resolution. `plan_depth` is the recursion depth; all three are running values, not final totals. The hook fires once per resolution attempt, so a feature reached from two parents fires twice; the input chains resolution checks before choosing a candidate (competing candidates, and a derived name a searched source has) go through the hook too, so it can fire for attempts that do not appear in resolution records. `INPUT_DATA_MATCH` fires during planning once per candidate source group and probe (the probed feature, or a `gated_probe` or `has_source` call), before the group's source discovery (`find_sources` and its column reads), and only when a claim route would be probed. An unpointed searched route that finds the name steps aside when a non-source candidate computes it (one that passed its own match, framework and links checks and whose input chain resolves, not one matching only an output part): the probe, and so the hook, still runs, but the source does not claim the name; a refusing gate can therefore also refuse (and log) such a probe. It sets `reader_class`, `data_access_format` (the group's `data_access_name()`), the probed `feature_names`, the planning identity and `plan_id`; `declared_attributes` holds the group's `declared_attributes(None)` (`None` when that raises, which a gate should treat as a refusal). `feature_group_class`, `compute_framework_name`, `run_id`, `structure_hash` and `step_uuid` are `None`, so a gate should key on `reader_class`, and `status`, `duration_seconds` and `rows_out` stay `None` because the probe is not instrumented. Under a gate, link index columns and kept key columns are probed too, so a gate sees key column names in `feature_names`. Each refusal is logged (INFO for a `never_fall_back` gate, WARNING otherwise). An exception from the extender (a `never_fall_back` gate or a breaking extender) refuses that candidate group. A refused unpointed group declines and another candidate can serve the feature; a refused pointed group fails planning unless another candidate computes the feature or a loaded subclass of the refused group, which the same pointer addresses, takes it over; a group pointed only through a `feature_group=` scope naming a concrete ancestor declines instead. `FeatureResolutionError.refusals` holds one exception per refused candidate group, in candidate order, stripped of tracebacks along its cause and context chain, the first also its `__cause__`, so a caller can tell an access refusal from a missing plugin; it is empty for a "Multiple feature groups" ambiguity. A refused pointed source group raises the same `FeatureResolutionError`, the extender's refusal in `refusals` and as `__cause__` (other pointed declines carry none); refusals are the extender's own objects (kept, with registered collection credentials masked in place, see below; a group whose own message held one is a masked copy), and do not survive pickling or `copy.deepcopy`. Other secrets in a refusal message are not masked and appear in printed tracebacks, so extenders should keep them out of refusal messages. Limits: the hook names the group class and its class-level declarations, not the source, and the raw `data_access` argument may carry credentials (in global scope it is the whole `DataAccessCollection`). It authorizes the planning identity, not a later run's (see the run-identity guard below). A refusal binds only the refused class, so its parent, a subclass, or a sibling owning the same suffix can still read the source. Declare what a gate decides by (such as a classification) on every group that can reach the data, or disable the other class with `PluginCollector.disabled_feature_groups`. The extender's return value and the arguments it passes to `func` are ignored, and an extender that returns without calling `func` refuses the group. Put a source group's I/O in `find_sources`, `columns` or `has_column`, which run inside the gate. I/O in an override of `is_pointed`, `match_feature_group_criteria` or `_matches_by_default_rules` is gated only when run through `cls.gated_probe(feature_name, options, data_access_collection, probe)`, which runs `probe` inside the hook, declines or aborts on a refusal like core's own probe, and returns a `SourceProbeOutcome` (from `mloda.provider`; `refused` is the reason or `None`, `result` the probe's value). The override returns False when `refused` is set. Each call fires the hook once more. A plain feature group's override I/O is not gated. Discovery calls made without an engine (`describe_columns`, `count_rows`, `resolve_feature()`) run no extenders and are not gated. Plugin tests can make a gate current without a run with `mloda.steward.reader_probe_scope(ReaderProbeScope(extender, None, None, None, None))`.
+
+`mloda.steward.DeniedNameGate(is_denied)` refuses a source group's `INPUT_DATA_MATCH` probe for any name the predicate denies, whether or not a source has the column. It fails closed: with no hook context or the default predicate, it refuses every name. The predicate receives column base names (a `~N` suffix stripped), including link, key and filter columns, for every source group including inline data; a predicate that raises refuses too, but its own message is not scrubbed, so keep names out of it. It covers source groups only (not a feature group that computes the name), and `resolve_feature()` only under `reader_probe_scope`. Under MULTIPROCESSING the predicate must be picklable.
+
+Core's own failure logs and `MlodaRunError` scrub exception text through `mloda.steward.scrub_credentials`, which drops URL user info, query and fragment, masks credential-named `key=value` and quoted dict-key values (including tuple and set values and multi-line pretty-printed JSON and pprint values, also when escaped inside a `repr` or a JSON dump, up to two outer layers that double backslashes without escaping the value's quote kind, such as a JSON dump inside a `repr`; not masked: a dump in a string that pprint wrapped over several lines when that output is itself escaped inside a `repr` or a JSON dump, or wrapped by pprint again, and a value holding a quote directly followed by a delimiter, such as `", `, in a JSON dump inside a `repr`), bearer and `Authorization` tokens (also prefixed or underscored header names such as `X-Authorization` or `HTTP_AUTHORIZATION`), and masks the password in `user/password@host:port`, `@host/service` and `@//host` DSNs. Session-id keys (`jsessionid`, `PHPSESSID`, `sessionid`) are masked like other credential-named keys, and a percent-encoded path is kept as-is unless its decoded form looks like it carries a credential, in which case the path is cut back to the last `/` before the first escape. A `/`- or `::`-separated URI part whose percent-decoded form holds `;`, `?` or `#` followed by text cuts the URI back to the start of that part, unless it only adds credential-named `key=value` parameters (masked in place) or punctuation. A `jdbc:` URI keeps its path unless the path, or the text directly after it, contains `=`, `;` or `@`, in which case the path is dropped along with the rest of that text. Multi-colon subprotocols such as `jdbc:h2:tcp:` count as `jdbc:`. An extender that logs a wrapped failure message itself should apply the same function. During a run or planning, every string value of 8 or more characters of a credential in the request's `DataAccessCollection` is also masked, raw and in its `repr` (either quote style) and JSON escaped forms, in the raised exception (args including nested strings, instance attributes (str ones, and the strings and keys inside dict, list, tuple and set ones), the str fields of `OSError`, `ImportError`, `SyntaxError`, the `UnicodeError` subclasses and `SystemExit`, an `ExceptionGroup`'s message (a masked copy is raised, since the message is read-only), notes, refusals, and the cause and context chain) and in every log record created inside the run (see [Log record masking](../in_depth/named-data-access-handles.md#log-record-masking), including the opt-in `enable_process_wide_log_masking()` for records outside it), except under known connection fields such as `host`, `user` or `path` (see `named-data-access-handles.md`); values under any other key are masked (fail closed). A container attribute holding a registered value is rebuilt as a plain dict, list, tuple or set (others are left untouched), and containers nested deeper than 32 levels are masked whole. Extenders wrapping a hook see the exception already masked. Not masked: bytes, other C-level attributes (such as `AttributeError.obj`), objects held in attributes or nested in their containers (exceptions included), non-dict mappings (such as HTTP header objects) and a value escaped twice (such as `repr(json.dumps(value))`). Other exception text stays raw; `data_access_collection.redact(str(exc))` also masks host, user and path values.
+
+`FEATURE_GROUP_MATCHED` reads the `mloda.steward.verified_context()` scope active while a session is planned (for example `prepare()`, `explain()`, `diagnose()`, and the planning half of `run_all()`/`stream_all()`). Every other hook reads the scope active at run-call time (`run()`, `stream_run()`, and the run half of `run_all()`/`stream_all()`; for the stream calls that is creation, not first iteration).
+
+A session prepared once and run many times reports each hook its own phase's identity, so a match-time gate authorizes the preparer, not the runner. Both are carried on the run's `RunContext` and the session's `PlanContext`: a run inside a `verified_context()` scope reports that scope's identity, and a run outside any scope runs under the preparer's identity (inherited from the `PlanContext`). `on_run_start(run, plan, steps)` receives both, so a gate can compare them and refuse a run whose identity differs. If the run identity differs from the plan identity, a `never_fall_back` extender wraps `FEATURE_GROUP_MATCHED` or `INPUT_DATA_MATCH`, and no such gate overrides `on_run_start`, the run is refused with `GateBypassError`; the refusal is lifted only by a gate wrapping `FEATURE_GROUP_MATCHED` or `INPUT_DATA_MATCH` that implements `on_run_start`. Wrapping `prepare()` and `run()` in one scope, or using `run_all()`/`stream_all()`, avoids a difference. Strict-mode refusal of an unregistered gate happens before `on_plan_start`, so no lifecycle hooks fire. `RunContext.carrier` and `RunContext.plugin_versions` are read-only, and a framework attached to a run rejects plain assignment and deletion of its `run_context`, `worker_index` and `function_extender` (`AttributeError`). Its extender set and hook table are read-only copies, so in-place mutation raises too. These guards catch accidental mutation, not deliberate reach such as `dict.clear(table)` or `object.__setattr__`: in-process plugins are trusted code, not sandboxed (see [Registration-Time Enforcement](../in_depth/plugin_registry.md#registration-time-enforcement)).
+
+`explain()` and `diagnose()` let an exception a breaking extender (`raise_on_error = True`, or `never_fall_back = True`) raises propagate, for example a refusal at `FEATURE_GROUP_MATCHED`; `diagnose()` still projects it when it is one of the error types it projects. An extender with `raise_on_error = False` and no `never_fall_back` is logged and swallowed instead, so resolution falls back.
+
+```python
+from mloda.steward import Extender, ExtenderHook, HookContext
+
+class FactsExtender(Extender):
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        result = func(*args, **kwargs)
+        context = HookContext.current()
+        if context is not None:
+            logger.info(f"{context.feature_group_class}: {context.duration_seconds}s, {context.rows_out} rows out")
+        return result
+```
+
+`specialized_from` is a tuple of `module.qualname` strings naming the parent classes the step's feature group replaced via subclass preference, sorted by that string, and `()` when none. On `FEATURE_GROUP_MATCHED` it is written once the match returns, like `feature_group_class`; on compute hooks and `INPUT_DATA_LOAD` it is the union over the step's features; on `JOIN` it is `()`.
+
+To unit-test an extender's `__call__` without running the engine, build a `HookContext` directly and `activate()` it. Only `hook`, `feature_group_class`, `feature_group_version` and `compute_framework_name` are required; the last three may be `None`. `plugin_version`, `input_features` and `input_feature_edges` default to `None` (a mapping passed in is copied, like `carrier`), `feature_names` and `specialized_from` default to empty tuples, and every other field defaults to `None`.
+
+```python
+from mloda.steward import ExtenderHook, HookContext
+
+context = HookContext(
+    hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+    feature_group_class="my_plugin.MyFeatureGroup",
+    feature_group_version="1",
+    compute_framework_name="PyArrowTable",
+)
+
+with context.activate():
+    FactsExtender()(lambda: "result")
+```
+
+Extenders cannot read credentials: `read_credential` raises inside a hook (see [Runtime access versus match-time binding](../in_depth/named-data-access-handles.md#runtime-access-versus-match-time-binding)).
+
+#### 6. Discovering Extenders
+
+To list all available extenders and their documentation, use the `get_extender_docs()` function from `mloda.steward`.
+
+#### 7. Extender identity under `ParallelizationMode.MULTIPROCESSING`
+
+A framework that stays resident in the parent process uses the caller's own extender objects, not copies: identity and mutable state on an extender (a client, tracer, connection) hold across every framework built there, including one whose own resolved `parallelization_mode` is not `MULTIPROCESSING` inside an overall MULTIPROCESSING-enabled run (e.g. a compute framework that only supports `SYNC`). For that SYNC-only framework to run at all, the requested `parallelization_modes` set must also contain the framework's own supported mode, e.g. `{ParallelizationMode.SYNC, ParallelizationMode.MULTIPROCESSING}`; requesting `{ParallelizationMode.MULTIPROCESSING}` alone filters the framework out at setup and the run raises.
+
+A parent-resident extender is one shared object, invoked by every framework built there, potentially concurrently under `ParallelizationMode.THREADING`. It must be thread-safe. Apart from the sealed flags (section 4) its state is unprotected, so keeping it consistent across frameworks and runs is the author's job.
+
+For a framework whose class declares `MULTIPROCESSING` support, a framework dispatched to a spawned worker gets an independent copy, materialized only when the framework is unpickled inside the worker: the parent only ever holds the pickled snapshot taken at run start. The snapshot is taken once per run, at setup (a stream's first iteration), so for runs executed one after another it carries the parent's state as the previous run's `on_run_complete` left it, and the worker copy also reflects state set in this run's `on_run_start`. The extender must be picklable at that point: a live handle that pickle can't round-trip (a client, tracer, connection, lock) must be stripped in `__getstate__` and rebuilt in `__setstate__` or on first use in `__call__`. Constructing the handle eagerly in `__init__` is fine as long as `__getstate__` strips it before pickling. State a worker copy accumulates stays in that worker unless the extender ships it out itself (a file, a socket, an exporter).
+
+Two copies in the same process that resolve to the same underlying handle (e.g. a pooled client) share its lifecycle, not two independently rebuilt handles: an extender exposing `close()` must make the closed state visible to every copy resolving to that handle, or closing one leaves the others writing to a dead handle.
+
+An extender that accepts an injected sink (client, provider, connection) should trial-pickle it in `__getstate__` and drop it if it can't survive: the run then completes with the sink dropped, instead of being rejected outright by mloda's plan-time picklability check. Log the drop once per instance. `mloda.steward` ships two small primitives for this: `pickle_failure_reason(value)` (`None` if `value` pickles cleanly, else the caught exception's type name) and `WarnOncePerInstance`, a thread-safe double-checked-locking guard whose `warn_once(emit)` fires `emit` at most once per instance and always resets to unwarned on any copy, so a pickled worker copy decides independently whether to warn instead of inheriting the parent's already-fired state:
+
+```py
+import logging
+from typing import Any
+
+from mloda.steward import Extender, pickle_failure_reason, WarnOncePerInstance
+
+logger = logging.getLogger(__name__)
+
+class MyExtender(Extender):
+    def __init__(self, sink: Any = None) -> None:
+        self._sink = sink
+        self._drop_guard = WarnOncePerInstance()
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        reason = pickle_failure_reason(self._sink) if self._sink is not None else None
+        if reason is not None:
+            self._drop_guard.warn_once(lambda: logger.warning(f"dropping unpicklable sink ({reason})"))
+            state["_sink"] = None
+        return state
+```
+
+No custom `__setstate__` is needed for `_drop_guard` itself: pickle reconstructs it as a fresh, unwarned guard on its own. Plan-time picklability validation and worker-dispatch pickling both pickle the same live extender instance, so this drop-and-warn fires once, in the parent, during plan-time validation; the later dispatch pickle is then silent, since the guard has already fired for that instance.
+
+#### 8. Plan and run lifecycle hooks
+
+`Extender` has four no-op hooks, all run in the parent on the caller's own extender objects that the request used (registry strict mode drops unregistered ones, see section 4), in every parallelization mode, for every extender even if `wraps()` returns nothing, in `gates first, then ascending priority` order:
+
+- `on_plan_start(plan)` and `on_plan_complete(plan, outcome)` wrap planning: `prepare()`, `explain()`, `diagnose()` and the planning half of `run_all()`/`stream_all()`. `plan` is the session's `PlanContext`. `plan.origin` names the entry point that planned it (`"run_all"`, `"stream_all"`, `"prepare"` (also a direct `mlodaAPI(...)`), `"explain"`, `"diagnose"`), or `None` on a `PlanContext` built elsewhere. A plan started from a hook or plugin during planning reports its own entry point, not the outer one. `plan.structure_hash` (see [Plan Lock](../in_depth/plan-lock.md)) is `None` in `on_plan_start` and after a failed plan, and set in `on_plan_complete` and `on_run_start`. The `PlanContext` passed to those two hooks is a new instance carrying the hash (it still compares equal to the one `on_plan_start` got), so read the hash from the context the later hook receives, not one kept from `on_plan_start`. Unlike `plan_id` it is the same across sessions and processes for the same plan, and it is excluded from `PlanContext` equality. `RunContext.structure_hash` and `HookContext.structure_hash` carry the same value into each run and its per-calculation hooks. `plan.content_hash` follows the same lifecycle; see [Plan Lock](../in_depth/plan-lock.md) for what it covers. `on_plan_complete` also fires when planning raised (`diagnose()` reports its swallowed errors as `failed`).
+- `on_run_start(run, plan, steps)` fires once per `run()` or stream, before any setup or compute. `run` is the `RunContext`, `steps` a tuple of the session's `PlanStep` records (computed once per session). An exception it raises refuses the run when the extender's `raise_on_error` or `never_fall_back` is `True`; otherwise it is logged and the run proceeds. A refusal stops later extenders from seeing `on_run_start`, but they still get `on_run_complete`.
+- `on_run_complete(run, outcome)` fires exactly once per run, after the workers were joined (a cancelled THREADING run may abandon step threads, see below) and the runner exited: also when setup, execution, finalizing or an `on_run_start` refusal raised.
+
+`outcome` is a frozen `LifecycleOutcome(status, error_type)` (exported from `mloda.steward` with `PlanContext` and `RunContext`): `status` is `"succeeded"`, `"failed"` for an `Exception` (with `error_type` the exception's fully qualified `module.qualname`, for example `builtins.ValueError`, matching OTel `error.type`; it follows the module that defines the class) or `"cancelled"`. A plan or run ended by any other `BaseException`, such as `KeyboardInterrupt` or `SystemExit` (SIGTERM), is `"cancelled"` with `error_type` set. A stream closed early, or never iterated and then closed or collected, is `"cancelled"` with `error_type` None; an `Exception` raised while finalizing gives `"failed"`. A stream primes at `stream_run()`/`stream_all()`, so an `on_run_start` refusal raises there, not on first iteration. A stream's `RunContext.started_at` is its creation time, and its run identity is captured at the `stream_run()` call. An old `on_run_complete(self, run_id)` signature raises `TypeError` naming the extender when the extender set is set up.
+
+Exceptions in `on_plan_start`, `on_plan_complete` and `on_run_complete` are logged and never propagated by default: `raise_on_error` and `never_fall_back` do not apply, and the remaining extenders are still called. With `raise_on_run_complete = True`, the first `Exception` from `on_run_complete` (in hook order) of a `"succeeded"` run propagates out of `run()`/`run_all()`, or the final `next()` of an exhausted stream, after all extenders were called; it is logged for a `"failed"` or `"cancelled"` run, and later ones are logged. `close()`, by contrast, runs only on a MULTIPROCESSING worker's copy. A worker that does not exit within `graceful_shutdown_timeout` (one deadline for all workers) is terminated, possibly mid-`close()`, and `on_run_complete` still fires: a sink whose records must not be lost should flush synchronously, not only in `close()`. A THREADING run that ends as cancelled (`SystemExit`, `KeyboardInterrupt`, or a stream closed early) waits at most `graceful_shutdown_timeout` for step threads in flight and then abandons them. `on_run_complete` then fires while an abandoned step may still be running, so its step hooks can fire afterwards and, in a process that stays alive, it keeps using shared framework connections. Step threads are daemon threads, so an abandoned one ends with the process, and threads a plugin starts inside a step inherit that. `run_all`/`stream_all` accept `graceful_shutdown_timeout` too, forwarding it the same way as `run()`/`stream_run()`. Inside `close()`, `CloseContext.current()` returns the ambient context for that worker's close, `None` everywhere else: `deadline`, `reason` (`"stop"` when the worker stops normally, a STOP or finishing its work; `"error"` for any abnormal exit, a failed command or bootstrap, or an unexpected exception; `"parent_gone"` when the parent process died), `run_id`, `plan_id`, `worker_index`, `carrier`, `tenant_id`, `project_id`, `principal`, and `remaining()` (seconds left, clamped to `0.0`). It is one instance shared across every extender closing in that worker, including its `carrier`, so one extender mutating it is visible to the others; `remaining()` can overstate by the time between the parent sending STOP and this worker starting to close. Capture the instance and pass it to threads, since a thread started inside `close()` does not inherit it. Unit tests can build one directly, requiring only `deadline` (a `time.monotonic()` timestamp) and `reason`, and use `activate()` the same way as `HookContext`.
+
+`run.run_id` is minted per execution, the same value as `HookContext.run_id` in the per-calculation hooks and as `RunResult.run_id`/`ResultStream.run_id`, so records can be correlated; re-running a prepared session gives a new `run_id` (`run.plan_id` and `HookContext.plan_id` stay the session's id). When a run with extenders raises (including a refusal at run start and an opt-in `raise_on_run_complete` failure), the exception carries the note `mloda run_id: <run_id>`, and a failed or interrupted planning of a session with extenders carries `mloda plan_id: <plan_id>` the same way (read it with `getattr(exc, "__notes__", None)`); an exception passing through nested runs (a feature group calling mloda inside a run) gets one note per run, the outermost run's last. `HookContext.current()` is `None` inside these hooks. The hooks are synchronous with no time budget: a blocking hook blocks the caller.
+
+```python
+from typing import Any
+
+from mloda.steward import Extender, ExtenderHook, LifecycleOutcome, RunContext
+
+class SealingExtender(Extender):
+    def __init__(self) -> None:
+        self.completed_run_ids: list[str | None] = []
+
+    def wraps(self) -> set[ExtenderHook]:
+        return set()
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    def on_run_complete(self, run: RunContext, outcome: LifecycleOutcome) -> None:
+        self.completed_run_ids.append(run.run_id)
+```
+
+To refuse a run when a step declares a handle, check `PlanStep.credential_handles` in `on_run_start`:
+
+```python
+from typing import Any
+
+from mloda.steward import Extender, ExtenderHook, PlanContext, PlanStep, RunContext
+
+
+class NoProdCredentials(Extender):
+    def wraps(self) -> set[ExtenderHook]:
+        return set()
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    def on_run_start(self, run: RunContext, plan: PlanContext, steps: tuple[PlanStep, ...]) -> None:
+        for step in steps:
+            if "prod_db" in step.credential_handles:
+                raise PermissionError("prod_db may not be used in this run")
+```
+
+To allow only some handles, refuse a run whose step lists one outside an allow list (a source step lists the handle it binds):
+
+```python
+class OnlyAllowedCredentials(Extender):
+    ALLOWED = frozenset({"analytics_db"})
+
+    def wraps(self) -> set[ExtenderHook]:
+        return set()
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    def on_run_start(self, run: RunContext, plan: PlanContext, steps: tuple[PlanStep, ...]) -> None:
+        for step in steps:
+            for handle in step.credential_handles:
+                if handle not in self.ALLOWED:
+                    raise PermissionError(f"{handle} may not be used in this run")
+
+extenders = {NoProdCredentials(), OnlyAllowedCredentials()}
+```
+
+To find over-declared handles, aggregate over the run's steps: keep the calculate contexts and report, per feature group, each declared handle that none of that group's contexts bound or read. A reported pair is a declaration to drop from that group, not a credential to remove, since another step's source may bind it.
+
+```python
+class UnusedCredentials(Extender):
+    def __init__(self) -> None:
+        self.contexts: list[HookContext] = []
+        self.unused: set[tuple[str | None, str]] = set()
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def on_run_start(self, run: RunContext, plan: PlanContext, steps: tuple[PlanStep, ...]) -> None:
+        self.contexts = []
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        context = HookContext.current()
+        if context is not None:
+            self.contexts.append(context)
+        return func(*args, **kwargs)
+
+    def on_run_complete(self, run: RunContext, outcome: LifecycleOutcome) -> None:
+        used = {
+            (c.feature_group_class, h) for c in self.contexts for h in (*c.credentials_read, c.bound_credential_handle)
+        }
+        self.unused = {
+            (c.feature_group_class, h) for c in self.contexts for h in c.credential_handles
+        } - used
+```
+
+In MULTIPROCESSING `__call__` runs in the worker, so aggregate there and flush from `close()`.

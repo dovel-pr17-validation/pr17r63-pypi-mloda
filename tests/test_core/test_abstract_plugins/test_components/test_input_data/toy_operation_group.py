@@ -1,0 +1,370 @@
+"""Toy operation group served by a Pandas and a PyArrow Implementation; import lazily inside tests."""
+
+from typing import Any, ClassVar
+
+import pandas as pd
+import pyarrow as pa
+
+from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.implementation import Implementation
+from mloda.provider import (
+    Cause,
+    Divergence,
+    DivergenceKind,
+    ComputeFramework,
+    FeatureSet,
+    DataCreatorFeatureGroup,
+    OperationFeatureGroup,
+    SubtypeDeclaration,
+    property_spec,
+)
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+
+OPTOY_FEATURE = "optoy_value"
+OPTOY_CHILD_FEATURE = "optoy_child_value"
+OPTOY_BARE_FEATURE = "optoy_bare_value"
+OPTOY_KEY = "optoy_kind"
+OPTOY_PANDAS_OFF = "optoy_pandas_off"
+OPTOY_VARIANT_FEATURE = "optoyvar_value"
+OPTOY_VARIANT = "skip_nan"
+PANDAS_MARK = 1
+PYARROW_MARK = 2
+
+
+class _NamedFeatureGroup(OperationFeatureGroup):
+    FEATURE: ClassVar[str] = OPTOY_FEATURE
+
+    SUBTYPES = SubtypeDeclaration(key=OPTOY_KEY)
+    PROPERTY_MAPPING = {
+        OPTOY_KEY: property_spec(
+            "Toy operation kind.",
+            strict=True,
+            allowed_values={"sum": "Sum", "median": "Median"},
+        ),
+    }
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == cls.FEATURE
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return None
+
+
+class OpToyFG(_NamedFeatureGroup):
+    """Operation group with a Pandas and a PyArrow implementation."""
+
+    CONTRACT_VERSION = 3
+    DIVERGENCES = (Divergence(kind=DivergenceKind.TYPE, cause=Cause.BACKEND, reason="group returns floats"),)
+
+
+class OpToyChildFG(OpToyFG):
+    """Subclass group with no implementation of its own."""
+
+    FEATURE = OPTOY_CHILD_FEATURE
+
+
+class OpToyNarrowFG(OpToyFG):
+    """Group-level support narrows Pandas to sum."""
+
+    FEATURE = "optoy_narrow_value"
+    SUBTYPES = SubtypeDeclaration(key=OPTOY_KEY, supported={"PandasDataFrame": {"sum"}})
+
+
+class OpToyHookFG(OpToyFG):
+    """Group that hand-overrides supports_compute_framework."""
+
+    FEATURE = "optoy_hook_value"
+
+    @classmethod
+    def supports_compute_framework(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        compute_framework: type[ComputeFramework],
+        *,
+        part: str | None = None,
+    ) -> bool:
+        return True
+
+
+class OpToyUnservedFG(OpToyFG):
+    """Group-level support names a framework no implementation serves."""
+
+    FEATURE = "optoy_unserved_value"
+    SUBTYPES = SubtypeDeclaration(key=OPTOY_KEY, supported={"PythonDictFramework": {"sum"}})
+
+
+class OpToyBareFG(_NamedFeatureGroup):
+    """Operation group with no implementation."""
+
+    FEATURE = OPTOY_BARE_FEATURE
+
+
+class OpToyPandas(Implementation[OpToyFG]):
+    feature_group = OpToyFG
+    compute_framework = PandasDataFrame
+    divergences = (
+        Divergence(
+            kind=DivergenceKind.VALUE, cause=Cause.BACKEND, subtypes=frozenset({"sum"}), reason="skips NaN in sum"
+        ),
+    )
+    served_by: ClassVar[list[Any]] = []
+
+    @classmethod
+    def accepts(cls, feature_name: str, options: Options, *, part: str | None = None) -> bool:
+        return options.get(OPTOY_PANDAS_OFF) is None
+
+    @classmethod
+    def calculate(
+        cls, group: type[OpToyFG], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        cls.served_by.append(group)
+        return pd.DataFrame({OPTOY_FEATURE: [PANDAS_MARK], OPTOY_CHILD_FEATURE: [PANDAS_MARK]})
+
+
+class OpToyPyArrow(Implementation[OpToyFG]):
+    feature_group = OpToyFG
+    compute_framework = PyArrowTable
+    supported = frozenset({"sum"})
+    served_by: ClassVar[list[Any]] = []
+
+    @classmethod
+    def calculate(
+        cls, group: type[OpToyFG], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        cls.served_by.append(group)
+        return pa.table({OPTOY_FEATURE: [PYARROW_MARK], OPTOY_CHILD_FEATURE: [PYARROW_MARK]})
+
+
+class OpToyVariantFG(_NamedFeatureGroup):
+    """Operation group whose Pandas implementation follows the skip_nan variant; PyArrow is the default."""
+
+    FEATURE = OPTOY_VARIANT_FEATURE
+    VARIANTS = frozenset({OPTOY_VARIANT})
+
+
+class OpToyVariantPandas(Implementation[OpToyVariantFG]):
+    feature_group = OpToyVariantFG
+    compute_framework = PandasDataFrame
+    divergences = (
+        Divergence(
+            kind=DivergenceKind.VARIANT,
+            cause=Cause.BACKEND,
+            variant=OPTOY_VARIANT,
+            subtypes=frozenset({"sum"}),
+            reason="skips NaN in sum",
+        ),
+    )
+
+    @classmethod
+    def calculate(
+        cls, group: type[OpToyVariantFG], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        return pd.DataFrame({OPTOY_VARIANT_FEATURE: [PANDAS_MARK]})
+
+
+class OpToyVariantPyArrow(Implementation[OpToyVariantFG]):
+    feature_group = OpToyVariantFG
+    compute_framework = PyArrowTable
+
+    @classmethod
+    def calculate(
+        cls, group: type[OpToyVariantFG], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        return pa.table({OPTOY_VARIANT_FEATURE: [PYARROW_MARK]})
+
+
+class OpToyVariantEmptyFG(OpToyVariantFG):
+    """Subclass that empties VARIANTS, so the inherited variant record is unlisted."""
+
+    FEATURE = "optoyvar_empty"
+    VARIANTS = frozenset()
+
+
+class OpToyVariantOtherFG(OpToyVariantFG):
+    """Subclass that narrows VARIANTS to a name the inherited variant record does not follow."""
+
+    FEATURE = "optoyvar_other"
+    VARIANTS = frozenset({"other"})
+
+
+OPTOY_VARIANT_CONSUMER = "optoyvar_consumer"
+
+
+class OpToyVariantConsumerFG(OperationFeatureGroup):
+    """Consumer whose input is the variant feature pinned to Pandas."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == OPTOY_VARIANT_CONSUMER
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(OPTOY_VARIANT_FEATURE, compute_framework="PandasDataFrame")}
+
+
+class OpToyVariantConsumerPandas(Implementation[OpToyVariantConsumerFG]):
+    feature_group = OpToyVariantConsumerFG
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def calculate(
+        cls, group: type[OpToyVariantConsumerFG], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        data[OPTOY_VARIANT_CONSUMER] = PANDAS_MARK
+        return data
+
+
+OPTOY_VARIANT_OPEN_CONSUMER = "optoyvar_open_consumer"
+OPTOY_VARIANT_EMPTY_CONSUMER = "optoyvar_empty_consumer"
+
+
+class OpToyVariantOpenConsumerFG(OpToyVariantConsumerFG):
+    """Consumer whose variant input has no framework pin; Pandas serves it through the MRO."""
+
+    NAME: ClassVar[str] = OPTOY_VARIANT_OPEN_CONSUMER
+    INPUT: ClassVar[str] = OPTOY_VARIANT_FEATURE
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == cls.NAME
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(self.INPUT)}
+
+
+class OpToyVariantEmptyConsumerFG(OpToyVariantOpenConsumerFG):
+    """Unpinned consumer over the group whose inherited variant record is unlisted."""
+
+    NAME = OPTOY_VARIANT_EMPTY_CONSUMER
+    INPUT = "optoyvar_empty"
+
+
+OPTOY_VARIANT_PIN_ROOT = "optoyvar_pin_root"
+
+
+class OpToyVariantPinRootFG(OpToyVariantOpenConsumerFG):
+    """Consumer that pins its variant input to the Pandas implementation."""
+
+    NAME = OPTOY_VARIANT_PIN_ROOT
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(OPTOY_VARIANT_OPEN_CONSUMER, implementation="OpToyVariantPandas")}
+
+
+OPTOY_VARIANT_RIVAL_CONSUMER = "optoyvar_rival_consumer"
+
+
+class OpToyVariantRivalFixableConsumerFG(OpToyVariantOpenConsumerFG):
+    """Rival consumer whose variant input the caller can fix by allowing the variant."""
+
+    NAME = OPTOY_VARIANT_RIVAL_CONSUMER
+    INPUT = OPTOY_VARIANT_FEATURE
+
+
+class OpToyVariantRivalUnlistedConsumerFG(OpToyVariantOpenConsumerFG):
+    """Rival consumer over the group whose variant is unlisted, so no allow fixes it."""
+
+    NAME = OPTOY_VARIANT_RIVAL_CONSUMER
+    INPUT = "optoyvar_empty"
+
+
+OPTOY_VARIANT_NARROW_CONSUMER = "optoyvar_narrow_consumer"
+
+
+class OpToyVariantNarrowFG(OpToyVariantFG):
+    """Pandas only supports median, so sum on Pandas is dropped for a non-variant reason."""
+
+    FEATURE = "optoyvar_narrow"
+    SUBTYPES = SubtypeDeclaration(key=OPTOY_KEY, supported={"PandasDataFrame": {"median"}})
+
+
+class OpToyVariantNarrowConsumerFG(OpToyVariantOpenConsumerFG):
+    """Unpinned consumer over the narrowed variant group."""
+
+    NAME = OPTOY_VARIANT_NARROW_CONSUMER
+    INPUT = "optoyvar_narrow"
+
+
+OPTOY_CHAIN_SRC = "optoy_chain_src"
+OPTOY_CHAIN_SUFFIX = "__optoy_chain"
+CHAIN_LOG: list[tuple[str, str]] = []
+
+
+class OpToyChainSourceFG(DataCreatorFeatureGroup):
+    """Pandas-only source for the chain toy."""
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {OPTOY_CHAIN_SRC}
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PandasDataFrame}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return pd.DataFrame({OPTOY_CHAIN_SRC: [1, 2, 3]})
+
+
+class OpToyChainFG(OperationFeatureGroup):
+    """Operation group whose feature `<src>__optoy_chain` takes `<src>` as input."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name).endswith(OPTOY_CHAIN_SUFFIX)
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(str(feature_name)[: -len(OPTOY_CHAIN_SUFFIX)])}
+
+
+class OpToyChainPandas(Implementation[OpToyChainFG]):
+    feature_group = OpToyChainFG
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def calculate(
+        cls, group: type[OpToyChainFG], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        for name in sorted(features.get_all_names()):
+            CHAIN_LOG.append((name, cls.__name__))
+            data[name] = PANDAS_MARK
+        return data
+
+
+class OpToyChainPyArrow(Implementation[OpToyChainFG]):
+    feature_group = OpToyChainFG
+    compute_framework = PyArrowTable
+
+    @classmethod
+    def calculate(
+        cls, group: type[OpToyChainFG], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        for name in sorted(features.get_all_names()):
+            CHAIN_LOG.append((name, cls.__name__))
+            data = data.append_column(name, pa.array([PYARROW_MARK] * data.num_rows))
+        return data

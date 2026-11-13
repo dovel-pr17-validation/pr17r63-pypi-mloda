@@ -1,0 +1,431 @@
+"""Tests that file, database and document source group modules import cleanly under blocked pyarrow and that
+CsvFG.load_neutral resolves a backend-neutral FileSource descriptor without pyarrow.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from tests.test_core.test_optional_pyarrow._pyarrow_blocker import run_blocked
+
+# ---------------------------------------------------------------------------
+# CSV
+# ---------------------------------------------------------------------------
+_BODY_CSV_IMPORT: str = """
+import sys
+
+try:
+    from mloda_plugins.feature_group.input_data.file_formats.csv_fg import CsvFG
+    print("IMPORTED")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+except Exception as e:
+    print("IMPORT_OTHER:" + type(e).__name__ + ":" + str(e))
+"""
+
+_BODY_CSV_LOAD: str = """
+import sys
+
+try:
+    from mloda.core.abstract_plugins.components.input_data.file_source import FileSource
+    from mloda.provider import FeatureSet
+    from mloda.user import Feature
+    from mloda.core.abstract_plugins.components.input_data.claim_route import SourceMatch
+    from mloda_plugins.feature_group.input_data.file_formats.csv_fg import CsvFG
+except Exception as e:
+    print("IMPORT_FAILED:" + type(e).__name__)
+    sys.exit(0)
+
+features = FeatureSet()
+features.add(Feature("A"))
+
+result = CsvFG.load_neutral(SourceMatch(source="/nonexistent/path.csv", access="/nonexistent/path.csv"), features)
+if isinstance(result, FileSource) and result.format == "csv" and result.columns == ("A",):
+    print("FILESOURCE")
+else:
+    print("WRONG:" + type(result).__name__)
+"""
+
+# ---------------------------------------------------------------------------
+# JSON
+# ---------------------------------------------------------------------------
+_BODY_JSON_IMPORT: str = """
+import sys
+
+try:
+    from mloda_plugins.feature_group.input_data.file_formats.json_fg import JsonFG
+    print("IMPORTED")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+except Exception as e:
+    print("IMPORT_OTHER:" + type(e).__name__ + ":" + str(e))
+"""
+
+# ---------------------------------------------------------------------------
+# Parquet
+# ---------------------------------------------------------------------------
+_BODY_PARQUET_IMPORT: str = """
+import sys
+
+try:
+    from mloda_plugins.feature_group.input_data.file_formats.parquet_fg import ParquetFG
+    print("IMPORTED")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+except Exception as e:
+    print("IMPORT_OTHER:" + type(e).__name__ + ":" + str(e))
+"""
+
+# ---------------------------------------------------------------------------
+# Feather
+# ---------------------------------------------------------------------------
+_BODY_FEATHER_IMPORT: str = """
+import sys
+
+try:
+    from mloda_plugins.feature_group.input_data.file_formats.feather_fg import FeatherFG
+    print("IMPORTED")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+except Exception as e:
+    print("IMPORT_OTHER:" + type(e).__name__ + ":" + str(e))
+"""
+
+# ---------------------------------------------------------------------------
+# ORC
+# ---------------------------------------------------------------------------
+_BODY_ORC_IMPORT: str = """
+import sys
+
+try:
+    from mloda_plugins.feature_group.input_data.file_formats.orc_fg import OrcFG
+    print("IMPORTED")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+except Exception as e:
+    print("IMPORT_OTHER:" + type(e).__name__ + ":" + str(e))
+"""
+
+
+@pytest.mark.timeout(30)
+def test_csv_fg_imports_without_pyarrow() -> None:
+    """CsvFG module must import successfully even when pyarrow is absent."""
+    result = run_blocked(_BODY_CSV_IMPORT)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel after blocking pyarrow. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.timeout(30)
+def test_csv_fg_load_neutral_returns_file_source_without_pyarrow() -> None:
+    """CsvFG.load_neutral returns a lightweight FileSource descriptor even when pyarrow
+    is absent; a per-framework transformer materializes it later.
+    """
+    result = run_blocked(_BODY_CSV_LOAD)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "FILESOURCE" in result.stdout, (
+        f"Expected FILESOURCE sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.timeout(30)
+def test_json_fg_imports_without_pyarrow() -> None:
+    """JsonFG module must import successfully even when pyarrow is absent."""
+    result = run_blocked(_BODY_JSON_IMPORT)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.timeout(30)
+def test_parquet_fg_imports_without_pyarrow() -> None:
+    """ParquetFG module must import successfully even when pyarrow is absent."""
+    result = run_blocked(_BODY_PARQUET_IMPORT)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.timeout(30)
+def test_feather_fg_imports_without_pyarrow() -> None:
+    """FeatherFG module must import successfully even when pyarrow is absent."""
+    result = run_blocked(_BODY_FEATHER_IMPORT)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+@pytest.mark.timeout(30)
+def test_orc_fg_imports_without_pyarrow() -> None:
+    """OrcFG module must import successfully even when pyarrow is absent."""
+    result = run_blocked(_BODY_ORC_IMPORT)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Feather: match declines with a rejection naming mloda[pyarrow], load_neutral raises ImportError
+# ---------------------------------------------------------------------------
+_BODY_FEATHER_DECLINE_AND_LOAD: str = """
+import os
+import sys
+import tempfile
+
+from mloda.core.abstract_plugins.components.input_data.claim_route import SourceMatch
+from mloda.core.abstract_plugins.components.match_rejection import MATCH_REJECTION_REASONS
+from mloda.provider import FeatureSet
+from mloda.user import DataAccessCollection, Feature, Options
+from mloda_plugins.feature_group.input_data.file_formats.feather_fg import FeatherFG
+
+fd, path = tempfile.mkstemp(suffix=".feather")
+os.close(fd)
+with open(path, "wb") as f:
+    f.write(b"placeholder")
+
+window = {}
+token = MATCH_REJECTION_REASONS.set(window)
+try:
+    matched = FeatherFG.match_feature_group_criteria("a", Options(), DataAccessCollection(files={path}))
+finally:
+    MATCH_REJECTION_REASONS.reset(token)
+
+features = FeatureSet()
+features.add(Feature("a"))
+
+try:
+    FeatherFG.load_neutral(SourceMatch(source=path, access=path), features)
+    load_result = "NO_RAISE"
+except ImportError as e:
+    load_result = "IMPORT_ERROR:" + str(e)
+except Exception as e:
+    load_result = "OTHER:" + type(e).__name__ + ":" + str(e)
+finally:
+    os.remove(path)
+
+print("MATCH:" + str(matched))
+rejection = window.get("FeatherFG")
+print("REJECTION:" + ("NONE" if rejection is None else rejection.reason))
+print("LOAD:" + load_result)
+"""
+
+
+@pytest.mark.timeout(30)
+def test_feather_fg_declines_with_an_install_hint_and_load_raises_without_pyarrow() -> None:
+    """Without pyarrow the Feather group declines at match time, recording why, and load_neutral raises ImportError."""
+    result = run_blocked(_BODY_FEATHER_DECLINE_AND_LOAD)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "MATCH:False" in result.stdout, f"Expected a decline. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    rejection_lines = [line for line in result.stdout.splitlines() if line.startswith("REJECTION:")]
+    assert rejection_lines and "mloda[pyarrow]" in rejection_lines[0], (
+        f"Expected a rejection naming mloda[pyarrow]. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "LOAD:IMPORT_ERROR:" in result.stdout, (
+        f"Expected import-error sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "mloda[pyarrow]" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Dict transformer: a non-CSV FileSource needs pyarrow, so it raises ImportError without it
+# ---------------------------------------------------------------------------
+_BODY_DICT_TRANSFORMER_NON_CSV: str = """
+from mloda.core.abstract_plugins.components.input_data.file_source import FileSource
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_file_source_transformer import (
+    FileSourceDictTransformer,
+)
+
+try:
+    FileSourceDictTransformer.transform_fw_to_other_fw(
+        FileSource(path="/nonexistent/data.parquet", format="parquet", columns=("a",))
+    )
+    print("NO_RAISE")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+except Exception as e:
+    print("OTHER:" + type(e).__name__ + ":" + str(e))
+"""
+
+
+@pytest.mark.timeout(30)
+def test_dict_file_source_transformer_non_csv_raises_import_error_without_pyarrow() -> None:
+    result = run_blocked(_BODY_DICT_TRANSFORMER_NON_CSV)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORT_ERROR:" in result.stdout, (
+        f"Expected import-error sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# YAML: the module must import without PyYAML, and only raise once the file is loaded
+# ---------------------------------------------------------------------------
+_BODY_YAML_IMPORT_AND_LOAD: str = """
+import os
+import sys
+import tempfile
+
+try:
+    from mloda.core.abstract_plugins.components.input_data.claim_route import SourceMatch
+    from mloda.provider import FeatureSet
+    from mloda.user import Feature
+    from mloda_plugins.feature_group.input_data.document_formats.yaml_fg import YamlFG
+    print("IMPORTED")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+    sys.exit(0)
+except Exception as e:
+    print("IMPORT_OTHER:" + type(e).__name__ + ":" + str(e))
+    sys.exit(0)
+
+fd, path = tempfile.mkstemp(suffix=".yaml")
+os.close(fd)
+with open(path, "w", encoding="utf-8") as f:
+    f.write("key: value\\n")
+
+features = FeatureSet()
+features.add(Feature("YamlFG"))
+
+try:
+    YamlFG.load_neutral(SourceMatch(source=path, access=path), features)
+    load_result = "NO_RAISE"
+except ImportError as e:
+    load_result = "IMPORT_ERROR:" + str(e)
+except Exception as e:
+    load_result = "OTHER:" + type(e).__name__ + ":" + str(e)
+finally:
+    os.remove(path)
+
+print("LOAD:" + load_result)
+"""
+
+
+@pytest.mark.timeout(30)
+def test_yaml_fg_imports_without_yaml_and_load_raises() -> None:
+    result = run_blocked(_BODY_YAML_IMPORT_AND_LOAD, module="yaml")
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel after blocking yaml. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "LOAD:IMPORT_ERROR:" in result.stdout, (
+        f"Expected import-error sentinel from load_neutral. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "mloda[yaml]" in result.stdout, (
+        f"Expected mloda[yaml] install hint. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Documents: every document group imports and TextFG loads into PythonDictFramework without pyarrow
+# ---------------------------------------------------------------------------
+_BODY_DOCUMENT_IMPORT_AND_LOAD: str = """
+import os
+import sys
+import tempfile
+
+try:
+    from mloda.user import DataAccessCollection, PluginCollector, mloda
+    from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import (
+        PythonDictFramework,
+    )
+    from mloda_plugins.feature_group.input_data.document_formats.json_document_fg import JsonDocumentFG
+    from mloda_plugins.feature_group.input_data.document_formats.markdown_fg import MarkdownFG
+    from mloda_plugins.feature_group.input_data.document_formats.text_fg import PyFG, TextFG
+    from mloda_plugins.feature_group.input_data.document_formats.yaml_fg import YamlFG
+    print("IMPORTED")
+except Exception as e:
+    print("IMPORT_FAILED:" + type(e).__name__ + ":" + str(e))
+    sys.exit(0)
+
+fd, path = tempfile.mkstemp(suffix=".txt")
+os.close(fd)
+with open(path, "w", encoding="utf-8") as f:
+    f.write("hello\\n")
+
+try:
+    result = mloda.run_all(
+        ["TextFG", "TextFG~source", "TextFG~file_type"],
+        compute_frameworks=[PythonDictFramework],
+        plugin_collector=PluginCollector.enabled_feature_groups({TextFG}),
+        data_access_collection=DataAccessCollection(files={"doc_handle": path}),
+    )
+    expected = [{"TextFG": ["hello\\n"], "TextFG~source": [path], "TextFG~file_type": ["txt"]}]
+    print("MATCH" if result == expected else "WRONG:" + repr(result))
+except Exception as e:
+    print("RUN_FAILED:" + type(e).__name__ + ":" + str(e))
+finally:
+    os.remove(path)
+"""
+
+
+@pytest.mark.timeout(30)
+def test_document_groups_import_and_text_fg_loads_into_python_dict_without_pyarrow() -> None:
+    result = run_blocked(_BODY_DOCUMENT_IMPORT_AND_LOAD)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel after blocking pyarrow. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "MATCH" in result.stdout.splitlines(), (
+        f"Expected the three outputs. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# SQLite: the database group imports and loads into PythonDictFramework without pyarrow
+# ---------------------------------------------------------------------------
+_BODY_SQLITE_IMPORT_AND_LOAD: str = """
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+
+try:
+    from mloda.user import DataAccessCollection, PluginCollector, mloda
+    from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import (
+        PythonDictFramework,
+    )
+    from mloda_plugins.feature_group.input_data.db_sources.sqlite_fg import SqliteFG
+    print("IMPORTED")
+except Exception as e:
+    print("IMPORT_FAILED:" + type(e).__name__ + ":" + str(e))
+    sys.exit(0)
+
+fd, path = tempfile.mkstemp(suffix=".sqlite")
+os.close(fd)
+connection = sqlite3.connect(path)
+connection.execute("CREATE TABLE sb_table (sb_a INTEGER, sb_b TEXT, sb_c REAL)")
+connection.execute("INSERT INTO sb_table VALUES (1, 'x', 1.5)")
+connection.execute("INSERT INTO sb_table VALUES (2, 'y', 2.5)")
+connection.commit()
+connection.close()
+
+try:
+    result = mloda.run_all(
+        ["sb_a", "sb_b"],
+        compute_frameworks=[PythonDictFramework],
+        plugin_collector=PluginCollector.enabled_feature_groups({SqliteFG}),
+        data_access_collection=DataAccessCollection(credentials=[{"sqlite": path}]),
+    )
+    print("RESULT:" + json.dumps(result[0], sort_keys=True))
+except Exception as e:
+    print("RUN_FAILED:" + type(e).__name__ + ":" + str(e))
+finally:
+    os.remove(path)
+"""
+
+
+@pytest.mark.timeout(30)
+def test_sqlite_fg_imports_and_loads_into_python_dict_without_pyarrow() -> None:
+    result = run_blocked(_BODY_SQLITE_IMPORT_AND_LOAD)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel after blocking pyarrow. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert 'RESULT:{"sb_a": [1, 2], "sb_b": ["x", "y"]}' in result.stdout, (
+        f"Expected the two requested columns. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )

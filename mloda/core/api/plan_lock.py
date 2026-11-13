@@ -1,0 +1,244 @@
+"""Lock file recording a resolved plan's classes, input wiring and join keys, so a change fails loudly."""
+
+import difflib
+import hashlib
+import json
+import os
+import warnings
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from mloda.core.abstract_plugins.components.credential_handle import credential_handle_keys
+from mloda.core.abstract_plugins.components.credential_scrub import _mask_secret_keys
+from mloda.core.abstract_plugins.components.divergence import divergence_dicts
+from mloda.core.api.plan_info import PlanStep
+from mloda.core.prepare.stable_text import stable_text
+
+PLAN_LOCK_FORMAT = 9
+
+
+class PlanLockContractVersionWarning(UserWarning):
+    """The only difference from the lock is a feature group's CONTRACT_VERSION."""
+
+
+class PlanLockMismatchError(Exception):
+    """The resolved plan differs from the lock file, or the lock file is missing."""
+
+
+def _class_path(cls: Any) -> str | None:
+    return None if cls is None else f"{cls.__module__}:{cls.__qualname__}"
+
+
+def _sorted_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
+
+
+def _masked_group(group: dict[str, Any], step: PlanStep) -> dict[str, Any]:
+    handle_keys = credential_handle_keys(step.feature_group) if step.feature_group is not None else {}
+    kept = {k: v for k, v in group.items() if k in handle_keys and isinstance(v, str)}
+    masked: dict[str, Any] = _mask_secret_keys({k: v for k, v in group.items() if k not in kept})
+    return {**masked, **kept}
+
+
+def _build(plan: Sequence[PlanStep]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the lock content and the wider content-hash content, built in one pass."""
+    requested: set[str] = set()
+    lock: dict[str, list[dict[str, Any]]] = {"compute": [], "joins": [], "transforms": []}
+    wide: dict[str, list[dict[str, Any]]] = {"compute": [], "joins": [], "transforms": []}
+    for step in plan:
+        if step.step_kind == "compute":
+            requested.update(step.requested_feature_names)
+            record: dict[str, Any] = {
+                "feature_names": sorted(step.feature_names),
+                "feature_group": _class_path(step.feature_group),
+                "compute_framework": _class_path(step.compute_framework),
+                "compute_framework_reason": step.compute_framework_reason,
+                "specialized_from": sorted(_class_path(parent) or "" for parent in step.specialized_from),
+                "result_framework": _class_path(step.result_framework),
+                "input_feature_edges": {name: sorted(inputs) for name, inputs in step.input_feature_edges.items()},
+                "leaves_connection": step.leaves_connection,
+                "implementation": step.implementation_path,
+                "implementation_hash": None if step.implementation is None else step.implementation_hash,
+                "implementation_specialized_from": sorted(
+                    _class_path(parent) or "" for parent in step.implementation_specialized_from
+                ),
+            }
+            if step.feature_group_hash is not None:
+                record["feature_group_hash"] = step.feature_group_hash
+            if step.credential_handles:
+                record["credential_handles"] = list(step.credential_handles)
+            if step.runtime_parameters:
+                record["runtime_parameters"] = list(step.runtime_parameters)
+            if step.contract_version is not None:
+                record["contract_version"] = step.contract_version
+            if step.divergences:
+                record["divergences"] = divergence_dicts(step.divergences)
+            if step.allowed_variants:
+                record["allowed_variants"] = list(step.allowed_variants)
+            lock["compute"].append(record)
+            wide_record: dict[str, Any] = {
+                key: value
+                for key, value in record.items()
+                if key
+                not in (
+                    "compute_framework_reason",
+                    "leaves_connection",
+                    "credential_handles",
+                    "runtime_parameters",
+                    "divergences",
+                    "allowed_variants",
+                )
+            }
+            options = step.content_options
+            wide_record["options"] = None if options is None else stable_text(_masked_group(options.group, step))
+            wide["compute"].append(wide_record)
+        elif step.step_kind == "join":
+            record = {
+                "left_feature_group": _class_path(step.feature_group),
+                "right_feature_group": _class_path(step.source_feature_group),
+                "join_type": step.join_type,
+                "compute_framework": _class_path(step.compute_framework),
+                "source_compute_framework": _class_path(step.source_compute_framework),
+                "destination_side": step.join_destination_side,
+                "join_keys": None if step.join_keys is None else list(step.join_keys),
+            }
+            lock["joins"].append(record)
+            wide["joins"].append(record)
+        elif step.step_kind == "transform":
+            record = {
+                "feature_group": _class_path(step.feature_group),
+                "from_compute_framework": _class_path(step.source_compute_framework),
+                "to_compute_framework": _class_path(step.compute_framework),
+                "leaves_connection": step.leaves_connection,
+            }
+            lock["transforms"].append(record)
+            wide["transforms"].append({k: v for k, v in record.items() if k != "leaves_connection"})
+        else:
+            raise ValueError(f"Unknown plan step kind {step.step_kind!r}.")
+    sorted_requested = sorted(requested)
+    return (
+        {
+            "format": PLAN_LOCK_FORMAT,
+            "requested_features": sorted_requested,
+            **{key: _sorted_records(records) for key, records in lock.items()},
+        },
+        {
+            "requested_features": sorted_requested,
+            **{key: _sorted_records(records) for key, records in wide.items()},
+        },
+    )
+
+
+def _lock_content(plan: Sequence[PlanStep]) -> dict[str, Any]:
+    return _build(plan)[0]
+
+
+def _dump(content: dict[str, Any]) -> str:
+    return json.dumps(content, sort_keys=True, indent=2) + "\n"
+
+
+def _lock_text(plan: Sequence[PlanStep]) -> str:
+    return _dump(_lock_content(plan))
+
+
+def plan_structure_hash(plan: Sequence[PlanStep]) -> str:
+    """Return the sha256 of the plan-lock text: an equal hash means an equal lock file."""
+    return hashlib.sha256(_lock_text(plan).encode("utf-8")).hexdigest()
+
+
+def plan_content_hash(plan: Sequence[PlanStep]) -> str:
+    """Return the sha256 of the lock content minus format and the keys _build leaves out, plus scrubbed options."""
+    text = json.dumps(_build(plan)[1], sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_PATH_FIELDS = {
+    "compute": ("feature_group", "compute_framework", "result_framework", "implementation"),
+    "joins": ("left_feature_group", "right_feature_group", "compute_framework", "source_compute_framework"),
+    "transforms": ("feature_group", "from_compute_framework", "to_compute_framework"),
+}
+
+
+def _main_paths(content: dict[str, Any]) -> set[str]:
+    paths: set[str | None] = set()
+    for section, fields in _PATH_FIELDS.items():
+        for record in content[section]:
+            paths.update(record[field] for field in fields)
+            paths.update(record.get("specialized_from", []))
+            paths.update(record.get("implementation_specialized_from", []))
+    return {path for path in paths if path and path.startswith("__main__:")}
+
+
+def write_plan_lock(plan: Sequence[PlanStep], path: str | os.PathLike[str]) -> None:
+    """Write the canonical lock file for the plan, refusing classes defined in __main__."""
+    content = _lock_content(plan)
+    mains = _main_paths(content)
+    if mains:
+        raise ValueError(f"Cannot lock classes defined in __main__, move them into a module: {sorted(mains)}")
+    unhashed = sorted(r["implementation"] for r in content["compute"] if r["implementation_hash"] == "unavailable")
+    if unhashed:
+        raise ValueError(f"Cannot lock implementations whose hash is unavailable (source not readable): {unhashed}")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(_dump(content))
+
+
+def _without_contract_version(content: dict[str, Any]) -> dict[str, Any]:
+    records = [{k: v for k, v in r.items() if k != "contract_version"} for r in content.get("compute", [])]
+    return {**content, "compute": _sorted_records(records)}
+
+
+def _compute_is_records(content: Any) -> bool:
+    compute = content.get("compute") if isinstance(content, dict) else None
+    return isinstance(compute, list) and all(isinstance(r, dict) for r in compute)
+
+
+def _contract_version_only(locked: dict[str, Any], resolved: dict[str, Any]) -> bool:
+    return _without_contract_version(locked) == _without_contract_version(resolved)
+
+
+def _contract_version_message(locked: dict[str, Any], resolved: dict[str, Any]) -> str:
+    def versions(content: dict[str, Any]) -> dict[str, set[Any]]:
+        found: dict[str, set[Any]] = {}
+        for record in content["compute"]:
+            found.setdefault(record["feature_group"], set()).add(record.get("contract_version"))
+        return found
+
+    before, after = versions(locked), versions(resolved)
+    changed = [
+        f"{group}: locked {sorted(before[group], key=str)}, resolved {sorted(after[group], key=str)}"
+        for group in sorted(before)
+        if before[group] != after.get(group)
+    ]
+    return "Plan lock contract version changed: " + "; ".join(changed)
+
+
+def check_plan_lock(plan: Sequence[PlanStep], path: str | os.PathLike[str]) -> None:
+    """Raise PlanLockMismatchError unless the plan matches the lock; a contract-version-only change warns."""
+    target = Path(path)
+    resolved = _lock_text(plan)
+    if not target.exists():
+        raise PlanLockMismatchError(
+            f"Plan lock file {target} does not exist. Call write_plan_lock(plan, path) to create it "
+            f"with this content:\n{resolved}"
+        )
+    locked = json.loads(target.read_text(encoding="utf-8-sig"))
+    resolved_content = json.loads(resolved)
+    if locked == resolved_content:
+        return
+    if (
+        _compute_is_records(locked)
+        and _compute_is_records(resolved_content)
+        and _contract_version_only(locked, resolved_content)
+    ):
+        warnings.warn(_contract_version_message(locked, resolved_content), PlanLockContractVersionWarning, stacklevel=2)
+        return
+    diff = difflib.unified_diff(
+        (json.dumps(locked, sort_keys=True, indent=2) + "\n").splitlines(keepends=True),
+        resolved.splitlines(keepends=True),
+        fromfile=str(target),
+        tofile="resolved",
+    )
+    raise PlanLockMismatchError(f"Resolved plan differs from {target}:\n{''.join(diff)}")

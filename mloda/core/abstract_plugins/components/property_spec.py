@@ -1,0 +1,310 @@
+"""The PROPERTY_MAPPING spec type.
+
+``PropertySpec`` is the typed, frozen spec and IS the contract: construction enforces every
+invariant (issue #694). ``property_spec`` is a thin builder kept for its authoring surface;
+its ``strict=`` keyword maps to the ``strict_validation=`` field.
+"""
+
+from __future__ import annotations
+
+import numbers
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from mloda.core.abstract_plugins.components.utils import is_match_abort
+
+
+def is_positive_int(value: Any) -> bool:
+    """Element validator for positive-integer options.
+
+    Accepts Python ints, numpy integers, and decimal strings. Rejects ``bool`` (which
+    would otherwise pass ``isinstance(value, int)`` and let ``horizon=True`` through),
+    zero, negatives, non-integers, and non-decimal digit strings such as ``"²"``, which
+    satisfy ``str.isdigit()`` but raise in ``int()``.
+
+    Use this instead of hand-rolling the check, so every plugin agrees on what a
+    positive integer is::
+
+        WINDOW_SIZE: PropertySpec("...", element_validator=is_positive_int)
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, numbers.Integral):
+        return int(value) > 0
+    return isinstance(value, str) and value.isdecimal() and int(value) > 0
+
+
+class _NoDefault:
+    """Type of the ``NO_DEFAULT`` sentinel."""
+
+    def __repr__(self) -> str:
+        return "NO_DEFAULT"
+
+    def __reduce__(self) -> str:
+        # Pickle and deepcopy resolve back to the module-level singleton instead of cloning it.
+        return "NO_DEFAULT"
+
+
+NO_DEFAULT: Any = _NoDefault()
+"""The spec declares NO default, which makes the key required.
+
+``default=None`` is a DECLARED default of ``None``: it makes the key optional and applies no
+value. The retired dict form drew that line with a PRESENT ``default: None`` entry; on a
+dataclass every field is always present, so the sentinel carries the distinction instead.
+"""
+
+
+def is_no_default(value: Any) -> bool:
+    """Is this the "declares no default" sentinel?
+
+    A type test, not an identity test: a second imported copy of this module (editable install
+    plus site-packages, importlib.reload) has its own sentinel object, and an identity test would
+    read that copy's sentinel as a declared default.
+    """
+    return isinstance(value, _NoDefault)
+
+
+# The declared type lists the container shapes so a bare str/bytes (the forgotten-comma bug) is
+# an author-time type error rather than a silent substring value space. The runtime is
+# deliberately more lenient: __post_init__ materializes ANY non-Mapping iterable (a generator,
+# a range) to a tuple, and keeps the str/bytes ValueError as the backstop for unchecked callers.
+# A Mapping is the value-space-with-descriptions form and is kept as given.
+AllowedValues = Mapping[Any, str] | tuple[Any, ...] | list[Any] | set[Any] | frozenset[Any]
+
+
+@dataclass(frozen=True)
+class PropertySpec:
+    """Typed, frozen option spec, the value type of PROPERTY_MAPPING."""
+
+    explanation: str
+    allowed_values: AllowedValues | None = None
+    default: Any = NO_DEFAULT
+    context: bool = True
+    strict_validation: bool = False
+    element_validator: Callable[[Any], Any] | None = None
+    match_guard: Callable[[Any], Any] | None = None
+    required_when: Callable[[Any], Any] | None = None
+    allow_explicit_none: bool = False
+    # Exempts a NO_DEFAULT key from the name-path required-presence check (#769): its value is bound
+    # outside match-time name capture (parsed from the name by the plugin, or supplied downstream).
+    # It does NOT change config-path requiredness.
+    deferred_binding: bool = False
+    # Names what the match_guard accepts, for the rejection reason.
+    expected: str | None = None
+    # Converts the captured text of a named capture bound to this key, before validation.
+    name_converter: Callable[[str], Any] | None = None
+    # Refused for untrusted service callers even when allow-listed.
+    caller_settable: bool = True
+    # False keeps a group option on the feature that declares it; input features never inherit it
+    # unless an explicit forward_group allowlist names it.
+    forward_to_inputs: bool = True
+    # A context option a run may replace for that run only; the prepare-time value stays the baseline.
+    runtime: bool = False
+
+    def __post_init__(self) -> None:
+        prefix = f"PropertySpec({self.explanation!r})"
+
+        # A str/bytes is iterable, so tuple("add") would silently build ('a', 'd', 'd'): reject the
+        # shape before materializing it.
+        if isinstance(self.allowed_values, (str, bytes)):
+            raise ValueError(
+                f"{prefix}: allowed_values is a {type(self.allowed_values).__name__} "
+                f"({self.allowed_values!r}), which would make membership a substring test. Wrap it in a "
+                f"container, for example a one-element tuple: ({self.allowed_values!r},)."
+            )
+
+        if self.allowed_values is not None and not isinstance(self.allowed_values, Mapping):
+            if not isinstance(self.allowed_values, Iterable):
+                raise ValueError(
+                    f"{prefix}: allowed_values is a {type(self.allowed_values).__name__} "
+                    f"({self.allowed_values!r}), not a Mapping or an iterable of accepted values."
+                )
+            object.__setattr__(self, "allowed_values", tuple(self.allowed_values))
+
+        if not isinstance(self.context, bool):
+            raise ValueError(f"{prefix}: context must be a bool, got {type(self.context).__name__}.")
+
+        if not isinstance(self.strict_validation, bool):
+            raise ValueError(
+                f"{prefix}: strict_validation must be a bool, got {type(self.strict_validation).__name__}."
+            )
+
+        if not isinstance(self.allow_explicit_none, bool):
+            raise ValueError(
+                f"{prefix}: allow_explicit_none must be a bool, got {type(self.allow_explicit_none).__name__}."
+            )
+
+        if not isinstance(self.deferred_binding, bool):
+            raise ValueError(f"{prefix}: deferred_binding must be a bool, got {type(self.deferred_binding).__name__}.")
+
+        if not isinstance(self.caller_settable, bool):
+            raise ValueError(f"{prefix}: caller_settable must be a bool, got {type(self.caller_settable).__name__}.")
+
+        if not isinstance(self.forward_to_inputs, bool):
+            raise ValueError(
+                f"{prefix}: forward_to_inputs must be a bool, got {type(self.forward_to_inputs).__name__}."
+            )
+
+        if not isinstance(self.runtime, bool):
+            raise ValueError(f"{prefix}: runtime must be a bool, got {type(self.runtime).__name__}.")
+
+        if self.runtime:
+            if not self.context:
+                raise ValueError(f"{prefix}: runtime=True requires context=True.")
+            for name in ("match_guard", "name_converter", "required_when"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"{prefix}: runtime=True cannot be combined with {name}.")
+
+        if self.element_validator is not None and not callable(self.element_validator):
+            raise ValueError(f"{prefix}: element_validator must be callable.")
+
+        if self.required_when is not None and not callable(self.required_when):
+            raise ValueError(f"{prefix}: required_when must be callable.")
+
+        if self.match_guard is not None and not callable(self.match_guard):
+            raise ValueError(f"{prefix}: match_guard must be callable.")
+
+        if self.name_converter is not None and not callable(self.name_converter):
+            raise ValueError(f"{prefix}: name_converter must be callable.")
+
+        if self.expected is not None:
+            if not isinstance(self.expected, str) or not self.expected.strip():
+                raise ValueError(f"{prefix}: expected must be a non-empty str, got {self.expected!r}.")
+            if self.match_guard is None:
+                raise ValueError(
+                    f"{prefix}: expected describes what the match_guard accepts and is never shown without one."
+                )
+
+        if self.element_validator is not None and not self.strict_validation:
+            raise ValueError(f"{prefix}: element_validator is never enforced without strict_validation=True.")
+
+        self._check_value_space(prefix)
+        self._check_declared_default(prefix)
+
+    def _check_value_space(self, prefix: str) -> None:
+        """A strict spec needs something to validate AGAINST.
+
+        An ``element_validator`` IS that value space: the validator, not membership, decides, so
+        ``allowed_values`` is not consulted at all and its emptiness cannot reject anything.
+        """
+        if not self.strict_validation or self.element_validator is not None:
+            return
+
+        if self.allowed_values is not None and not self.allowed_values:
+            raise ValueError(f"{prefix}: an empty allowed_values would reject every value.")
+
+        if self.allowed_values is None:
+            raise ValueError(
+                f"{prefix}: strict_validation=True needs a non-empty allowed_values or an element_validator."
+            )
+
+    def _check_declared_default(self, prefix: str) -> None:
+        """A strict spec's declared default must be within its own value space (issue #530 semantics).
+
+        ``NO_DEFAULT`` declares no default, and a declared ``None`` applies no value: neither has
+        anything to check.
+        """
+        if is_no_default(self.default) or self.default is None or not self.strict_validation:
+            return
+
+        if self.element_validator is not None:
+            try:
+                verdict = self.element_validator(self.default)
+            except Exception as exc:
+                raise ValueError(
+                    f"{prefix}: the element_validator raised an error when called with default {self.default!r}."
+                ) from exc
+            if not verdict:
+                raise ValueError(f"{prefix}: default {self.default!r} is rejected by the element_validator.")
+            return
+
+        if self.allowed_values is None:
+            return
+
+        # Mirrors the match path: an unhashable default can never be a member of a hash-based value
+        # space, so the TypeError is a clean rejection, not an escaping error.
+        try:
+            is_member = self.default in self.allowed_values
+        except TypeError:
+            is_member = False
+        if not is_member:
+            raise ValueError(f"{prefix}: default {self.default!r} is not within the declared allowed_values.")
+
+
+def element_admitted(spec: PropertySpec, element: Any, on_raise: Callable[[Exception], None]) -> bool:
+    """One element's verdict: a declared element_validator REPLACES membership."""
+    validator = spec.element_validator
+    if validator is not None:
+        try:
+            return bool(validator(element))
+        except Exception as exc:
+            if is_match_abort(exc):  # a marked abort must escape, not become a rejection
+                raise
+            on_raise(exc)
+            return False
+    try:
+        return spec.allowed_values is not None and element in spec.allowed_values
+    # An unhashable element is never a member.
+    except TypeError as exc:
+        if is_match_abort(exc):
+            raise
+        return False
+    except Exception as exc:
+        if is_match_abort(exc):
+            raise
+        on_raise(exc)
+        return False
+
+
+def property_spec(
+    explanation: str,
+    *,
+    strict: bool = False,
+    allowed_values: AllowedValues | None = None,
+    default: Any = NO_DEFAULT,
+    context: bool = True,
+    element_validator: Callable[[Any], Any] | None = None,
+    required_when: Callable[[Any], Any] | None = None,
+    match_guard: Callable[[Any], Any] | None = None,
+    expected: str | None = None,
+    allow_explicit_none: bool = False,
+    deferred_binding: bool = False,
+    name_converter: Callable[[str], Any] | None = None,
+    caller_settable: bool = True,
+    forward_to_inputs: bool = True,
+    runtime: bool = False,
+) -> PropertySpec:
+    """Build a ``PropertySpec``; the ``strict=`` keyword sets the ``strict_validation`` field."""
+    return PropertySpec(
+        explanation,
+        allowed_values=allowed_values,
+        default=default,
+        context=context,
+        strict_validation=strict,
+        element_validator=element_validator,
+        match_guard=match_guard,
+        expected=expected,
+        required_when=required_when,
+        allow_explicit_none=allow_explicit_none,
+        deferred_binding=deferred_binding,
+        name_converter=name_converter,
+        caller_settable=caller_settable,
+        forward_to_inputs=forward_to_inputs,
+        runtime=runtime,
+    )
+
+
+def unforwarded_keys(mapping: Any) -> frozenset[str]:
+    """PROPERTY_MAPPING keys whose spec keeps the option off input features."""
+    if not isinstance(mapping, Mapping):
+        return frozenset()
+    return frozenset(
+        key for key, spec in mapping.items() if isinstance(spec, PropertySpec) and not spec.forward_to_inputs
+    )
+
+
+def runtime_parameter_keys(feature_group: Any) -> dict[str, PropertySpec]:
+    """The group's declared runtime parameter keys."""
+    mapping = getattr(feature_group, "PROPERTY_MAPPING", None) or {}
+    return {key: spec for key, spec in mapping.items() if isinstance(spec, PropertySpec) and spec.runtime}

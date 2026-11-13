@@ -1,0 +1,321 @@
+"""A worker spawned via WorkerManager must exit once the real OS process that spawned it is killed."""
+
+from __future__ import annotations
+
+import os
+import signal
+import time
+from pathlib import Path
+from typing import Any
+from unittest import mock
+from uuid import uuid4
+
+import pytest
+
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.run_context import RunContext
+from mloda.core.runtime.mp_context import mp_start_context
+from mloda.core.runtime.worker.multiprocessing_worker import worker
+from mloda.core.runtime.worker_manager import WorkerManager
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+from tests.helpers.probe_runner import run_probes
+
+
+class _FakeCfwManager:
+    """Plain, picklable stand-in for CfwManager; Mock objects do not reliably pickle across spawn."""
+
+    def get_location(self) -> str:
+        return "grpc://localhost:9999"
+
+    def get_run_context(self) -> RunContext:
+        return RunContext()
+
+
+def _worker_is_gone(pid: int) -> bool:
+    """A reparented child can sit as an unreaped zombie, which still answers os.kill(pid, 0);
+    /proc state distinguishes that from actually running. The pid can also be reaped between
+    an exists() check and a subsequent read, so read directly and treat a vanished entry as gone.
+    The reap can land in either gap around the read: before open() (ENOENT, FileNotFoundError)
+    or after open() but before the actual read (ESRCH, ProcessLookupError); both are OSError
+    siblings, not parent/child, so both need to be caught explicitly."""
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        stat_text = stat_path.read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return stat_text.rsplit(")", 1)[1].split()[0] == "Z"
+
+
+def _wait_until_gone(pid: int, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _worker_is_gone(pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _fake_parent_main(pid_file: str, kind: str = "bound_worker") -> None:
+    """Spawns a real worker, standby, or shared Manager server, writes its pid to pid_file, then blocks for SIGKILL."""
+    manager = WorkerManager()
+    process: Any
+    if kind == "shared_manager":
+        import multiprocessing
+
+        import mloda.core.core.cfw_manager as cfw_manager_module
+
+        cfw_module: Any = cfw_manager_module
+        cfw_module.shared_manager()
+        process = multiprocessing.active_children()[0]
+    elif kind == "unbound_standby":
+        from mloda.core.runtime.worker.multiprocessing_worker import standby_worker
+
+        manager.prestart_workers(1, standby_worker)
+        process = manager.standby[0][0]
+    else:
+        cfw_register = _FakeCfwManager()
+        cfw = PythonDictFramework(mode=ParallelizationMode.MULTIPROCESSING, children_if_root=frozenset())
+
+        process, _, _ = manager.create_worker_process(
+            cfw_uuid=uuid4(),
+            target=worker,
+            args=(cfw_register, cfw, uuid4()),
+        )
+
+    with open(pid_file, "w") as pid_handle:
+        pid_handle.write(str(process.pid))
+
+    # Non-daemonic (it has its own child); if the test process dies uncleanly,
+    # multiprocessing's exit handling would join this for the full sleep duration.
+    time.sleep(20)
+
+
+class TestWorkerIsGoneSurvivesAConcurrentReap:
+    """_worker_is_gone must not raise when a pid it just confirmed exists is reaped
+    before the follow-up read, which is exactly what a concurrent reaper (multiprocessing's
+    own bookkeeping, or the subreaper after a SIGKILLed parent) can do to it."""
+
+    def test_pid_reaped_between_check_and_read_reads_as_gone(self) -> None:
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+
+        try:
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not Path(f"/proc/{pid}/stat").exists():
+                time.sleep(0.01)
+            assert Path(f"/proc/{pid}/stat").exists(), "child never became a visible zombie"
+
+            real_read_text = Path.read_text
+
+            def reap_then_read(self: Path, *args: object, **kwargs: object) -> str:
+                # Wins the race a concurrent reaper could win: the pid still existed when
+                # _worker_is_gone checked, but is gone by the time it actually reads.
+                os.waitpid(pid, 0)
+                return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(Path, "read_text", reap_then_read):
+                assert _worker_is_gone(pid) is True
+        finally:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+    def test_pid_reaped_between_open_and_read_reads_as_gone(self) -> None:
+        """Same race, the other ordering: the reap lands after Path.open() succeeds (the pid
+        was still alive) but before the actual read, which raises ProcessLookupError (ESRCH)
+        rather than FileNotFoundError (ENOENT)."""
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+
+        try:
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not Path(f"/proc/{pid}/stat").exists():
+                time.sleep(0.01)
+            assert Path(f"/proc/{pid}/stat").exists(), "child never became a visible zombie"
+
+            real_path_open = Path.open
+
+            def open_then_reap(self: Path, *args: Any, **kwargs: Any) -> Any:
+                # The open() itself succeeds because the pid is still alive here; win the
+                # race a concurrent reaper could win against the read that follows.
+                f = real_path_open(self, *args, **kwargs)
+                os.waitpid(pid, 0)
+                return f
+
+            with mock.patch.object(Path, "open", open_then_reap):
+                assert _worker_is_gone(pid) is True
+        finally:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+
+class TestWorkerProcessDoesNotOutliveASigkilledParent:
+    """A worker spawned via WorkerManager.create_worker_process must exit once its parent dies."""
+
+    @pytest.mark.timeout(90)  # must exceed the sum of the internal waits
+    @pytest.mark.parametrize("kind", ["bound_worker", "unbound_standby", "shared_manager"])
+    def test_real_worker_process_exits_after_its_real_parent_process_is_sigkilled(
+        self, tmp_path: Path, kind: str
+    ) -> None:
+        pid_file = tmp_path / "worker.pid"
+        ctx = mp_start_context()
+        fake_parent = ctx.Process(target=_fake_parent_main, args=(str(pid_file), kind))
+        fake_parent.start()
+
+        worker_pid: int | None = None
+        worker_gone = False
+        try:
+            deadline = time.time() + 30.0
+            while time.time() < deadline and worker_pid is None:
+                if pid_file.exists():
+                    content = pid_file.read_text().strip()
+                    if content:
+                        worker_pid = int(content)
+                        break
+                time.sleep(0.05)
+            assert worker_pid is not None, (
+                f"fake parent process never reported the worker's pid (fake_parent.exitcode={fake_parent.exitcode})"
+            )
+
+            assert fake_parent.pid is not None, "fake parent process has no pid"
+            fake_parent_pid = fake_parent.pid
+            os.kill(fake_parent_pid, signal.SIGKILL)
+            fake_parent.join(timeout=5)
+            assert not fake_parent.is_alive(), "fake parent process survived SIGKILL"
+
+            worker_gone = _wait_until_gone(worker_pid, 20.0)
+
+            assert worker_gone, "worker process outlived its SIGKILLed parent process"
+        finally:
+            # Never leak either process, even if an assertion above failed.
+            if fake_parent.is_alive():
+                fake_parent.kill()
+                fake_parent.join(timeout=5)
+            if worker_pid is not None and not worker_gone:
+                try:
+                    os.kill(worker_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+class TestForkedChildOfAProcessHoldingMlodaProcesses:
+    @pytest.mark.parametrize("variant", ["single_manager", "replaced_manager_still_in_use"])
+    @pytest.mark.timeout(40)
+    def test_forked_child_exits_cleanly_and_the_parents_server_survives(self, variant: str, tmp_path: Path) -> None:
+        replace = (
+            "    sys.path.append(os.path.dirname(stderr_path))\n    m.shared_manager()\n"
+            if variant == "replaced_manager_still_in_use"
+            else ""
+        )
+        probe = tmp_path / "probe.py"
+        stderr_file = tmp_path / "child_stderr.txt"
+        probe.write_text(
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "import mloda.core.core.cfw_manager as m\n"
+            "\n"
+            'if __name__ == "__main__":\n'
+            "    manager = m.shared_manager()\n"
+            f"    stderr_path = {str(stderr_file)!r}\n" + replace + "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)\n"
+            "        os.dup2(fd, 2)\n"
+            "        sys.exit(0)\n"
+            "    _, status = os.waitpid(pid, 0)\n"
+            "    with open(stderr_path) as handle:\n"
+            "        text = handle.read()\n"
+            '    print(json.dumps({"stderr": text, "status": str(os.waitstatus_to_exitcode(status)),'
+            ' "alive": str(manager.is_alive())}))\n'
+        )
+
+        result = run_probes(probe, 1)[0]
+
+        assert result["status"] == "0"
+        assert "AssertionError" not in result["stderr"]
+        # The interpreter's own resource tracker may write to a forked child's stderr.
+        assert "can only join a child process" not in result["stderr"]
+        assert result["alive"] == "True"
+
+    @pytest.mark.parametrize(
+        "child_cleanup",
+        [
+            "",
+            "manager.stop_standbys()",
+            "manager.join_all()",
+            "manager.terminate_alive_processes()",
+            "server.end_flight_server_process()",
+        ],
+        ids=["nothing", "stop_standbys", "join_all", "terminate_alive_processes", "end_flight_server_process"],
+    )
+    @pytest.mark.timeout(40)
+    def test_forked_child_running_cleanup_does_not_terminate_workers_or_the_flight_server(
+        self, child_cleanup: str, tmp_path: Path
+    ) -> None:
+        cleanup_line = f"        {child_cleanup}\n" if child_cleanup else ""
+        probe = tmp_path / "probe.py"
+        probe.write_text(
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "from mloda.core.runtime.flight.runner_flight_server import ParallelRunnerFlightServer\n"
+            "from mloda.core.runtime.worker.multiprocessing_worker import standby_worker\n"
+            "from mloda.core.runtime.worker_manager import WorkerManager\n"
+            "\n"
+            'if __name__ == "__main__":\n'
+            "    manager = WorkerManager()\n"
+            "    manager.prestart_workers(1, standby_worker)\n"
+            "    worker_process = manager.standby[0][0]\n"
+            "    server = ParallelRunnerFlightServer()\n"
+            "    server.start_flight_server_process()\n"
+            "    server_process = server.flight_server_process\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n" + cleanup_line + "        sys.exit(0)\n"
+            "    _, status = os.waitpid(pid, 0)\n"
+            "    worker_process.join(timeout=1.5)\n"
+            "    server_process.join(timeout=0)\n"
+            "    worker_code = str(worker_process.exitcode)\n"
+            "    server_code = str(server_process.exitcode)\n"
+            "    manager.stop_standbys()\n"
+            "    server.end_flight_server_process()\n"
+            '    print(json.dumps({"status": str(os.waitstatus_to_exitcode(status)),'
+            ' "worker": worker_code, "server": server_code}))\n'
+        )
+
+        result = run_probes(probe, 1)[0]
+
+        assert result["status"] == "0"
+        assert result["worker"] == "None"
+        assert result["server"] == "None"
+
+
+class TestSharedManagerServerDoesNotOutliveACleanParentExit:
+    @pytest.mark.timeout(40)
+    def test_server_is_gone_after_the_parent_interpreter_exits_normally(self, tmp_path: Path) -> None:
+        probe = tmp_path / "probe.py"
+        probe.write_text(
+            "import json\n"
+            "import multiprocessing\n"
+            "import mloda.core.core.cfw_manager as m\n"
+            "\n"
+            'if __name__ == "__main__":\n'
+            "    m.shared_manager()\n"
+            '    print(json.dumps({"pid": str(multiprocessing.active_children()[0].pid)}))\n'
+        )
+        server_pid = int(run_probes(probe, 1)[0]["pid"])
+
+        server_gone = False
+        try:
+            server_gone = _wait_until_gone(server_pid, 10.0)
+            assert server_gone, "shared manager server outlived its cleanly exited parent"
+        finally:
+            if not server_gone:
+                try:
+                    os.kill(server_pid, signal.SIGKILL)
+                except OSError:
+                    pass

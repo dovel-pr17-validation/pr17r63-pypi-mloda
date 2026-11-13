@@ -1,0 +1,466 @@
+import weakref
+from typing import Any
+
+import pytest
+
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.data_creator_feature_group import DataCreatorFeatureGroup
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.prepare.identify_feature_group import FeatureResolutionError
+from mloda.core.api.prepare.setup_compute_framework import SetupComputeFramework
+from mloda.core.api.request import SetupConfigurationError
+from mloda.user import Feature
+from mloda.user import Features, ParallelizationMode, PluginCollector, mloda
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import (
+    PythonDictFramework,
+)
+from mloda.provider import ComputeFramework
+from mloda.core.abstract_plugins.components.utils import get_all_subclasses, safe_field_with_error
+from mloda.core.abstract_plugins.compute_framework import compute_framework_subclasses
+
+from tests.helpers.subclass_walks import collect_until_dead
+
+
+PIN_SRC_FEATURE = "setupcfw_pin_hint_source"
+PIN_CONSUMER_FEATURE = "setupcfw_pin_hint_consumer"
+
+
+class SetupCfwPinHintSourceFG(DataCreatorFeatureGroup):
+    """Serves the source feature on PythonDictFramework only."""
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {PIN_SRC_FEATURE}
+
+    @classmethod
+    def compute_framework_rule(cls) -> Any:
+        return {PythonDictFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {PIN_SRC_FEATURE: [1]}
+
+
+class SetupCfwPinHintConsumerFG(FeatureGroup):
+    """Needs its source computed on PandasDataFrame."""
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {PIN_CONSUMER_FEATURE}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(PIN_SRC_FEATURE, compute_framework="PandasDataFrame")}
+
+    @classmethod
+    def compute_framework_rule(cls) -> Any:
+        return {PythonDictFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {PIN_CONSUMER_FEATURE: [1]}
+
+
+class TestSetupComputeFramework:
+    @pytest.fixture
+    def features(self) -> Features:
+        return Features([Feature("some_feature")])
+
+    def get_list_compute_frameworks_as_class_name(self) -> list[str]:
+        return [subclass.get_class_name() for subclass in get_all_subclasses(ComputeFramework)]
+
+    @pytest.mark.parametrize(
+        "user_compute_frameworks, parallelization_modes",
+        [
+            (None, {ParallelizationMode.SYNC}),
+            (["PandasDataFrame"], {ParallelizationMode.SYNC}),
+            (["PandasDataFrame"], None),
+        ],
+        ids=["default_sync", "user_list_sync", "user_list_no_modes"],
+    )
+    def test_no_compute_framework_loaded_raises_clear_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        features: Features,
+        user_compute_frameworks: list[str] | None,
+        parallelization_modes: set[ParallelizationMode] | None,
+    ) -> None:
+        monkeypatch.setattr(
+            "mloda.core.api.prepare.setup_compute_framework.compute_framework_subclasses", lambda: set()
+        )
+        with pytest.raises(ValueError) as exc_info:
+            SetupComputeFramework(user_compute_frameworks, features, parallelization_modes)
+        assert str(exc_info.value) == "No compute framework plugin is loaded; import one or call PluginLoader.all()."
+
+    def test_init_with_user_compute_frameworks(self, features: Features) -> None:
+        user_compute_frameworks = ["PyArrowTable", "PandasDataFrame"]
+        setup_compute_framework = SetupComputeFramework(user_compute_frameworks, features)
+        assert {fw.get_class_name() for fw in setup_compute_framework.compute_frameworks} == set(
+            user_compute_frameworks
+        )
+        assert setup_compute_framework.framework_preference == {PyArrowTable: 0, PandasDataFrame: 1}
+
+    def test_init_without_user_compute_frameworks(self, features: Features) -> None:
+        setup_compute_framework = SetupComputeFramework(None, features)
+        assert len(setup_compute_framework.compute_frameworks) == len(self.get_list_compute_frameworks_as_class_name())
+
+    def test_validate_if_at_least_one_feature_compute_framework_is_in_available_compute_framework(
+        self, features: Features
+    ) -> None:
+        feature = Feature("some_feature2", compute_framework="PythonDictFramework")
+        features.collection.append(feature)
+
+        available_compute_frameworks = {ComputeFramework}
+        setup_compute_framework = SetupComputeFramework(None, features)
+
+        # negative test
+        with pytest.raises(ValueError):
+            setup_compute_framework.validate_if_at_least_one_feature_compute_framework_is_in_available_compute_framework(
+                features, available_compute_frameworks
+            )
+
+        # positive test
+        available_compute_frameworks = get_all_subclasses(ComputeFramework)
+        setup_compute_framework = SetupComputeFramework(None, features)
+        assert setup_compute_framework.compute_frameworks == available_compute_frameworks
+
+    def test_filter_user_set_in_available_sub_classes(self, features: Features) -> None:
+        api_request_compute_frameworks = self.get_list_compute_frameworks_as_class_name()[1:]
+        sub_classes = get_all_subclasses(ComputeFramework)
+
+        setup_compute_framework = SetupComputeFramework(None, features)
+
+        filtered_compute_frameworks = setup_compute_framework.filter_user_set_in_available_sub_classes(
+            api_request_compute_frameworks,
+            sub_classes,
+        )
+        assert len({fw.get_class_name() for fw in filtered_compute_frameworks}) == len(
+            set(api_request_compute_frameworks)
+        )
+
+    def test_filter_user_set_in_available_sub_classes_non_empty_available_classes_keeps_existing_message(
+        self, features: Features
+    ) -> None:
+        setup_compute_framework = SetupComputeFramework(None, features)
+
+        with pytest.raises(ValueError) as exc_info:
+            setup_compute_framework.filter_user_set_in_available_sub_classes(
+                ["missing_compute_framework"], {ComputeFramework}
+            )
+
+        assert str(exc_info.value) == (
+            "No given compute frameworks ['missing_compute_framework'] found in "
+            "available compute frameworks: ['ComputeFramework']."
+        )
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"PandasDataFrame"},
+            frozenset({"PandasDataFrame"}),
+            "PandasDataFrame",
+            b"PandasDataFrame",
+            {"PandasDataFrame": 0},
+            set(),
+        ],
+        ids=["set", "frozenset", "str", "bytes", "dict", "empty_set"],
+    )
+    def test_non_sequence_raises_with_ordered_list_hint(self, features: Features, bad: Any) -> None:
+        with pytest.raises(ValueError, match="ordered list") as exc_info:
+            SetupComputeFramework(bad, features)
+
+        assert '["PolarsDataFrame", "PandasDataFrame"]' in str(exc_info.value)
+
+    @pytest.mark.parametrize("empty", [None, [], ()], ids=["none", "empty_list", "empty_tuple"])
+    def test_none_and_empty_sequence_keep_all_frameworks_without_preference(
+        self, features: Features, empty: Any
+    ) -> None:
+        setup_compute_framework = SetupComputeFramework(empty, features)
+
+        assert setup_compute_framework.compute_frameworks == get_all_subclasses(ComputeFramework)
+        assert setup_compute_framework.framework_preference == {}
+
+    def test_unknown_name_raises_even_when_another_entry_matches(self, features: Features) -> None:
+        with pytest.raises(ValueError, match="NoSuchFramework"):
+            SetupComputeFramework(["PandasDataFrame", "NoSuchFramework"], features)
+
+    def test_framework_preference_keeps_list_order(self, features: Features) -> None:
+        forward = SetupComputeFramework(["PyArrowTable", "PandasDataFrame"], features)
+        backward = SetupComputeFramework(["PandasDataFrame", "PyArrowTable"], features)
+
+        assert forward.framework_preference == {PyArrowTable: 0, PandasDataFrame: 1}
+        assert backward.framework_preference == {PandasDataFrame: 0, PyArrowTable: 1}
+
+    def test_tuple_is_accepted_and_keeps_order(self, features: Features) -> None:
+        setup_compute_framework = SetupComputeFramework(("PandasDataFrame", PyArrowTable), features)
+
+        assert setup_compute_framework.framework_preference == {PandasDataFrame: 0, PyArrowTable: 1}
+        assert setup_compute_framework.compute_frameworks == {PandasDataFrame, PyArrowTable}
+
+    def test_framework_preference_dedups_by_class_keeping_first_index(self, features: Features) -> None:
+        setup_compute_framework = SetupComputeFramework(["PandasDataFrame", PandasDataFrame], features)
+
+        assert setup_compute_framework.framework_preference == {PandasDataFrame: 0}
+
+    def test_classes_sharing_one_name_share_one_position(self, features: Features) -> None:
+        def make() -> type[ComputeFramework]:
+            class ZzSetupSharedNameFramework(ComputeFramework):
+                @staticmethod
+                def is_available() -> bool:
+                    return False
+
+            return ZzSetupSharedNameFramework
+
+        first, second = make(), make()
+
+        setup_compute_framework = SetupComputeFramework(["PyArrowTable", "ZzSetupSharedNameFramework"], features)
+
+        assert setup_compute_framework.framework_preference == {PyArrowTable: 0, first: 1, second: 1}
+
+    def test_framework_missing_from_registry_is_reported_by_setup(self, features: Features) -> None:
+        class _SkipsRegistration:
+            def __init_subclass__(cls, **kwargs: Any) -> None:
+                pass
+
+        def make() -> type[ComputeFramework]:
+            class ZzSetupUnregisteredFramework(_SkipsRegistration, ComputeFramework):
+                pass
+
+            return ZzSetupUnregisteredFramework
+
+        held = [make()]
+        name = held[0].__name__
+        ref = weakref.ref(held[0])
+        walk_sees = held[0] in get_all_subclasses(ComputeFramework)
+        registry_sees = held[0] in compute_framework_subclasses()
+        _, class_message = safe_field_with_error(lambda: SetupComputeFramework([held[0]], features), None)
+        _, name_message = safe_field_with_error(lambda: SetupComputeFramework([name], features), None)
+        _, base_message = safe_field_with_error(lambda: SetupComputeFramework([ComputeFramework], features), None)
+        _, feature_message = safe_field_with_error(lambda: Feature("f", compute_framework=name), None)
+        # The default set cannot report a framework it cannot see, so the drop there is by design.
+        in_default = held[0] in SetupComputeFramework(None, features).compute_frameworks
+
+        del held[:]
+        collected = collect_until_dead(ref)
+
+        assert walk_sees
+        assert not registry_sees
+        assert class_message is not None
+        assert class_message.startswith("No given compute frameworks")
+        assert name in class_message
+        assert "super().__init_subclass__()" in class_message
+        assert name_message is not None
+        assert name_message.startswith("No given compute frameworks")
+        assert name in name_message
+        assert base_message is not None
+        assert base_message.startswith("No given compute frameworks")
+        assert "__init_subclass__" not in base_message
+        assert feature_message is not None
+        assert feature_message.startswith("Compute framework via parameter")
+        assert name in feature_message
+        assert not in_default
+        assert collected
+
+    def test_set_through_mloda_api_raises_setup_configuration_error(self) -> None:
+        with pytest.raises(SetupConfigurationError, match="ordered list"):
+            mloda.prepare(["some_feature"], compute_frameworks={"PandasDataFrame"})  # type: ignore[arg-type]
+
+    def test_no_compute_framework_loaded_through_run_all_raises_setup_configuration_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "mloda.core.api.prepare.setup_compute_framework.compute_framework_subclasses", lambda: set()
+        )
+
+        with pytest.raises(SetupConfigurationError, match="No compute framework plugin is loaded"):
+            mloda.run_all(["some_feature"], output_framework="PandasDataFrame")
+
+    @pytest.mark.parametrize(
+        ("output", "expected"),
+        [("PyArrowTable", PyArrowTable), (PyArrowTable, PyArrowTable), (None, None)],
+        ids=["name", "class", "none"],
+    )
+    def test_output_framework_resolves_by_name_or_class(
+        self, features: Features, output: Any, expected: type[ComputeFramework] | None
+    ) -> None:
+        setup_compute_framework = SetupComputeFramework(["PandasDataFrame"], features, output_framework=output)
+
+        assert setup_compute_framework.output_framework is expected
+
+    def test_unknown_output_framework_raises(self, features: Features) -> None:
+        with pytest.raises(ValueError, match="NoSuchFramework"):
+            SetupComputeFramework(None, features, output_framework="NoSuchFramework")
+
+    def test_unavailable_output_framework_raises(self, features: Features) -> None:
+        class ZzSetupUnavailableOutputFramework(ComputeFramework):
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        with pytest.raises(ValueError, match="ZzSetupUnavailableOutputFramework"):
+            SetupComputeFramework(None, features, output_framework="ZzSetupUnavailableOutputFramework")
+
+    @staticmethod
+    def _unavailable(monkeypatch: pytest.MonkeyPatch, *frameworks: type[ComputeFramework]) -> None:
+        for framework in frameworks:
+            monkeypatch.setattr(framework, "is_available", staticmethod(lambda: False))
+
+    def test_all_requested_unavailable_raises_naming_framework_and_install_hint(
+        self, monkeypatch: pytest.MonkeyPatch, features: Features
+    ) -> None:
+        self._unavailable(monkeypatch, PandasDataFrame)
+
+        with pytest.raises(ValueError) as exc_info:
+            SetupComputeFramework(["PandasDataFrame"], features)
+
+        assert (
+            'PandasDataFrame is not available: its library is not installed. Install it with: pip install "mloda[pandas]"'
+            in str(exc_info.value)
+        )
+
+    def test_all_requested_unavailable_lists_each_framework(
+        self, monkeypatch: pytest.MonkeyPatch, features: Features
+    ) -> None:
+        self._unavailable(monkeypatch, PandasDataFrame, PyArrowTable)
+
+        with pytest.raises(ValueError) as exc_info:
+            SetupComputeFramework(["PandasDataFrame", "PyArrowTable"], features)
+
+        message = str(exc_info.value)
+        assert 'pip install "mloda[pandas]"' in message
+        assert 'pip install "mloda[pyarrow]"' in message
+
+    def test_unavailable_framework_without_install_hint_gets_generic_message(self, features: Features) -> None:
+        class ZzSetupNoHintFramework(ComputeFramework):
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        with pytest.raises(ValueError) as exc_info:
+            SetupComputeFramework(["ZzSetupNoHintFramework"], features)
+
+        message = str(exc_info.value)
+        assert "ZzSetupNoHintFramework is not available in this environment." in message
+        assert "library is not installed" not in message
+        assert "Install it" not in message
+
+    def test_identical_unavailable_messages_are_listed_once(self, features: Features) -> None:
+        def make() -> type[ComputeFramework]:
+            class ZzSetupDuplicateMessageFramework(ComputeFramework):
+                @staticmethod
+                def is_available() -> bool:
+                    return False
+
+            return ZzSetupDuplicateMessageFramework
+
+        first, second = make(), make()
+
+        with pytest.raises(ValueError) as exc_info:
+            SetupComputeFramework([first, second], features)
+
+        assert str(exc_info.value).count("ZzSetupDuplicateMessageFramework is not available") == 1
+
+    def test_unavailable_framework_with_custom_install_hint_names_it(self, features: Features) -> None:
+        class ZzSetupCustomHintFramework(ComputeFramework):
+            INSTALL_HINT = "pip install my-backend"
+
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        with pytest.raises(ValueError, match="Install it with: pip install my-backend"):
+            SetupComputeFramework(["ZzSetupCustomHintFramework"], features)
+
+    def test_mixed_available_and_unavailable_keeps_today_behaviour(
+        self, monkeypatch: pytest.MonkeyPatch, features: Features
+    ) -> None:
+        self._unavailable(monkeypatch, PandasDataFrame)
+        monkeypatch.setattr(PyArrowTable, "is_available", staticmethod(lambda: True))
+
+        setup_compute_framework = SetupComputeFramework(["PandasDataFrame", "PyArrowTable"], features)
+
+        assert setup_compute_framework.framework_preference == {PandasDataFrame: 0, PyArrowTable: 1}
+
+    @pytest.mark.parametrize(
+        ("requested", "compute_frameworks"),
+        [
+            (["some_feature"], ["PandasDataFrame"]),
+            ([Feature("some_feature", compute_framework="PandasDataFrame")], None),
+            ([Feature("some_feature", options={"compute_framework": "PandasDataFrame"})], None),
+        ],
+        ids=["requested_list", "feature_pin", "feature_option_pin"],
+    )
+    def test_unavailable_request_through_run_all_raises_setup_configuration_error_with_hint(
+        self, monkeypatch: pytest.MonkeyPatch, requested: list[Any], compute_frameworks: list[str] | None
+    ) -> None:
+        self._unavailable(monkeypatch, PandasDataFrame)
+
+        with pytest.raises(SetupConfigurationError, match=r'pip install "mloda\[pandas\]"'):
+            mloda.run_all(requested, compute_frameworks=compute_frameworks)
+
+    @pytest.mark.parametrize(
+        "requested",
+        [None, [PythonDictFramework, PandasDataFrame]],
+        ids=["no_list", "mixed"],
+    )
+    def test_feature_pinning_unavailable_framework_raises_with_hint(
+        self, monkeypatch: pytest.MonkeyPatch, features: Features, requested: list[Any] | None
+    ) -> None:
+        self._unavailable(monkeypatch, PandasDataFrame)
+        features.collection.append(Feature("pinned_feature", compute_framework="PandasDataFrame"))
+
+        with pytest.raises(ValueError) as exc_info:
+            SetupComputeFramework(requested, features)
+
+        message = str(exc_info.value)
+        assert "Feature pinned_feature" in message
+        assert "PandasDataFrame is not available" in message
+        assert 'pip install "mloda[pandas]"' in message
+
+    def test_unavailable_input_feature_pin_names_install_hint_in_resolution_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._unavailable(monkeypatch, PandasDataFrame)
+        collector = PluginCollector.enabled_feature_groups({SetupCfwPinHintSourceFG, SetupCfwPinHintConsumerFG})
+
+        with pytest.raises(FeatureResolutionError) as exc_info:
+            mloda.run_all(
+                [PIN_CONSUMER_FEATURE], compute_frameworks=["PythonDictFramework"], plugin_collector=collector
+            )
+
+        message = str(exc_info.value)
+        assert 'pip install "mloda[pandas]"' in message
+        assert "needed by" in message
+        assert any(
+            "SetupCfwPinHintSourceFG (compute framework pin)" in line and 'pip install "mloda[pandas]"' in line
+            for line in message.splitlines()
+        )
+
+    def test_unavailable_pin_outside_requested_list_names_both_problems(
+        self, monkeypatch: pytest.MonkeyPatch, features: Features
+    ) -> None:
+        self._unavailable(monkeypatch, PandasDataFrame)
+        features.collection.append(Feature("pinned_feature", compute_framework="PandasDataFrame"))
+
+        with pytest.raises(ValueError, match="has compute frameworks") as exc_info:
+            SetupComputeFramework(["PyArrowTable"], features)
+
+        assert 'pip install "mloda[pandas]"' in str(exc_info.value)
+
+    def test_unavailable_output_framework_appends_install_hint(self, features: Features) -> None:
+        class ZzSetupHintedOutputFramework(ComputeFramework):
+            INSTALL_HINT = "pip install my-backend"
+
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        with pytest.raises(ValueError, match="pip install my-backend"):
+            SetupComputeFramework(None, features, output_framework="ZzSetupHintedOutputFramework")
+
+    def test_unknown_output_framework_through_mloda_api_raises_setup_configuration_error(self) -> None:
+        with pytest.raises(SetupConfigurationError, match="NoSuchFramework"):
+            mloda.prepare(["some_feature"], output_framework="NoSuchFramework")

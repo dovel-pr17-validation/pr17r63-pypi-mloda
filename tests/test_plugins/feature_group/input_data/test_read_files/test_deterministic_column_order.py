@@ -1,0 +1,191 @@
+import json
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import pyarrow as pa
+import pyarrow.orc as pyarrow_orc
+import pyarrow.parquet as pyarrow_parquet
+import pytest
+
+from mloda.core.abstract_plugins.components.input_data.claim_route import SourceMatch
+from mloda.core.abstract_plugins.components.input_data.file_source import FileSource
+from mloda.user import DataType
+from tests.helpers.probe_runner import run_probes
+from tests.mixins.reader_feature_groups.lazy_source_group import load_group
+
+
+_PROBE = Path(__file__).with_name("column_order_probe.py")
+_PROBE_SEEDS = [0, 1, 2]
+
+
+@pytest.mark.timeout(60)
+def test_run_all_csv_column_order_is_sorted_and_seed_independent() -> None:
+    outputs = run_probes(_PROBE, count=len(_PROBE_SEEDS), seeds=_PROBE_SEEDS)
+
+    columns = [output["columns"].split(",") for output in outputs]
+    assert len(columns) == len(_PROBE_SEEDS)
+    for seed, names in zip(_PROBE_SEEDS, columns):
+        assert names == sorted(names), f"seed {seed} returned unsorted columns {names}"
+    assert columns[0] == columns[1] == columns[2], f"column order differs across seeds: {columns}"
+
+
+def _loaded_column_names(result: Any) -> list[str]:
+    """CsvFG resolves a FileSource descriptor whose ``columns`` pins the order;
+    the other groups return a materialized table with ``column_names``."""
+    if isinstance(result, FileSource):
+        return list(result.columns)
+    return list(result.column_names)
+
+
+def _match(path: str) -> SourceMatch:
+    return SourceMatch(source=path, access=path)
+
+
+def _group(module_name: str, class_name: str) -> Any:
+    return load_group(module_name, class_name)
+
+
+class FeatureSetStub:
+    """Mirrors FeatureSet.get_all_names() which returns an alphabetically sorted tuple."""
+
+    def __init__(self, columns: list[str]) -> None:
+        self.columns = columns
+
+    def get_all_names(self) -> tuple[str, ...]:
+        return tuple(sorted(self.columns))
+
+
+class TestDeterministicColumnOrder:
+    """The five stock file source groups must materialize get_all_names() (a sorted tuple) in a
+    deterministic, alphabetically sorted order so the output column order does not
+    depend on PYTHONHASHSEED."""
+
+    base_path: Any = None
+    physical_columns: Any = None
+    sorted_columns: Any = None
+    feather_file: Any = None
+    json_file: Any = None
+    csv_file: Any = None
+    orc_file: Any = None
+    parquet_file: Any = None
+
+    @classmethod
+    def setup_class(cls) -> None:
+        cls.base_path = tempfile.mkdtemp(prefix="arrow_order_test_")
+
+        # Non-alphabetical physical column order to expose ordering bugs.
+        cls.physical_columns = ["c1", "a1", "b1"]
+        cls.sorted_columns = sorted(cls.physical_columns)  # ["a1", "b1", "c1"]
+
+        table = pa.Table.from_pydict({"c1": [1, 2, 3], "a1": [4, 5, 6], "b1": [7, 8, 9]})
+
+        cls.feather_file = f"{cls.base_path}/test.feather"
+        with pa.OSFile(cls.feather_file, "wb") as sink:
+            with pa.ipc.new_file(sink, table.schema) as writer:
+                writer.write_table(table)
+
+        cls.json_file = f"{cls.base_path}/test.json"
+        with open(cls.json_file, "w") as f:
+            rows = [{col: table.column(col)[i].as_py() for col in cls.physical_columns} for i in range(table.num_rows)]
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+        cls.csv_file = f"{cls.base_path}/test.csv"
+        import pyarrow.csv as pyarrow_csv
+
+        pyarrow_csv.write_csv(table, cls.csv_file)
+
+        cls.orc_file = f"{cls.base_path}/test.orc"
+        with pa.OSFile(cls.orc_file, "wb") as f:
+            pyarrow_orc.write_table(table, f)
+
+        cls.parquet_file = f"{cls.base_path}/test.parquet"
+        pyarrow_parquet.write_table(table, cls.parquet_file)
+
+    @classmethod
+    def teardown_class(cls) -> None:
+        shutil.rmtree(cls.base_path, ignore_errors=True)
+
+    def test_column_order_is_sorted(self) -> None:
+        features = FeatureSetStub(self.physical_columns)
+
+        for cls, path in self._all_groups():
+            columns = _loaded_column_names(cls.load_neutral(_match(path), features))
+            assert columns == self.sorted_columns, (
+                f"{cls.__name__} returned columns {columns}, expected {self.sorted_columns}"
+            )
+
+    def _all_groups(self) -> list[tuple[Any, Any]]:
+        return [
+            (_group("feather_fg", "FeatherFG"), self.feather_file),
+            (_group("json_fg", "JsonFG"), self.json_file),
+            (_group("csv_fg", "CsvFG"), self.csv_file),
+            (_group("orc_fg", "OrcFG"), self.orc_file),
+            (_group("parquet_fg", "ParquetFG"), self.parquet_file),
+        ]
+
+    def test_empty_feature_set_returns_zero_columns(self) -> None:
+        """An empty get_all_names() (empty tuple) must yield a zero-column table
+        without raising. Regression lock for the already-sorted readers."""
+        features = FeatureSetStub([])
+
+        for cls, path in self._all_groups():
+            columns = _loaded_column_names(cls.load_neutral(_match(path), features))
+            assert columns == [], f"{cls.__name__} returned columns {columns}, expected [] for empty feature set"
+
+    def test_single_column_feature_set_returns_that_column(self) -> None:
+        """A single-column feature set must return exactly that one column.
+        Regression lock for the already-sorted readers."""
+        features = FeatureSetStub(["a1"])
+
+        for cls, path in self._all_groups():
+            columns = _loaded_column_names(cls.load_neutral(_match(path), features))
+            assert columns == ["a1"], f"{cls.__name__} returned columns {columns}, expected ['a1']"
+
+    def test_feather_column_names_returns_physical_column_names(self) -> None:
+        assert list(_group("feather_fg", "FeatherFG").column_names(self.feather_file)) == self.physical_columns
+
+    def test_orc_column_names_returns_physical_column_names(self) -> None:
+        assert list(_group("orc_fg", "OrcFG").column_names(self.orc_file)) == self.physical_columns
+
+    def test_parquet_describe_columns_maps_string_column_to_string_type(self, tmp_path: Path) -> None:
+        table = pa.Table.from_pydict({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        file_path = str(tmp_path / "typed.parquet")
+        pyarrow_parquet.write_table(table, file_path)
+
+        described = _group("parquet_fg", "ParquetFG").describe_columns(_match(file_path))
+
+        assert described == {"a": DataType.INT64, "b": DataType.STRING}
+
+    def test_parquet_describe_columns_maps_unmapped_nested_type_to_none(self, tmp_path: Path) -> None:
+        nested = pa.array([{"x": 1}, {"x": 2}, {"x": 3}], type=pa.struct([("x", pa.int64())]))
+        table = pa.table({"a": pa.array([1, 2, 3]), "nested": nested})
+        file_path = str(tmp_path / "nested.parquet")
+        pyarrow_parquet.write_table(table, file_path)
+
+        described = _group("parquet_fg", "ParquetFG").describe_columns(_match(file_path))
+
+        assert described == {"a": DataType.INT64, "nested": None}
+
+    def test_parquet_describe_columns_maps_list_type_to_list(self, tmp_path: Path) -> None:
+        table = pa.Table.from_pydict({"a": [1, 2, 3], "nested": [[1, 2], [3], []]})
+        file_path = str(tmp_path / "list.parquet")
+        pyarrow_parquet.write_table(table, file_path)
+
+        described = _group("parquet_fg", "ParquetFG").describe_columns(_match(file_path))
+
+        assert described == {"a": DataType.INT64, "nested": DataType.LIST}
+
+    def test_parquet_column_names_returns_top_level_names_for_nested_column(self, tmp_path: Path) -> None:
+        """Must report top-level names, not pyarrow's leaf-flattened nested fields, and agree with describe_columns."""
+        table = pa.Table.from_pydict({"a": [1, 2, 3], "nested": [[1, 2], [3], []]})
+        file_path = str(tmp_path / "nested_names.parquet")
+        pyarrow_parquet.write_table(table, file_path)
+
+        parquet = _group("parquet_fg", "ParquetFG")
+        column_names = parquet.column_names(file_path)
+
+        assert sorted(column_names) == ["a", "nested"]
+        assert set(column_names) == set(parquet.describe_columns(_match(file_path)).keys())

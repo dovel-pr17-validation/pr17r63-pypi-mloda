@@ -1,0 +1,368 @@
+import sqlite3
+from typing import Any
+
+import pyarrow as pa
+import pytest
+
+from mloda.provider import ComputeFramework
+from mloda.provider import FeatureGroup
+from mloda.provider import FeatureSet
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.user import GlobalFilter
+from mloda.user import Options
+from mloda.user import PluginCollector
+from mloda.user import mloda
+from mloda.user import ParallelizationMode
+from mloda.user import DataAccessCollection
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_framework import SqliteFramework, _regexp
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from tests.helpers.frame_records import records_from_frame
+from tests.test_plugins.integration_plugins.test_data_creator import ATestDataCreator
+
+
+@pytest.fixture
+def sqlite_conn() -> Any:
+    conn = sqlite3.connect(":memory:")
+    conn.create_function("REGEXP", 2, _regexp)
+    yield conn
+    conn.close()
+
+
+sqlite_test_dict: dict[str, Any] = {
+    "id": [1, 2, 3, 4, 5],
+    "value": [10, 20, 30, 40, 50],
+    "category": ["A", "B", "A", "C", "B"],
+    "score": [1.5, 2.5, 3.5, 4.5, 5.5],
+}
+
+
+class SqliteTestDataCreator(ATestDataCreator):
+    compute_framework = SqliteFramework
+
+    conversion = {
+        **ATestDataCreator.conversion,
+        SqliteFramework: lambda data: data,
+    }
+
+    @classmethod
+    def get_raw_data(cls) -> dict[str, Any]:
+        return sqlite_test_dict
+
+
+class ATestSqliteFeatureGroup(FeatureGroup):
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {SqliteFramework}
+
+
+class SqliteSimpleTransformFeatureGroup(ATestSqliteFeatureGroup):
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        feature_name_str = str(feature_name) if isinstance(feature_name, FeatureName) else str(feature_name)
+
+        if feature_name_str == "doubled_value":
+            return {Feature("value")}
+        elif feature_name_str == "score_plus_ten":
+            return {Feature("score")}
+        elif feature_name_str == "unbuildable_text":
+            return {Feature("value")}
+
+        return set()
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        result_data = data
+
+        for feat in features.features:
+            feature_name = str(feat.name)
+
+            if feature_name == "doubled_value":
+                result_data = result_data.select(_raw_sql="*, value * 2 AS doubled_value")
+            elif feature_name == "score_plus_ten":
+                result_data = result_data.select(_raw_sql="*, score + 10 AS score_plus_ten")
+            elif feature_name == "unbuildable_text":
+                result_data = result_data.select(
+                    _raw_sql="*, CASE WHEN value = 10 THEN 'a' ELSE X'FF' END AS unbuildable_text"
+                )
+
+        return result_data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"doubled_value", "score_plus_ten", "unbuildable_text"}
+
+
+class SqliteSecondTransformFeatureGroup(ATestSqliteFeatureGroup):
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("doubled_value")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        result_data = data
+
+        for feat in features.features:
+            feature_name = str(feat.name)
+
+            if feature_name == "quadrupled_value":
+                result_data = result_data.select(_raw_sql="*, doubled_value * 2 AS quadrupled_value")
+
+        return result_data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"quadrupled_value"}
+
+
+class SqliteAggregationFeatureGroup(ATestSqliteFeatureGroup):
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        feature_name_str = str(feature_name) if isinstance(feature_name, FeatureName) else str(feature_name)
+
+        if feature_name_str in ["avg_value_by_category", "count_by_category"]:
+            return {Feature("value"), Feature("category")}
+
+        return set()
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        result_data = data
+
+        for feat in features.features:
+            feature_name = str(feat.name)
+
+            if feature_name == "avg_value_by_category":
+                result_data = result_data.select(
+                    _raw_sql="*, AVG(value) OVER (PARTITION BY category) AS avg_value_by_category"
+                )
+            elif feature_name == "count_by_category":
+                result_data = result_data.select(
+                    _raw_sql="*, COUNT(*) OVER (PARTITION BY category) AS count_by_category"
+                )
+
+        return result_data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"avg_value_by_category", "count_by_category"}
+
+
+class SqliteCheckData(FeatureGroup):
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        feature_name_str = str(feature_name) if isinstance(feature_name, FeatureName) else str(feature_name)
+
+        if feature_name_str in ["pyarrow_avg_value_by_category_sqlite"]:
+            return {Feature("avg_value_by_category")}
+
+        return set()
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        data = data.rename_columns(["id", "value", "category", "score", "pyarrow_avg_value_by_category_sqlite"])
+        return data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"pyarrow_avg_value_by_category_sqlite"}
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PyArrowTable}
+
+
+class TestSqliteIntegrationWithMlodaAPI:
+    def test_basic_sqlite_feature_calculation(self, flight_server: Any, sqlite_conn: Any) -> None:
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {SqliteTestDataCreator, SqliteSimpleTransformFeatureGroup}
+        )
+
+        feature_list: list[Feature | str] = [Feature(name="doubled_value"), Feature(name="score_plus_ten")]
+
+        data_access_collection = DataAccessCollection(connections={sqlite_conn})
+
+        result = mloda.run_all(
+            feature_list,
+            flight_server=flight_server,
+            plugin_collector=plugin_collector,
+            data_access_collection=data_access_collection,
+            compute_frameworks=[SqliteFramework],
+        )
+
+        final_data = result[0]
+        assert isinstance(final_data, pa.Table)
+
+        assert "doubled_value" in final_data.column_names
+        assert "score_plus_ten" in final_data.column_names
+
+        final_df = final_data.to_pandas()
+        doubled_values = final_df["doubled_value"].tolist()
+        assert doubled_values == [20, 40, 60, 80, 100]
+
+        score_plus_ten = final_df["score_plus_ten"].tolist()
+        assert score_plus_ten == [11.5, 12.5, 13.5, 14.5, 15.5]
+
+    def test_run_fails_naming_a_feature_whose_column_arrow_cannot_build(
+        self, flight_server: Any, sqlite_conn: Any
+    ) -> None:
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {SqliteTestDataCreator, SqliteSimpleTransformFeatureGroup}
+        )
+
+        with pytest.raises(Exception, match="unbuildable_text"):
+            mloda.run_all(
+                [Feature(name="unbuildable_text")],
+                flight_server=flight_server,
+                plugin_collector=plugin_collector,
+                data_access_collection=DataAccessCollection(connections={sqlite_conn}),
+                compute_frameworks=[SqliteFramework],
+            )
+
+    def test_sqlite_aggregation_features(self, flight_server: Any, sqlite_conn: Any) -> None:
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {SqliteTestDataCreator, SqliteAggregationFeatureGroup}
+        )
+
+        feature_list: list[Feature | str] = [Feature(name="avg_value_by_category"), Feature(name="count_by_category")]
+
+        result = mloda.run_all(
+            feature_list,
+            data_access_collection=DataAccessCollection(connections={sqlite_conn}),
+            flight_server=flight_server,
+            parallelization_modes={ParallelizationMode.SYNC},
+            compute_frameworks=[SqliteFramework],
+            plugin_collector=plugin_collector,
+        )
+
+        final_data = result[0]
+        assert isinstance(final_data, pa.Table)
+        assert "avg_value_by_category" in final_data.column_names
+        assert "count_by_category" in final_data.column_names
+
+        final_df = final_data.to_pandas()
+        avg_values = final_df["avg_value_by_category"].tolist()
+        count_values = final_df["count_by_category"].tolist()
+
+        assert len(set(avg_values)) <= 3
+        assert len(set(count_values)) <= 3
+
+    def test_multiple_feature_groups_sqlite_pipeline(self, flight_server: Any, sqlite_conn: Any) -> None:
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {SqliteTestDataCreator, SqliteSimpleTransformFeatureGroup, SqliteSecondTransformFeatureGroup}
+        )
+
+        feature_list: list[Feature | str] = [Feature(name="quadrupled_value")]
+
+        result = mloda.run_all(
+            feature_list,
+            data_access_collection=DataAccessCollection(connections={sqlite_conn}),
+            flight_server=flight_server,
+            compute_frameworks=[SqliteFramework],
+            plugin_collector=plugin_collector,
+            parallelization_modes={ParallelizationMode.SYNC},
+        )
+
+        assert len(result) == 1
+        final_data = result[0]
+
+        assert isinstance(final_data, pa.Table)
+        assert "quadrupled_value" in final_data.column_names
+        quadrupled_values = final_data.to_pandas()["quadrupled_value"].tolist()
+        assert quadrupled_values == [40, 80, 120, 160, 200]
+
+    @pytest.mark.parametrize("output", [PyArrowTable, PandasDataFrame, SqliteFramework])
+    def test_output_framework_with_a_sqlite_run(self, flight_server: Any, sqlite_conn: Any, output: Any) -> None:
+        result = mloda.run_all(
+            [Feature(name="doubled_value")],
+            flight_server=flight_server,
+            parallelization_modes={ParallelizationMode.SYNC},
+            plugin_collector=PluginCollector.enabled_feature_groups(
+                {SqliteTestDataCreator, SqliteSimpleTransformFeatureGroup}
+            ),
+            data_access_collection=DataAccessCollection(connections={sqlite_conn}),
+            compute_frameworks=[SqliteFramework],
+            output_framework=output,
+        )
+
+        assert isinstance(result[0], output.expected_data_framework())
+        records = records_from_frame(result[0])
+        assert [record["doubled_value"] for record in records] == [20, 40, 60, 80, 100]
+        if output is SqliteFramework:
+            assert result[0].connection is sqlite_conn
+
+    @pytest.mark.parametrize("with_collection", [True, False], ids=["collection_conn", "no_dac"])
+    def test_output_framework_with_a_sqlite_run_on_a_step_connection(
+        self, flight_server: Any, sqlite_conn: Any, with_collection: bool
+    ) -> None:
+        collection_conn = sqlite3.connect(":memory:")
+        try:
+            result = mloda.run_all(
+                [Feature(name="doubled_value", options={"connection_handle": "step"})],
+                flight_server=flight_server,
+                parallelization_modes={ParallelizationMode.SYNC},
+                plugin_collector=PluginCollector.enabled_feature_groups(
+                    {SqliteTestDataCreator, SqliteSimpleTransformFeatureGroup}
+                ),
+                data_access_collection=DataAccessCollection(connections={"step": sqlite_conn, "other": collection_conn})
+                if with_collection
+                else DataAccessCollection(connections={"step": sqlite_conn}),
+                compute_frameworks=[SqliteFramework],
+                output_framework=SqliteFramework,
+            )
+
+            assert result[0].connection is sqlite_conn
+            assert result[0].connection is not collection_conn
+            records = records_from_frame(result[0])
+            assert [record["doubled_value"] for record in records] == [20, 40, 60, 80, 100]
+        finally:
+            collection_conn.close()
+
+    def test_zero_row_sqlite_run_has_the_schema_of_the_non_empty_run(
+        self, flight_server: Any, sqlite_conn: Any
+    ) -> None:
+        def run(minimum: int) -> pa.Table:
+            global_filter = GlobalFilter()
+            global_filter.add_filter("value", "min", {"value": minimum})
+            result = mloda.run_all(
+                [Feature(name="doubled_value"), Feature(name="score_plus_ten")],
+                flight_server=flight_server,
+                parallelization_modes={ParallelizationMode.SYNC},
+                plugin_collector=PluginCollector.enabled_feature_groups(
+                    {SqliteTestDataCreator, SqliteSimpleTransformFeatureGroup}
+                ),
+                data_access_collection=DataAccessCollection(connections={sqlite_conn}),
+                compute_frameworks=[SqliteFramework],
+                global_filter=global_filter,
+            )
+            assert isinstance(result[0], pa.Table)
+            return result[0]
+
+        full = run(0)
+        empty = run(1000)
+
+        assert (full.num_rows, empty.num_rows) == (5, 0)
+        assert empty.schema.field("doubled_value").type == full.schema.field("doubled_value").type == pa.int64()
+        assert empty.schema.field("score_plus_ten").type == full.schema.field("score_plus_ten").type == pa.float64()
+
+    def test_transform_to_pyarrow(self, flight_server: Any, sqlite_conn: Any) -> None:
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {
+                SqliteTestDataCreator,
+                SqliteSimpleTransformFeatureGroup,
+                SqliteSecondTransformFeatureGroup,
+                SqliteAggregationFeatureGroup,
+                SqliteCheckData,
+            }
+        )
+
+        feature_list: list[Feature | str] = [Feature(name="pyarrow_avg_value_by_category_sqlite")]
+
+        result = mloda.run_all(
+            feature_list,
+            data_access_collection=DataAccessCollection(connections={sqlite_conn}),
+            flight_server=flight_server,
+            compute_frameworks=[PyArrowTable, SqliteFramework],
+            plugin_collector=plugin_collector,
+            parallelization_modes={ParallelizationMode.SYNC},
+        )
+
+        assert len(result) == 1
+        assert "pyarrow_avg_value_by_category_sqlite" in result[0].column_names

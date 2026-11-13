@@ -1,0 +1,1274 @@
+"""The ``mloda`` CLI: explain and run feature requests through the same services the MCP server uses.
+
+``mloda explain`` prints exactly what the service layer returns, so agent sessions can be reproduced locally.
+"""
+
+import ast
+import base64
+import csv
+import getpass
+import io
+import json
+import logging
+import tomllib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from mloda.core.abstract_plugins.components.input_data.api_data_fg import ApiDataFG
+from mloda.core.abstract_plugins.components.options import RESERVED_READER_OPTION_KEY
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.interfaces.cli import demo
+from mloda.interfaces.cli.main import build_services, main
+from mloda.interfaces.service.catalog import Catalog
+from mloda.interfaces.service.config import ConfigError, Settings, load_settings
+from mloda.interfaces.service.errors import is_error
+from mloda.interfaces.service.planner import Planner
+from mloda.interfaces.service.runner import Runner
+from mloda.user import PluginCollector, PluginLoader
+from tests.helpers.docs_scope import shipped_feature_group_registry
+from tests.test_interfaces.source_groups import (
+    CRED_FEATURE,
+    CRED_KEY,
+    FAILED,
+    FILE_SOURCE_GROUPS,
+    MISSING,
+    PASTED,
+    PASTED_UNDERSCORE,
+    PLAN_RAISE,
+    PLAN_RAISE_SECRET,
+    RAISE,
+    RAISE_SECRET,
+    CredentialReadMcp8,
+    PlanRaiseMcp5,
+    RunnerFailedRowsMcp5,
+    RunnerMissingInputMcp5,
+    RunnerRaiseMcp5,
+    cred_digest,
+    credential_config,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MAIN_PATH = REPO_ROOT / "mloda" / "interfaces" / "cli" / "main.py"
+CLOCK_START = 1_800_000_000.0
+ENV: dict[str, str] = {"MLODA_MCP_SIGNING_KEY": "k" * 32}
+REQUEST: dict[str, Any] = {"features": ["customer_id", "income", "segment"]}
+CUSTOMER_IDS = [f"C9Q4{index:03d}" for index in range(1, 6)]
+PREVIEW_ROWS = [
+    {"income": 10, "segment": "a"},
+    {"income": 20, "segment": "b"},
+    {"income": 30, "segment": "a"},
+    {"income": 40, "segment": "b"},
+    {"income": 50, "segment": "a"},
+]
+SECRET = "SECRET_mcp_cli_7f3a"  # nosec B105
+CONFIG = """
+[mcp]
+mode = "plan"
+
+[mcp.classification]
+customer_id = "personal"
+income = "internal"
+segment = "public"
+order_id = "public"
+
+[mcp.sources.sales]
+files = ["data/sales.csv"]
+"""
+ORDERS_SOURCE = """
+[mcp.sources.orders]
+files = ["data/orders.csv"]
+"""
+
+
+def _clock() -> float:
+    return CLOCK_START
+
+
+def _base(*extra: type[FeatureGroup]) -> PluginCollector:
+    return PluginCollector.enabled_feature_groups({*FILE_SOURCE_GROUPS, ApiDataFG, *extra})
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    code: int
+    out: str
+    err: str
+
+    def json(self) -> dict[str, Any]:
+        result: dict[str, Any] = json.loads(self.out)
+        return result
+
+
+def _cli(
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str] = ENV,
+    stdin_text: str = "",
+    extra_groups: Sequence[type[FeatureGroup]] = (),
+) -> _Outcome:
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        code = main(
+            list(argv),
+            env=env,
+            stdin=io.StringIO(stdin_text),
+            stdout=out,
+            stderr=err,
+            plugin_collector=_base(*extra_groups),
+            clock=_clock,
+        )
+    except SystemExit as exited:
+        code = exited.code if isinstance(exited.code, int) else 1
+    return _Outcome(code, out.getvalue(), err.getvalue())
+
+
+def _write_data(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    rows = [f"{CUSTOMER_IDS[i - 1]},{10 * i},{'a' if i % 2 else 'b'}" for i in range(1, 6)]
+    (data / "sales.csv").write_text("customer_id,income,segment\n" + "\n".join(rows) + "\n")
+    (data / "orders.csv").write_text("order_id,amount\n1,3\n2,4\n3,5\n")
+
+
+def _config(tmp_path: Path, text: str = CONFIG, name: str = "mloda.toml") -> Path:
+    _write_data(tmp_path)
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _request_file(tmp_path: Path, request: Any = REQUEST) -> Path:
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(request), encoding="utf-8")
+    return path
+
+
+def _elsewhere(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    return cwd
+
+
+def _services(
+    config: Path | None, overrides: Mapping[str, Any] | None = None, trusted: bool = True
+) -> tuple[Catalog, Planner, Runner]:
+    settings = replace(load_settings(config, ENV, overrides), trusted_caller=trusted)
+    services: tuple[Catalog, Planner, Runner] = build_services(
+        settings, env=ENV, plugin_collector=_base(), clock=_clock
+    )
+    return services
+
+
+def _expected_explain(config: Path | None, request: Any = REQUEST) -> dict[str, Any]:
+    _, planner, _ = _services(config)
+    return planner.explain(request)
+
+
+def _expected_run(config: Path, request: Any = REQUEST) -> dict[str, Any]:
+    _, planner, runner = _services(config, {"mode": "execute"})
+    explained = planner.explain(request)
+    assert not is_error(explained), explained
+    return runner.run(explained["plan_id"])
+
+
+def _without_audit(result: Mapping[str, Any]) -> dict[str, Any]:
+    stripped = json.loads(json.dumps(result))
+    stripped.pop("audit_id", None)
+    if isinstance(stripped.get("error"), dict):
+        stripped["error"].pop("audit_id", None)
+    return dict(stripped)
+
+
+def _error_code(outcome: _Outcome) -> str:
+    result = outcome.json()
+    assert is_error(result), result
+    code: str = result["error"]["code"]
+    return code
+
+
+def _plan_payload(plan_id: str) -> dict[str, Any]:
+    segment = plan_id.split(".")[1]
+    payload: dict[str, Any] = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    return payload
+
+
+def _assert_no_paths(text: str, tmp_path: Path) -> None:
+    assert str(tmp_path) not in text
+    assert "sales.csv" not in text
+
+
+def _assert_no_withheld_values(outcome: _Outcome) -> None:
+    for customer_id in CUSTOMER_IDS:
+        assert customer_id not in outcome.out
+        assert customer_id not in outcome.err
+
+
+EXPLAIN_TEXT = "step 1  CsvFG  customer_id, income, segment  (source sales)\n"
+
+
+class TestExplainParity:
+    @pytest.mark.parametrize("extra", [[], ["--format", "json"]])
+    def test_explain_file_prints_exactly_the_service_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str]
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", str(_request_file(tmp_path)), "--config", str(config), *extra])
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json() == _expected_explain(config)
+        assert "plan_id" in outcome.json()
+
+    def test_text_format_prints_one_line_per_step(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", str(_request_file(tmp_path)), "--format", "text", "--config", str(config)])
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.err == ""
+        assert outcome.out == EXPLAIN_TEXT
+        _assert_no_paths(outcome.out, tmp_path)
+
+    def test_explain_stdin_prints_exactly_the_service_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", "-", "--config", str(config)], stdin_text=json.dumps(REQUEST))
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json() == _expected_explain(config)
+
+    def test_error_result_matches_the_service_apart_from_audit_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        request = {"features": ["customer_id", "incme"]}
+
+        outcome = _cli(["explain", str(_request_file(tmp_path, request)), "--config", str(config)])
+
+        assert outcome.code == 2
+        assert _without_audit(outcome.json()) == _without_audit(_expected_explain(config, request))
+        assert _error_code(outcome) == "validation_failed"
+
+    def test_output_is_one_json_document_without_paths(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", str(_request_file(tmp_path)), "--config", str(config)])
+
+        assert isinstance(outcome.json(), dict)
+        _assert_no_paths(outcome.out, tmp_path)
+
+
+class TestExplainErrors:
+    @pytest.mark.parametrize(
+        ("request_value", "code"),
+        [
+            ({"features": ["incme"]}, "validation_failed"),
+            ([1, 2], "validation_failed"),
+            ({"features": [{"name": "income", "options": {RESERVED_READER_OPTION_KEY: SECRET}}]}, "policy_denied"),
+        ],
+    )
+    @pytest.mark.parametrize("extra", [[], ["--format", "text"]])
+    def test_error_result_goes_to_stdout_with_exit_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request_value: Any, code: str, extra: list[str]
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", str(_request_file(tmp_path, request_value)), "--config", str(config), *extra])
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == code
+        assert SECRET not in outcome.out + outcome.err
+
+    def test_env_settings_apply_on_top_of_the_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(
+            ["explain", str(_request_file(tmp_path)), "--config", str(config)],
+            env={**ENV, "MLODA_MCP_MAX_ROWS": "3"},
+        )
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "limit_exceeded"
+
+
+class TestUnlistedOption:
+    REQUEST_WITH_OPTION: dict[str, Any] = {"features": [{"name": "income", "options": {"unlisted_key": 1}}]}
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    def test_cli_accepts_an_option_that_is_not_allow_listed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        path = _request_file(tmp_path, self.REQUEST_WITH_OPTION)
+
+        outcome = _cli([command, str(path), "--config", str(config)])
+
+        assert "option_not_allowed" not in outcome.out
+        assert outcome.code == 0, outcome.out
+
+
+class TestRequestInput:
+    def test_missing_request_file_is_a_stderr_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", str(tmp_path / "nope.json"), "--config", str(config)])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()
+
+    def test_invalid_json_file_is_a_stderr_error_without_its_contents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        path = tmp_path / "request.json"
+        path.write_text('{"features": ["' + SECRET + '"', encoding="utf-8")
+
+        outcome = _cli(["explain", str(path), "--config", str(config)])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()
+        assert SECRET not in outcome.err
+
+    def test_invalid_json_on_stdin_is_a_stderr_error_without_its_contents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", "-", "--config", str(config)], stdin_text=SECRET + " {")
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()
+        assert SECRET not in outcome.err
+
+
+class TestConfigResolution:
+    def test_mloda_toml_in_the_working_directory_is_used(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _request_file(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        outcome = _cli(["explain", "request.json"])
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json() == _expected_explain(config)
+
+    def test_without_a_config_the_defaults_apply(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _write_data(tmp_path)
+        request = _request_file(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", str(request)])
+
+        assert outcome.code == 2
+        assert _without_audit(outcome.json()) == _without_audit(_expected_explain(None))
+
+    def test_no_config_ignores_mloda_toml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _config(tmp_path)
+        request = _request_file(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        outcome = _cli(["explain", str(request), "--no-config"])
+
+        assert outcome.code == 2
+        assert _without_audit(outcome.json()) == _without_audit(_expected_explain(None))
+
+    def test_no_config_ignores_a_broken_mloda_toml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _config(tmp_path, "[mcp]\nnot_a_key = 1\n")
+        request = _request_file(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        outcome = _cli(["explain", str(request), "--no-config"])
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "validation_failed"
+
+    def test_broken_mloda_toml_in_the_working_directory_is_a_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _config(tmp_path, "[mcp]\nnot_a_key = 1\n")
+        request = _request_file(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        outcome = _cli(["explain", str(request)])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert "not_a_key" in outcome.err
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    @pytest.mark.parametrize("problem", ["missing", "bad_toml", "unknown_key"])
+    def test_config_error_is_stderr_only_with_exit_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, problem: str
+    ) -> None:
+        texts = {"bad_toml": "[mcp\nmode = ", "unknown_key": "[mcp]\nmood = 'plan'\n"}
+        config = tmp_path / "missing.toml" if problem == "missing" else _config(tmp_path, texts[problem], "cfg.toml")
+        request = _request_file(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli([command, str(request), "--config", str(config)])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()
+
+    def test_config_and_no_config_are_exclusive(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", str(_request_file(tmp_path)), "--config", str(config), "--no-config"])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+
+
+class TestRun:
+    def test_run_prints_the_service_run_result(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", str(_request_file(tmp_path)), "--config", str(config)])
+
+        assert outcome.code == 0, outcome.err
+        result = outcome.json()
+        assert result["status"] == "completed"
+        assert result["audit_id"].startswith("run_")
+        assert _without_audit(result) == _without_audit(_expected_run(config))
+
+    def test_run_executes_even_when_the_config_is_in_plan_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", str(_request_file(tmp_path)), "--config", str(config), "--format", "json"])
+
+        assert outcome.code == 0, outcome.err
+        (table,) = outcome.json()["tables"]
+        assert table["row_count"] == 5
+        assert table["preview"]["rows"] == PREVIEW_ROWS
+
+    def test_run_reads_the_request_from_stdin(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", "-", "--config", str(config)], stdin_text=json.dumps(REQUEST))
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json()["status"] == "completed"
+
+    @pytest.mark.parametrize("output_format", ["json", "jsonl", "csv"])
+    def test_max_rows_over_the_source_is_limit_exceeded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_format: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        argv = ["run", str(_request_file(tmp_path)), "--config", str(config), "--max-rows", "3"]
+
+        outcome = _cli([*argv, "--format", output_format])
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "limit_exceeded"
+        details = outcome.json()["error"]["details"]
+        assert {"source": "sales", "reason": "over_limit", "rows": 5, "max_rows": 3} in details
+        _assert_no_withheld_values(outcome)
+
+    def test_max_rows_within_the_source_runs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", str(_request_file(tmp_path)), "--config", str(config), "--max-rows", "10"])
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json()["status"] == "completed"
+
+    def test_explain_error_is_printed_and_nothing_runs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": ["incme"]})
+
+        outcome = _cli(["run", str(request), "--config", str(config)])
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "validation_failed"
+        assert "tables" not in outcome.json()
+
+    @pytest.mark.parametrize("extra", [["--max-rows", "abc"], ["--format", "xml"]])
+    def test_bad_run_option_exits_2(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str]) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", str(_request_file(tmp_path)), "--config", str(config), *extra])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+
+
+class TestRunInlineData:
+    REQUEST: dict[str, Any] = {"features": ["token"], "data": {"Tokens": {"token": ["007", "", None]}}}
+
+    def test_inline_data_runs_when_enabled_and_classified(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        text = CONFIG.replace('mode = "plan"', 'mode = "plan"\ninline_data = true')
+        config = _config(tmp_path, text.replace('segment = "public"', 'segment = "public"\ntoken = "public"'))
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", "-", "--config", str(config), "--format", "json"], stdin_text=json.dumps(self.REQUEST))
+
+        assert outcome.code == 0, outcome.err
+        (table,) = outcome.json()["tables"]
+        assert [row["token"] for row in table["preview"]["rows"]] == ["007", "", None]
+
+    def test_inline_data_without_opt_in_is_policy_denied(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", "-", "--config", str(config)], stdin_text=json.dumps(self.REQUEST))
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "policy_denied"
+        assert '"007"' not in outcome.out
+
+
+class TestRunFailedRows:
+    def test_failed_rows_are_printed_and_exit_3(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": ["customer_id", FAILED]})
+
+        outcome = _cli(["run", str(request), "--config", str(config)], extra_groups=[RunnerFailedRowsMcp5])
+
+        assert outcome.code == 3, outcome.err
+        result = outcome.json()
+        assert result["status"] == "completed"
+        assert result["failed_rows"] == [
+            {"column": FAILED, "reason": "timeout", "row_count": 2, "rows": [1, 3], "truncated": False}
+        ]
+
+    @pytest.mark.parametrize("output_format", ["jsonl", "csv"])
+    def test_failed_rows_summary_goes_to_stderr_for_row_formats(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_format: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": [FAILED]})
+        argv = ["run", str(request), "--config", str(config), "--format", output_format]
+
+        outcome = _cli(argv, extra_groups=[RunnerFailedRowsMcp5])
+
+        assert outcome.code == 3, outcome.err
+        lines = outcome.err.strip().splitlines()
+        assert len(lines) == 1
+        for part in (FAILED, "timeout", "2", "1", "3"):
+            assert part in lines[0]
+        assert "failed_rows" not in outcome.out
+
+    def test_run_without_failed_rows_exits_0_and_has_no_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(
+            ["run", str(_request_file(tmp_path)), "--config", str(config)], extra_groups=[RunnerFailedRowsMcp5]
+        )
+
+        assert outcome.code == 0, outcome.err
+        assert "failed_rows" not in outcome.json()
+
+
+class TestRunFeatureGroupFailure:
+    def test_failing_feature_group_is_an_internal_result_with_exit_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": ["customer_id", RAISE]})
+
+        outcome = _cli(["run", str(request), "--config", str(config)], extra_groups=[RunnerRaiseMcp5])
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "internal"
+        assert RAISE_SECRET not in outcome.out
+
+    def test_missing_input_has_its_own_code_with_exit_2(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": ["customer_id", MISSING]})
+
+        outcome = _cli(["run", str(request), "--config", str(config)], extra_groups=[RunnerMissingInputMcp5])
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "missing_input_feature"
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    def test_planning_failure_is_an_internal_result_with_exit_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": [PLAN_RAISE]})
+
+        outcome = _cli([command, str(request), "--config", str(config)], extra_groups=[PlanRaiseMcp5])
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "internal"
+        assert PLAN_RAISE_SECRET not in outcome.out
+
+
+CRED_TOKEN = "tok-Zk9-cli-secret-77"  # nosec B105
+CRED_CONFIG = credential_config(CONFIG, 'order_id = "public"', handle="db")
+
+
+class TestCredentials:
+    def test_run_reads_a_table_credential_from_the_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path, CRED_CONFIG)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": [CRED_FEATURE]})
+
+        outcome = _cli(
+            ["run", str(request), "--config", str(config)],
+            env={**ENV, "TOK_VAR": CRED_TOKEN},
+            extra_groups=[CredentialReadMcp8],
+        )
+
+        assert outcome.code == 0, outcome.err
+        (table,) = outcome.json()["tables"]
+        assert table["preview"]["rows"] == [{CRED_FEATURE: cred_digest(CRED_TOKEN)}] * 5
+        assert CRED_TOKEN not in outcome.out + outcome.err
+
+    def test_a_pasted_value_in_the_config_exits_2_without_echoing_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        config = _config(tmp_path, CRED_CONFIG.replace("TOK_VAR", PASTED))
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": [CRED_FEATURE]})
+
+        with caplog.at_level(logging.DEBUG):
+            outcome = _cli(["explain", str(request), "--config", str(config)], extra_groups=[CredentialReadMcp8])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.startswith("mloda: error:")
+        assert PASTED not in outcome.out + outcome.err
+        assert all(PASTED not in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    def test_a_pasted_underscore_token_is_never_echoed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, command: str
+    ) -> None:
+        config = _config(tmp_path, CRED_CONFIG.replace("TOK_VAR", PASTED_UNDERSCORE))
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": [CRED_FEATURE]})
+
+        with caplog.at_level(logging.DEBUG):
+            outcome = _cli([command, str(request), "--config", str(config)], extra_groups=[CredentialReadMcp8])
+
+        assert outcome.code == 2
+        assert "[mcp.credentials.db] field 'token'" in outcome.err
+        assert PASTED_UNDERSCORE not in outcome.out + outcome.err
+        assert all(PASTED_UNDERSCORE not in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.parametrize(("command", "value"), [("explain", None), ("run", ""), ("explain", "   ")])
+    def test_unset_or_empty_variable_exits_2_naming_handle_and_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, value: str | None
+    ) -> None:
+        config = _config(tmp_path, CRED_CONFIG)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": [CRED_FEATURE]})
+        env = ENV if value is None else {**ENV, "TOK_VAR": value}
+
+        outcome = _cli([command, str(request), "--config", str(config)], env=env, extra_groups=[CredentialReadMcp8])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.startswith("mloda: error:")
+        assert "[mcp.credentials.db] field 'token'" in outcome.err
+        assert "TOK_VAR" not in outcome.err
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    @pytest.mark.parametrize(
+        ("handle", "named"), [("dbx", ["dbx"]), (None, [CRED_KEY, "is not set"])], ids=["misspelled", "unset"]
+    )
+    def test_a_bad_handle_is_explained_in_the_message_and_on_stderr(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, handle: str | None, named: list[str]
+    ) -> None:
+        config = _config(tmp_path, credential_config(CONFIG, 'order_id = "public"', handle=handle))
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": [CRED_FEATURE]})
+
+        outcome = _cli(
+            [command, str(request), "--config", str(config)],
+            env={**ENV, "TOK_VAR": CRED_TOKEN},
+            extra_groups=[CredentialReadMcp8],
+        )
+
+        assert outcome.code == 2
+        error = outcome.json()["error"]
+        assert error["code"] == "internal"
+        for needle in named:
+            assert needle in error["message"]
+            assert needle in outcome.err
+        assert outcome.err.startswith("mloda: error:")
+        assert CRED_TOKEN not in outcome.out + outcome.err
+
+    def test_services_check_credentials_before_building(self, tmp_path: Path) -> None:
+        settings = load_settings(_config(tmp_path, CRED_CONFIG), ENV)
+
+        with pytest.raises(ConfigError, match="token"):
+            build_services(settings, env=ENV, plugin_collector=_base(CredentialReadMcp8), clock=_clock)
+
+
+class TestShortCredentialWarning:
+    OTHER_CONFIG = CRED_CONFIG + '\n[mcp.credentials.other]\ntoken = "OTHER_VAR"\n'
+
+    @staticmethod
+    def _short_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        logger = "mloda.core.abstract_plugins.components.data_access_collection"
+        return [r.getMessage() for r in caplog.records if r.name == logger and "shorter than" in r.getMessage()]
+
+    def _services(self, tmp_path: Path, text: str, env: dict[str, str]) -> Planner:
+        settings = load_settings(_config(tmp_path, text), env)
+        _, planner, _ = build_services(settings, env=env, plugin_collector=_base(CredentialReadMcp8), clock=_clock)
+        return planner
+
+    def test_warns_once_at_startup_and_not_again_while_values_are_unchanged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        env = {**ENV, "TOK_VAR": "short1"}
+        with caplog.at_level(logging.WARNING):
+            planner = self._services(tmp_path, CRED_CONFIG, env)
+            at_startup = len(self._short_warnings(caplog))
+            for _ in range(3):
+                planner.explain({"features": [CRED_FEATURE]})
+
+        assert at_startup == 1
+        assert len(self._short_warnings(caplog)) == 1
+
+    def test_warns_again_for_a_handle_whose_value_changes(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        env = {**ENV, "TOK_VAR": "short1"}
+        planner = self._services(tmp_path, CRED_CONFIG, env)
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING):
+            env["TOK_VAR"] = "short2"
+            planner.explain({"features": [CRED_FEATURE]})
+            planner.explain({"features": [CRED_FEATURE]})
+
+        assert len(self._short_warnings(caplog)) == 1
+
+    def test_an_unchanged_handle_does_not_warn_when_another_one_changes(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        env = {**ENV, "TOK_VAR": "short1", "OTHER_VAR": "short3"}
+        planner = self._services(tmp_path, self.OTHER_CONFIG, env)
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING):
+            env["OTHER_VAR"] = "short4"
+            planner.explain({"features": [CRED_FEATURE]})
+
+        (warning,) = self._short_warnings(caplog)
+        assert "'other'" in warning
+
+
+class TestRunFormats:
+    def test_jsonl_prints_one_preview_row_per_line(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", str(_request_file(tmp_path)), "--config", str(config), "--format", "jsonl"])
+
+        assert outcome.code == 0, outcome.err
+        assert [json.loads(line) for line in outcome.out.splitlines()] == PREVIEW_ROWS
+
+    def test_jsonl_prints_rows_of_every_table(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path, CONFIG + ORDERS_SOURCE)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": ["income", "order_id"]})
+
+        outcome = _cli(["run", str(request), "--config", str(config), "--format", "jsonl"])
+
+        assert outcome.code == 0, outcome.err
+        rows = [json.loads(line) for line in outcome.out.splitlines()]
+        expected = [{"income": 10 * i} for i in range(1, 6)] + [{"order_id": i} for i in range(1, 4)]
+        assert sorted(rows, key=json.dumps) == sorted(expected, key=json.dumps)
+
+    def test_csv_prints_header_and_preview_rows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", str(_request_file(tmp_path)), "--config", str(config), "--format", "csv"])
+
+        assert outcome.code == 0, outcome.err
+        rows = list(csv.reader(io.StringIO(outcome.out)))
+        assert rows == [["income", "segment"]] + [[str(row["income"]), str(row["segment"])] for row in PREVIEW_ROWS]
+
+    def test_csv_with_more_than_one_table_is_a_stderr_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path, CONFIG + ORDERS_SOURCE)
+        _elsewhere(tmp_path, monkeypatch)
+        request = _request_file(tmp_path, {"features": ["income", "order_id"]})
+
+        outcome = _cli(["run", str(request), "--config", str(config), "--format", "csv"])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()
+
+    @pytest.mark.parametrize("output_format", ["json", "jsonl", "csv"])
+    def test_full_prints_every_row_and_column(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_format: str
+    ) -> None:
+        config = _config(tmp_path, CONFIG.replace('mode = "plan"', 'mode = "plan"\nmax_preview_rows = 2'))
+        _elsewhere(tmp_path, monkeypatch)
+        argv = ["run", str(_request_file(tmp_path)), "--config", str(config), "--full", "--format", output_format]
+
+        outcome = _cli(argv)
+
+        assert outcome.code == 0, outcome.err
+        expected = [{"customer_id": CUSTOMER_IDS[i], **PREVIEW_ROWS[i]} for i in range(5)]
+        if output_format == "json":
+            (table,) = outcome.json()["tables"]
+            assert "preview" not in table
+            assert table["row_count"] == 5
+            assert table["rows"] == expected
+        elif output_format == "jsonl":
+            assert [json.loads(line) for line in outcome.out.splitlines()] == expected
+        else:
+            rows = list(csv.reader(io.StringIO(outcome.out)))
+            assert rows == [["customer_id", "income", "segment"]] + [
+                [CUSTOMER_IDS[i], str(PREVIEW_ROWS[i]["income"]), str(PREVIEW_ROWS[i]["segment"])] for i in range(5)
+            ]
+
+    def test_full_still_enforces_max_rows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        argv = ["run", str(_request_file(tmp_path)), "--config", str(config), "--max-rows", "3", "--full"]
+
+        outcome = _cli(argv)
+
+        assert outcome.code == 2
+        assert _error_code(outcome) == "limit_exceeded"
+
+    @pytest.mark.parametrize("output_format", ["json", "jsonl", "csv"])
+    def test_withheld_values_never_appear(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_format: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", str(_request_file(tmp_path)), "--config", str(config), "--format", output_format])
+
+        assert outcome.code == 0, outcome.err
+        _assert_no_withheld_values(outcome)
+        _assert_no_paths(outcome.out, tmp_path)
+
+
+class TestWithheldFilters:
+    REQUEST: dict[str, Any] = {
+        "features": ["segment"],
+        "filters": [{"feature": "customer_id", "op": "eq", "value": CUSTOMER_IDS[2]}],
+    }
+
+    def test_service_built_for_mcp_refuses_a_filter_on_a_withheld_column(self, tmp_path: Path) -> None:
+        _, planner, _ = _services(_config(tmp_path), trusted=False)
+
+        result = planner.explain(self.REQUEST)
+
+        assert planner.settings.trusted_caller is False
+        assert is_error(result)
+        assert result["error"]["code"] == "policy_denied"
+        details = result["error"]["details"]
+        assert [(detail["path"], detail["problem"]) for detail in details] == [
+            ("/filters/0", "filter_on_withheld_column")
+        ]
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    def test_cli_accepts_a_filter_on_a_withheld_column(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli([command, str(_request_file(tmp_path, self.REQUEST)), "--config", str(config)])
+
+        assert outcome.code == 0, outcome.out + outcome.err
+        assert outcome.json()["status" if command == "run" else "plan_id"]
+        if command == "run":
+            _assert_no_withheld_values(outcome)
+
+
+class TestBuildServices:
+    def _settings(self, tmp_path: Path, mode: str = "plan") -> Settings:
+        return load_settings(_config(tmp_path), ENV, {"mode": mode})
+
+    def test_returns_catalog_planner_and_runner_over_the_settings(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+
+        catalog, planner, runner = build_services(settings, env=ENV, plugin_collector=_base(), clock=_clock)
+
+        assert isinstance(catalog, Catalog)
+        assert isinstance(planner, Planner)
+        assert isinstance(runner, Runner)
+        assert planner.settings == settings
+
+    def test_signing_key_from_env_makes_plan_ids_portable(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        _, first, _ = build_services(settings, env=ENV, plugin_collector=_base(), clock=_clock)
+        _, second, _ = build_services(settings, env=ENV, plugin_collector=_base(), clock=_clock)
+
+        plan_id = first.explain(REQUEST)["plan_id"]
+
+        assert not is_error(second.verify_plan_id(plan_id))
+
+    def test_without_a_signing_key_each_build_has_its_own_key(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        _, first, _ = build_services(settings, env={}, plugin_collector=_base(), clock=_clock)
+        _, second, _ = build_services(settings, env={}, plugin_collector=_base(), clock=_clock)
+
+        plan_id = first.explain(REQUEST)["plan_id"]
+
+        assert not is_error(first.verify_plan_id(plan_id))
+        assert second.verify_plan_id(plan_id)["error"]["code"] == "plan_invalid"
+
+    def test_principal_is_the_local_user(self, tmp_path: Path) -> None:
+        _, planner, _ = build_services(self._settings(tmp_path), env=ENV, plugin_collector=_base(), clock=_clock)
+
+        plan_id = planner.explain(REQUEST)["plan_id"]
+
+        assert _plan_payload(plan_id)["sub"] == getpass.getuser()
+
+    def test_clock_is_passed_to_the_planner(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        _, planner, _ = build_services(settings, env=ENV, plugin_collector=_base(), clock=_clock)
+
+        plan_id = planner.explain(REQUEST)["plan_id"]
+
+        assert _plan_payload(plan_id)["exp"] == int(CLOCK_START) + settings.plan_ttl_seconds
+
+    def test_runner_runs_plans_of_its_planner(self, tmp_path: Path) -> None:
+        _, planner, runner = build_services(
+            self._settings(tmp_path, "execute"), env=ENV, plugin_collector=_base(), clock=_clock
+        )
+
+        result = runner.run(planner.explain(REQUEST)["plan_id"])
+
+        assert result["status"] == "completed"
+        assert result["tables"][0]["preview"]["rows"] == PREVIEW_ROWS
+
+    def test_catalog_without_collector_loads_and_lists_installed_plugins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loads: list[bool] = []
+        original_all = PluginLoader.all
+
+        def spy_all(cls: type[PluginLoader], force_reload: bool = False) -> PluginLoader:
+            loads.append(force_reload)
+            return original_all(force_reload=force_reload)
+
+        monkeypatch.setattr(PluginLoader, "all", classmethod(spy_all))
+        registry = shipped_feature_group_registry()
+        monkeypatch.setattr("mloda.core.api.plugin_docs.feature_group_subclasses", registry)
+
+        catalog, _, _ = build_services(self._settings(tmp_path), env=ENV, plugin_collector=None)
+
+        assert loads, "build_services built the catalog without calling PluginLoader.all"
+        result = catalog.search("AggregatedFeatureGroup", kinds=["feature_group"], limit=50)
+        assert "AggregatedFeatureGroup" in [item["feature_group"] for item in result["items"]], result
+
+
+class TestUsage:
+    def _printed(self, outcome: _Outcome, capsys: pytest.CaptureFixture[str]) -> str:
+        captured = capsys.readouterr()
+        return outcome.out + outcome.err + captured.out + captured.err
+
+    def test_help_prints_usage_and_exits_0(self, capsys: pytest.CaptureFixture[str]) -> None:
+        outcome = _cli(["--help"])
+
+        assert outcome.code == 0
+        printed = self._printed(outcome, capsys)
+        assert "usage" in printed.lower()
+        assert "demo" in printed
+        assert "explain" in printed
+        assert "run" in printed
+
+    def test_subcommand_help_exits_0(self, capsys: pytest.CaptureFixture[str]) -> None:
+        outcome = _cli(["run", "--help"])
+
+        assert outcome.code == 0
+        printed = self._printed(outcome, capsys)
+        assert "--max-rows" in printed
+        assert "--format" in printed
+
+    def test_no_subcommand_prints_usage_and_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        outcome = _cli([])
+
+        assert outcome.code == 2
+        assert "usage" in self._printed(outcome, capsys).lower()
+
+
+DEMO_STDOUT = """\
+Result
+customer_id  income
+C001         50000
+C002         75000
+C003         None
+C004         60000
+C005         85000
+
+income__sum_aggr  age__avg_aggr
+270000            37.5
+270000            37.5
+270000            37.5
+270000            37.5
+270000            37.5
+
+Plan
+step 1  ApiDataFG               age, customer_id, income  (source SampleData)
+step 2  AggregatedFeatureGroup  age__avg_aggr, income__sum_aggr  (from age, income)
+
+Next
+Edit the README example: https://github.com/mloda-ai/mloda#30-second-example
+DataFrames: pip install "mloda[pandas]"
+"""
+
+
+class TestDemo:
+    def test_plan_lines_name_the_groups_of_transform_and_join_steps(self) -> None:
+        idle: dict[str, Any] = {
+            "features": [],
+            "source": None,
+            "inputs": [],
+            "source_feature_group": None,
+            "join_type": None,
+        }
+        steps = [
+            {
+                **idle,
+                "step": 1,
+                "kind": "compute",
+                "feature_group": "CsvFG",
+                "features": ["customer_id", "income"],
+                "source": "sales",
+            },
+            {**idle, "step": 2, "kind": "transform", "feature_group": "JsonFG", "source_feature_group": "CsvFG"},
+            {
+                **idle,
+                "step": 3,
+                "kind": "join",
+                "feature_group": "CsvFG",
+                "source_feature_group": "JsonFG",
+                "join_type": "inner",
+            },
+        ]
+
+        assert demo.plan_lines(steps) == [
+            "step 1  CsvFG      customer_id, income  (source sales)",
+            "step 2  transform  CsvFG -> JsonFG",
+            "step 3  join       CsvFG + JsonFG  (inner)",
+        ]
+
+    @pytest.mark.parametrize(
+        ("toml", "env"),
+        [
+            (None, {}),
+            ("[mcp]\nnot_a_key = 1\n", {}),
+            (None, {"MLODA_MCP_MODE": "plan"}),
+            ("[mcp]\nnot_a_key = 1\n", {"MLODA_MCP_MODE": "plan"}),
+        ],
+    )
+    def test_demo_prints_the_pinned_output_whatever_the_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str | None, env: dict[str, str]
+    ) -> None:
+        cwd = _elsewhere(tmp_path, monkeypatch)
+        if toml is not None:
+            (cwd / "mloda.toml").write_text(toml, encoding="utf-8")
+
+        outcome = _cli(["demo"], env=env)
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.out == DEMO_STDOUT
+        assert outcome.err == ""
+
+
+class TestPackaging:
+    def test_console_script_is_declared(self) -> None:
+        with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+            data = tomllib.load(handle)
+
+        assert data["project"]["scripts"]["mloda"] == "mloda.interfaces.cli.main:main"
+
+    def test_cli_module_does_not_import_mcp_at_import_time(self) -> None:
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+
+        modules: list[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+                modules.append(node.module)
+
+        assert not [name for name in modules if name == "mcp" or name.startswith("mcp.")]
+
+
+class TestFeatureArguments:
+    def _explain(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *args: str) -> _Outcome:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        return _cli(["explain", *args, "--config", str(config)])
+
+    def test_features_without_flags_build_a_plain_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._explain(tmp_path, monkeypatch, "customer_id", "income")
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json()["normalized_request"] == {"features": [{"name": "customer_id"}, {"name": "income"}]}
+
+    def test_option_and_context_flags_build_the_request(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        outcome = self._explain(tmp_path, monkeypatch, "income", "segment", "-o", "a=1", "-c", "b=two")
+
+        assert outcome.code == 0, outcome.err
+        expected = {"group_options": {"a": "1"}, "context_options": {"b": "two"}}
+        assert outcome.json()["normalized_request"] == {
+            "features": [{"name": "income", **expected}, {"name": "segment", **expected}]
+        }
+
+    def test_flags_are_repeatable_and_empty_containers_are_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcome = self._explain(tmp_path, monkeypatch, "income", "--option", "a=1", "-o", "b=2")
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json()["normalized_request"] == {
+            "features": [{"name": "income", "group_options": {"a": "1", "b": "2"}}]
+        }
+
+    def test_json_and_file_values(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        note = tmp_path / "note.txt"
+        note.write_text("line one\nline two", encoding="utf-8")
+
+        outcome = self._explain(
+            tmp_path, monkeypatch, "income", "-o", 'l:=[1, {"x": true}]', "-o", f"t=@{note}", "-o", "n:=5", "-o", "e="
+        )
+
+        assert outcome.code == 0, outcome.err
+        (feature,) = outcome.json()["normalized_request"]["features"]
+        assert feature["group_options"] == {"l": [1, {"x": True}], "t": "line one\nline two", "n": 5, "e": ""}
+
+    def test_value_may_contain_equals(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        outcome = self._explain(tmp_path, monkeypatch, "income", "-o", "k=a=b")
+
+        (feature,) = outcome.json()["normalized_request"]["features"]
+        assert feature["group_options"] == {"k": "a=b"}
+
+    def test_run_builds_the_request_too(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["run", "income", "segment", "-o", "a=1", "--config", str(config)])
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json()["status"] == "completed"
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    def test_a_json_name_that_does_not_exist_is_still_a_missing_request_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli([command, "x.json", "--config", str(config)])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert "request file not found" in outcome.err
+
+    def test_an_existing_file_without_json_suffix_is_a_request_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+        path = tmp_path / "request.txt"
+        path.write_text(json.dumps(REQUEST), encoding="utf-8")
+
+        outcome = _cli(["explain", str(path), "--config", str(config)])
+
+        assert outcome.code == 0, outcome.err
+        assert outcome.json()["normalized_request"] == REQUEST
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            ["-o", "no_equals_" + SECRET],
+            ["-c", "no_equals_" + SECRET],
+            ["-o", "k:=" + SECRET + " {"],
+            ["-o", "k=@" + SECRET + "_missing.txt"],
+            ["-c", "k:=[" + SECRET],
+            ["-o", "k:=" + "[" * 200_000 + SECRET],
+        ],
+    )
+    def test_malformed_pair_is_a_stderr_error_that_never_echoes_the_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, flags: list[str]
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli([command, "income", *flags, "--config", str(config)])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()
+        assert SECRET not in outcome.err
+
+    @pytest.mark.parametrize("flag", ["-o", "-c"])
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    def test_flags_with_a_request_file_are_a_stderr_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, flag: str
+    ) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli([command, str(_request_file(tmp_path)), flag, "k=" + SECRET, "--config", str(config)])
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()
+        assert SECRET not in outcome.err
+
+    def test_flags_with_stdin_request_are_a_stderr_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _config(tmp_path)
+        _elsewhere(tmp_path, monkeypatch)
+
+        outcome = _cli(["explain", "-", "-o", "k=v", "--config", str(config)], stdin_text=json.dumps(REQUEST))
+
+        assert outcome.code == 2
+        assert outcome.out == ""
+        assert outcome.err.strip()

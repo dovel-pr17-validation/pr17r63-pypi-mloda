@@ -1,0 +1,266 @@
+import pandas as pd
+import pytest
+
+from mloda.core.abstract_plugins.components.match_rejection import MatchRejection
+
+from mloda.user import mloda
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.provider import FeatureSet
+from mloda.user import Options
+from mloda.user import PluginCollector
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.base import AggregatedFeatureGroup
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.pandas import PandasAggregation
+
+from tests.test_plugins.feature_group.experimental.test_base_aggregated_feature_group.aggregated_calculate_test_mixin import (
+    AggregatedCalculateTestMixin,
+)
+from tests.test_plugins.feature_group.experimental.test_base_aggregated_feature_group.aggregated_zero_row_test_mixin import (
+    AggregatedZeroRowTestMixin,
+)
+from tests.test_plugins.feature_group.experimental.test_base_aggregated_feature_group.test_aggregated_utils import (
+    PandasAggregatedTestDataCreator,
+    validate_aggregated_features,
+)
+from tests.test_plugins.feature_group.experimental.zero_row_result_type_test_mixin import PandasZeroRowAdapter
+
+
+@pytest.fixture
+def sample_dataframe() -> pd.DataFrame:
+    """Create a sample pandas DataFrame for testing."""
+    return pd.DataFrame(
+        {
+            "sales": [100, 200, 300, 400, 500],
+            "quantity": [10, 20, 30, 40, 50],
+            "price": [10.0, 9.5, 9.0, 8.5, 8.0],
+            "discount": [0.1, 0.2, 0.15, 0.25, 0.1],
+            "customer_rating": [4, 5, 3, 4, 5],
+        }
+    )
+
+
+@pytest.fixture
+def feature_set_sum() -> FeatureSet:
+    """Create a feature set with a sum aggregation feature."""
+    feature_set = FeatureSet()
+    feature_set.add(Feature("sales__sum_aggr"))
+    return feature_set
+
+
+class TestAggregatedFeatureGroup:
+    """Tests for the AggregatedFeatureGroup class."""
+
+    def test_get_aggregation_type(self) -> None:
+        """Test extraction of aggregation type from feature name."""
+        assert AggregatedFeatureGroup.get_aggregation_type("sales__sum_aggr") == "sum"
+        assert AggregatedFeatureGroup.get_aggregation_type("quantity__min_aggr") == "min"
+        assert AggregatedFeatureGroup.get_aggregation_type("price__max_aggr") == "max"
+        assert AggregatedFeatureGroup.get_aggregation_type("discount__avg_aggr") == "avg"
+        assert AggregatedFeatureGroup.get_aggregation_type("quantity__count_aggr") == "count"
+        assert AggregatedFeatureGroup.get_aggregation_type("discount__median_aggr") == "median"
+
+        # Test with invalid feature names
+        with pytest.raises(ValueError):
+            AggregatedFeatureGroup.get_aggregation_type("invalid_feature_name")
+
+        with pytest.raises(ValueError):
+            AggregatedFeatureGroup.get_aggregation_type("sales__aggr_")
+
+        with pytest.raises(ValueError):
+            AggregatedFeatureGroup.get_aggregation_type("__sum_aggr")
+
+    def test_match_feature_group_criteria(self) -> None:
+        """Test match_feature_group_criteria method."""
+        options = Options()
+
+        # Test with valid feature names
+        assert AggregatedFeatureGroup.match_feature_group_criteria("sales__sum_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("quantity__min_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("price__max_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("discount__avg_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("quantity__count_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("discount__median_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("sales__std_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("sales__var_aggr", options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria("sales__mean_aggr", options)
+
+        # Test with FeatureName objects
+        assert AggregatedFeatureGroup.match_feature_group_criteria(FeatureName("sales__sum_aggr"), options)
+        assert AggregatedFeatureGroup.match_feature_group_criteria(FeatureName("quantity__min_aggr"), options)
+
+        # Test with invalid feature names
+        assert not AggregatedFeatureGroup.match_feature_group_criteria("invalid_feature_name", options)
+        assert not AggregatedFeatureGroup.match_feature_group_criteria("sum_invalid_sales", options)
+        assert not AggregatedFeatureGroup.match_feature_group_criteria("sales__invalid", options)
+
+    def test_bogus_name_aggregation_is_rejected_despite_a_valid_option(
+        self, rejection_window: dict[str, MatchRejection]
+    ) -> None:
+        options = Options(context={AggregatedFeatureGroup.AGGREGATION_TYPE: "sum"})
+        assert AggregatedFeatureGroup.match_feature_group_criteria("x__bogus_aggr", options) is False
+        assert len(rejection_window) == 1
+        assert "bogus" in next(iter(rejection_window.values())).reason
+
+    def test_input_features(self) -> None:
+        """Test input_features method."""
+        options = Options()
+        feature_group = AggregatedFeatureGroup()
+
+        # Test with valid feature names
+        input_features = feature_group.input_features(options, FeatureName("sales__sum_aggr"))
+        assert input_features == {Feature("sales")}
+
+        input_features = feature_group.input_features(options, FeatureName("quantity__min_aggr"))
+        assert input_features == {Feature("quantity")}
+
+        input_features = feature_group.input_features(options, FeatureName("price__max_aggr"))
+        assert input_features == {Feature("price")}
+
+        input_features = feature_group.input_features(options, FeatureName("discount__avg_aggr"))
+        assert input_features == {Feature("discount")}
+
+        input_features = feature_group.input_features(options, FeatureName("quantity__count_aggr"))
+        assert input_features == {Feature("quantity")}
+
+        input_features = feature_group.input_features(options, FeatureName("discount__median_aggr"))
+        assert input_features == {Feature("discount")}
+
+        child = Feature("sales", options=Options(context={"some_key": 1}), feature_group="SomeReader")
+        declared_options = Options(context={"in_features": [child]})
+        assert feature_group.match_feature_group_criteria("sales__sum_aggr", declared_options)
+        result = feature_group.input_features(declared_options, FeatureName("sales__sum_aggr"))
+        assert result is not None
+        [declared] = result
+        assert declared.options.get("some_key") == 1
+        assert declared.feature_group_scope == "SomeReader"
+
+
+class TestPandasAggregation:
+    """Tests for the PandasAggregation class."""
+
+    def test_compute_framework_rule(self) -> None:
+        """The implementation names the Pandas framework and the aggregation group."""
+        assert PandasAggregation.compute_framework is PandasDataFrame
+        assert PandasAggregation.feature_group is AggregatedFeatureGroup
+        assert PandasDataFrame in AggregatedFeatureGroup.compute_framework_definition()
+
+    def test_perform_aggregation_sum(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with sum aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "sum", ["sales"])
+        assert result == 1500  # Sum of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_min(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with min aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "min", ["sales"])
+        assert result == 100  # Min of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_max(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with max aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "max", ["sales"])
+        assert result == 500  # Max of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_avg(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with avg aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "avg", ["sales"])
+        assert result == 300  # Avg of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_mean(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with mean aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "mean", ["sales"])
+        assert result == 300  # Mean of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_count(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with count aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "count", ["sales"])
+        assert result == 5  # Count of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_std(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with std aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "std", ["sales"])
+        assert abs(result - 158.11) < 0.1  # Std of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_var(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with var aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "var", ["sales"])
+        assert abs(result - 25000) < 0.1  # Var of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_median(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with median aggregation."""
+        result = PandasAggregation._perform_aggregation(sample_dataframe, "median", ["sales"])
+        assert result == 300  # Median of [100, 200, 300, 400, 500]
+
+    def test_perform_aggregation_invalid(self, sample_dataframe: pd.DataFrame) -> None:
+        """Test _perform_aggregation method with invalid aggregation type."""
+        with pytest.raises(ValueError):
+            PandasAggregation._perform_aggregation(sample_dataframe, "invalid", ["sales"])
+
+    def test_group_calculate_feature_runs_the_feature_set_implementation(
+        self, sample_dataframe: pd.DataFrame, feature_set_sum: FeatureSet
+    ) -> None:
+        feature_set_sum.implementation = PandasAggregation
+        result = AggregatedFeatureGroup.calculate_feature(sample_dataframe, feature_set_sum)
+        assert result["sales__sum_aggr"].iloc[0] == 1500
+
+    @pytest.mark.parametrize(
+        "agg, dtype", [("min", "Int64"), ("max", "Int64"), ("mean", "Float64"), ("median", "Float64")]
+    )
+    def test_one_row_nullable_frame_with_non_zero_index_keeps_value(self, agg: str, dtype: str) -> None:
+        data = pd.DataFrame({"sales": pd.array([5], dtype="Int64")}, index=[7])
+        feature_set = FeatureSet()
+        feature_set.add(Feature(f"sales__{agg}_aggr"))
+        feature_set.implementation = PandasAggregation
+        result = AggregatedFeatureGroup.calculate_feature(data, feature_set)
+        column = result[f"sales__{agg}_aggr"]
+        assert list(result.index) == [7]
+        assert column.iloc[0] == 5
+        assert str(column.dtype) == dtype
+
+    def test_mean_on_tz_aware_datetime_returns_timestamp(self) -> None:
+        data = pd.DataFrame({"sales": pd.to_datetime(["2024-01-01", "2024-01-03"]).tz_localize("UTC")})
+        feature_set = FeatureSet()
+        feature_set.add(Feature("sales__mean_aggr"))
+        feature_set.implementation = PandasAggregation
+        result = AggregatedFeatureGroup.calculate_feature(data, feature_set)
+        column = result["sales__mean_aggr"]
+        assert str(column.dtype) == "datetime64[ns, UTC]" or str(column.dtype).endswith(", UTC]")
+        assert column.iloc[0] == pd.Timestamp("2024-01-02", tz="UTC")
+
+
+class TestPandasAggregatedZeroRow(PandasZeroRowAdapter, AggregatedZeroRowTestMixin):
+    feature_group_class = PandasAggregation
+
+
+class TestPandasAggregationCalculate(PandasZeroRowAdapter, AggregatedCalculateTestMixin):
+    feature_group_class = PandasAggregation
+
+
+class TestAggPandasIntegration:
+    """Integration tests for the aggregated feature group."""
+
+    def test_aggregation_with_data_creator(self) -> None:
+        """Test aggregation features with mloda."""
+
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {PandasAggregatedTestDataCreator, AggregatedFeatureGroup}
+        )
+
+        # Run the mloda with multiple aggregation features
+        result = mloda.run_all(
+            [
+                "sales",
+                "sales__sum_aggr",
+                "price__avg_aggr",
+                "discount__min_aggr",
+                "customer_rating__max_aggr",
+                "quantity__count_aggr",
+                "discount__median_aggr",
+                # "sales__std_aggr",
+                # "sales__var_aggr",
+            ],
+            compute_frameworks=[PandasDataFrame],
+            plugin_collector=plugin_collector,
+        )
+
+        validate_aggregated_features(result)

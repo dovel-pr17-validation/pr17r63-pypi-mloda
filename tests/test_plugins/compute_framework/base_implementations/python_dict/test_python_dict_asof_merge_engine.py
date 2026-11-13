@@ -1,0 +1,143 @@
+"""
+Tests for PythonDictMergeEngine.merge_asof (point-in-time / as-of join).
+
+Consumes the shared AsofMergeEngineSuite. PythonDict's native format is a columnar dict.
+"""
+
+import pytest
+
+from mloda._testing.compute_framework.merge_suite import AsofMergeEngineSuite
+from mloda._testing.framework_adapter import PythonDictAdapter
+from mloda.user import Index
+from mloda.core.abstract_plugins.components.link import AsOfJoinConfig
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_merge_engine import (
+    PythonDictMergeEngine,
+)
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    import pyarrow as pa
+except ImportError:
+    logger.warning("PyArrow is not installed. Some tests will be skipped.")
+    pa = None  # type: ignore[assignment, unused-ignore]
+
+
+class TestPythonDictAsofMergeEngine(AsofMergeEngineSuite):
+    """Unit tests for PythonDictMergeEngine.merge_asof."""
+
+    adapter_class = PythonDictAdapter
+
+    def test_nearest_direction(self) -> None:
+        """Vector F: PythonDict supports 'nearest' -> closer right row (t=8, gap 2) matched."""
+        left = {"k": [1], "t": [10], "lv": [100]}
+        right = {"k": [1, 1], "t": [8, 15], "rv": ["A", "B"]}
+
+        engine = PythonDictMergeEngine()
+        cfg = AsOfJoinConfig(left_time_column="t", right_time_column="t", direction="nearest")
+        result = engine.merge_asof(left, right, Index(("k",)), Index(("k",)), cfg)
+
+        assert len(result["rv"]) == 1
+        assert result["rv"][0] == "A"
+
+    def test_mixed_time_column_raises_value_error(self) -> None:
+        """A heterogeneous time column (int then str) is not orderable. The guard must scan all
+        non-null values, not just the first, and raise a clear ValueError naming the column
+        instead of letting a raw comparison TypeError surface later."""
+        left = {"k": ["a", "a"], "t": [1, "2025-06-01"], "lv": [1, 2]}
+        right = {"k": ["a"], "t": [1], "rv": [1.0]}
+
+        engine = PythonDictMergeEngine()
+        cfg = AsOfJoinConfig(left_time_column="t", right_time_column="t")
+        with pytest.raises(ValueError, match=r"'t'.*(datetime|numeric)"):
+            engine.merge_asof(left, right, Index(("k",)), Index(("k",)), cfg)
+
+    def test_tie_breaks_ascending_and_is_order_independent(self) -> None:
+        """
+        Tie determinism: two right rows share the identical boundary timestamp within a
+        by-key. The winner must be the row whose right non-key column values sort ASCENDING
+        (smallest wins), matching the sqlite backend fix (fc805f0), and the result must be
+        INDEPENDENT of right-input ordering.
+
+        Left {k:1, t:10, lv:1}; two right rows tie at t=10 (== left t, backward, allow_exact
+        default True): {k:1, t:10, rv:5} and {k:1, t:10, rv:2}. Expected exactly one row with
+        rv==2 regardless of which order the tied right rows are supplied in.
+        """
+        left = {"k": [1], "t": [10], "lv": [1]}
+        right_a = {"k": [1, 1], "t": [10, 10], "rv": [5, 2]}
+        right_b = {"k": [1, 1], "t": [10, 10], "rv": [2, 5]}
+
+        cfg = AsOfJoinConfig(
+            left_time_column="t",
+            right_time_column="t",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+
+        result_a = PythonDictMergeEngine().merge_asof(left, right_a, Index(("k",)), Index(("k",)), cfg)
+        assert len(result_a["rv"]) == 1
+        assert result_a["rv"][0] == 2
+
+        # Order-independence: reversed right input must yield the identical winner.
+        result_b = PythonDictMergeEngine().merge_asof(left, right_b, Index(("k",)), Index(("k",)), cfg)
+        assert len(result_b["rv"]) == 1
+        assert result_b["rv"][0] == 2
+
+    def test_coerce_z_suffix_utc_strings_join(self) -> None:
+        """Z-suffixed UTC strings coerce as tz-aware and join."""
+        left = {"k": ["a"], "t": ["2025-06-03T00:00:00Z"], "lv": [1]}
+        right = {
+            "k": ["a", "a"],
+            "t": ["2025-06-01T00:00:00Z", "2025-06-04T00:00:00Z"],
+            "rv": [1.0, 2.0],
+        }
+
+        engine = PythonDictMergeEngine()
+        cfg = AsOfJoinConfig(
+            left_time_column="t",
+            right_time_column="t",
+            direction="backward",
+            coerce_time_columns=True,
+        )
+        result = engine.merge_asof(left, right, Index(("k",)), Index(("k",)), cfg)
+
+        assert len(result["rv"]) == 1
+        assert result["rv"][0] == 1.0
+
+    def test_coerce_date_only_z_value_raises(self) -> None:
+        """A date-only 'Z' value must raise ValueError, not be read as naive midnight."""
+        left = {"k": ["a"], "t": ["2025-06-03Z"], "lv": [1]}
+        right = {"k": ["a"], "t": ["2025-06-01Z"], "rv": [1.0]}
+
+        engine = PythonDictMergeEngine()
+        cfg = AsOfJoinConfig(
+            left_time_column="t",
+            right_time_column="t",
+            direction="backward",
+            coerce_time_columns=True,
+        )
+        with pytest.raises(ValueError, match="Invalid isoformat"):
+            engine.merge_asof(left, right, Index(("k",)), Index(("k",)), cfg)
+
+    def test_coerce_mixed_tz_naive_and_aware_raises(self) -> None:
+        """Coercion of a column mixing tz-aware and tz-naive ISO strings must raise ValueError:
+        datetime.fromisoformat parses both, but naive and aware datetimes are not mutually
+        orderable, so the engine must reject the mix explicitly instead of failing later."""
+        left = {
+            "k": ["a", "a"],
+            "t": ["2025-06-01T00:00:00+00:00", "2025-06-01T01:00:00"],
+            "lv": [1, 2],
+        }
+        right = {"k": ["a"], "t": ["2025-05-01T00:00:00"], "rv": [1.0]}
+
+        engine = PythonDictMergeEngine()
+        cfg = AsOfJoinConfig(
+            left_time_column="t",
+            right_time_column="t",
+            direction="backward",
+            coerce_time_columns=True,
+        )
+        with pytest.raises(ValueError, match=r"(?i)mix"):
+            engine.merge_asof(left, right, Index(("k",)), Index(("k",)), cfg)

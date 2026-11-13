@@ -1,0 +1,88 @@
+"""Reads a plugin's declared_attributes(features) into a validated, scalar-only, fresh dict."""
+
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from mloda.core.abstract_plugins.components.credential_scrub import scrub_credentials
+from mloda.core.abstract_plugins.components.utils import safe_field_with_error
+
+_INT_MIN = -(2**63)
+_INT_MAX = 2**63 - 1
+
+
+def scalar_attributes(attributes: Any, label: str, mapping_error: str) -> dict[str, str | int | float | bool]:
+    """Return a fresh dict of finite, int64-range scalars; raise TypeError on a non-Mapping or non-str key."""
+    if not isinstance(attributes, Mapping):
+        raise TypeError(f"{label} {mapping_error}, got {type(attributes).__name__}")
+    result: dict[str, str | int | float | bool] = {}
+    for key, value in attributes.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{label} keys must be str, got {type(key).__name__}")
+        if isinstance(value, bool):
+            result[key] = bool(value)
+        elif isinstance(value, int):
+            number = int(value)
+            if _INT_MIN <= number <= _INT_MAX:
+                result[key] = number
+        elif isinstance(value, float):
+            decimal = float(value)
+            if math.isfinite(decimal):
+                result[key] = decimal
+        elif isinstance(value, str):
+            result[key] = str.__str__(value)
+    return result
+
+
+def read_declared_attributes(owner: Any, features: Any) -> dict[str, str | int | float | bool]:
+    """Return owner.declared_attributes(features) as a fresh dict; raise TypeError on a non-Mapping or non-str key."""
+    return scalar_attributes(owner.declared_attributes(features), "declared_attributes", "must return a Mapping")
+
+
+def unmet_declaration_reason(
+    consumer: str, owner: str, declared: Mapping[str, Any], required: Mapping[str, Any]
+) -> str | None:
+    """None when declared meets required; a None required value means any declared value (equal and same type else)."""
+    for key, want in required.items():
+        if key not in declared:
+            have = "none" if not declared else "no such key"
+            return f"{consumer} requires declared '{key}'; {owner} declares {have}"
+        got = declared[key]
+        if want is not None and not (got == want and type(got) is type(want)):
+            return f"{consumer} requires declared '{key}' == {want!r}; {owner} declares {got!r}"
+    return None
+
+
+_Declarations = dict[type, tuple[dict[str, str | int | float | bool], str | None]]
+
+
+def contained_declarations(owner: type, memo: _Declarations) -> tuple[dict[str, str | int | float | bool], str | None]:
+    """Plan-time declarations of owner and the contained raise text, read once per memo."""
+    if owner not in memo:
+        fallback: dict[str, str | int | float | bool] = {}
+        declared, error = safe_field_with_error(lambda: read_declared_attributes(owner, None), fallback)
+        memo[owner] = (declared, None if error is None else scrub_credentials(error))
+    return memo[owner]
+
+
+@dataclass(frozen=True)
+class DeclarationRequirement:
+    """A consumer's requirements plus the candidate feature group's own declarations."""
+
+    consumer: str
+    required: Mapping[str, Any]
+    owner: type
+    memo: _Declarations
+
+    def unmet_reason(self, owner_name: str, reader: type | None) -> str | None:
+        """Reason the merged {group, reader} declarations miss the requirement, else None; reads them lazily."""
+        owner_declared, error = contained_declarations(self.owner, self.memo)
+        declared = dict(owner_declared)
+        if reader is not None:
+            reader_declared, reader_error = contained_declarations(reader, self.memo)
+            declared.update(reader_declared)
+            error = error or reader_error
+        if error is not None:
+            return f"{self.consumer} requires declarations of {owner_name}; reading them raised: {error}"
+        return unmet_declaration_reason(self.consumer, owner_name, declared, self.required)

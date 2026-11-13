@@ -1,0 +1,355 @@
+"""Implementation: a plugin that serves one (Source or Operation FeatureGroup, ComputeFramework) pair."""
+
+import inspect
+import typing
+import weakref
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Mapping
+from contextvars import ContextVar
+from typing import Any, ClassVar, Generic, TypeVar
+
+from mloda.core.abstract_plugins.components.base_feature_group_version import (
+    BaseFeatureGroupVersion,
+    ThirdPartyVersionMode,
+)
+from mloda.core.abstract_plugins.components.divergence import (
+    Divergence,
+    DivergenceKind,
+    DivergenceSource,
+    allowed_variants,
+    divergence_order,
+    stamped,
+    validate_divergences,
+)
+from mloda.core.abstract_plugins.components.credential_scrub import scrub_credentials
+from mloda.core.abstract_plugins.components.utils import get_all_subclasses, is_nominal_subclass
+from mloda.core.abstract_plugins.components.var_scope import VarScope
+from mloda.core.abstract_plugins.components.subclass_registry import SubclassRegistry
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.abstract_plugins.components.input_data.source_feature_group import SourceFeatureGroup
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.operation_feature_group import OperationFeatureGroup
+
+G = TypeVar("G", bound=FeatureGroup)
+
+_registry: SubclassRegistry[type["Implementation[Any]"]] = SubclassRegistry()
+
+
+_CONCRETE_VERDICTS: weakref.WeakKeyDictionary[type, bool] = weakref.WeakKeyDictionary()
+_PAIR_VERDICTS: weakref.WeakKeyDictionary[type, bool] = weakref.WeakKeyDictionary()
+
+# typing's private, uncached Generic subscription; the public one's LRU cache holds every argument strongly.
+_GENERIC_GETITEM: Callable[..., Any] = inspect.unwrap(
+    getattr(typing, "_generic_class_getitem", None) or Generic.__dict__["__class_getitem__"].__func__
+)
+
+
+def _has_abstract_member(cls: Any) -> bool:
+    """Any abstract member left; checked by hand because ABCMeta sets the flag after __init_subclass__."""
+    return any(getattr(inspect.getattr_static(cls, name, None), "__isabstractmethod__", False) for name in dir(cls))
+
+
+def _is_concrete(cls: Any) -> bool:
+    """No abstract member left; the verdict is cached after class creation."""
+    if cls not in _CONCRETE_VERDICTS:
+        _CONCRETE_VERDICTS[cls] = not _has_abstract_member(cls)
+    return _CONCRETE_VERDICTS[cls]
+
+
+def _serves_groups(group: Any) -> bool:
+    return is_nominal_subclass(group, (SourceFeatureGroup, OperationFeatureGroup))
+
+
+def _declared_groups(node: Any, subst: Mapping[Any, Any]) -> list[type]:
+    """Every concrete G bound by an Implementation[G] reachable from node, resolving TypeVars through generic bases."""
+    origin = typing.get_origin(node) or node
+    args = [subst.get(a, a) if isinstance(a, TypeVar) else a for a in typing.get_args(node)]
+    if origin is Implementation:
+        group = args[0] if args else None
+        return [group] if isinstance(group, type) and group is not Any and typing.get_origin(group) is None else []
+    if not is_nominal_subclass(origin, Implementation):
+        return []
+    mapping = dict(zip(getattr(origin, "__parameters__", ()), args))
+    declared: list[type] = []
+    for base in origin.__dict__.get("__orig_bases__", origin.__bases__):
+        declared.extend(_declared_groups(base, mapping))
+    return declared
+
+
+def _mismatched_group(cls: Any, group: Any) -> type | None:
+    return next((g for g in _declared_groups(cls, {}) if not is_nominal_subclass(group, g)), None)
+
+
+def _names_a_pair(cls: Any) -> bool:
+    group = getattr(cls, "feature_group", None)
+    framework = getattr(cls, "compute_framework", None)
+    return (
+        _serves_groups(group)
+        and _mismatched_group(cls, group) is None
+        and is_nominal_subclass(framework, ComputeFramework)
+    )
+
+
+def _is_pair(cls: Any) -> bool:
+    """Names a valid pair; the verdict is cached after class creation."""
+    if cls not in _PAIR_VERDICTS:
+        _PAIR_VERDICTS[cls] = _names_a_pair(cls)
+    return _PAIR_VERDICTS[cls]
+
+
+def _canonical_subtype(group: type[FeatureGroup], feature_name: str, options: Options) -> str | None:
+    subtype = group.resolve_subtype(feature_name, options)
+    if subtype is None:
+        return None
+    canonical = group.canonical_subtype(subtype)
+    return canonical if canonical in group.subtype_universe() else None
+
+
+class Implementation(ABC, Generic[G]):
+    """Names its pair with feature_group and compute_framework and computes it in calculate.
+
+    An overriding `__init_subclass__` must call super(), which registers the class.
+    """
+
+    feature_group: ClassVar[type[FeatureGroup]]
+    compute_framework: ClassVar[type[ComputeFramework]]
+    supported: ClassVar[frozenset[str] | None] = None
+    divergences: ClassVar[tuple[Divergence, ...]] = ()
+
+    def __class_getitem__(cls, params: Any) -> Any:
+        """Subscribe without typing's cache, so a reloaded or redefined group can be reclaimed."""
+        return _GENERIC_GETITEM(cls, params)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "DIVERGENCES" in cls.__dict__:
+            raise TypeError(f"{cls.__name__} declares 'DIVERGENCES'; an Implementation spells it divergences.")
+        if "divergent" in cls.__dict__:
+            raise TypeError(f"{cls.__name__} declares 'divergent'; an Implementation declares divergences.")
+        for name in ("contract_version", "CONTRACT_VERSION"):
+            if name in cls.__dict__:
+                raise TypeError(f"{cls.__name__} declares '{name}'; the FeatureGroup declares the contract version.")
+        if _has_abstract_member(cls):
+            _registry.add(cls)  # a decorator may still make it concrete
+            return
+        group: Any = getattr(cls, "feature_group", None)
+        framework = getattr(cls, "compute_framework", None)
+        if not _serves_groups(group):
+            raise TypeError(
+                f"{cls.__name__} must set feature_group to a SourceFeatureGroup or OperationFeatureGroup subclass."
+            )
+        declared = _mismatched_group(cls, group)
+        if declared is not None:
+            raise TypeError(
+                f"{cls.__name__}.feature_group must be {declared.__name__} or a subclass "
+                f"(Implementation[{declared.__name__}]), got {group.__name__}."
+            )
+        if not is_nominal_subclass(framework, ComputeFramework):
+            raise TypeError(f"{cls.__name__} must set compute_framework to a ComputeFramework subclass.")
+        validate_divergences(
+            cls.__name__,
+            cls.divergences,
+            group.subtype_universe,
+            group.OUTPUT_PARTS,
+            variants=group.VARIANTS,
+        )
+        _registry.add(cls)
+
+    @classmethod
+    def version(cls) -> str:
+        """Version: mloda version, module name and the implementation hash of the code this class runs."""
+        return BaseFeatureGroupVersion.version(cls)
+
+    @classmethod
+    def version_third_party_mode(cls) -> ThirdPartyVersionMode:
+        """Whether version()'s hash reacts to reachable third-party dependency versions; INCLUDE by default."""
+        return ThirdPartyVersionMode.INCLUDE
+
+    @classmethod
+    def accepts(cls, feature_name: str, options: Options, *, part: str | None = None) -> bool:
+        """Whether this implementation can compute the concrete feature; True by default.
+        ``part`` is the requested declared output part, None for the whole feature.
+        A rejection here is per feature and does not show in subtype_support_matrix()."""
+        return True
+
+    @classmethod
+    def canonical_subtype(cls, group: type[FeatureGroup], feature_name: str, options: Options) -> str | None:
+        """The feature's canonical subtype when the group declares it, else None."""
+        return _canonical_subtype(group, feature_name, options)
+
+    @classmethod
+    def divergence_records(cls) -> tuple[Divergence, ...]:
+        """The declared divergences, stamped with the implementation source and this class's framework."""
+        framework = cls.compute_framework.get_class_name()
+        return tuple(stamped(r, DivergenceSource.IMPLEMENTATION, framework) for r in cls.divergences)
+
+    @classmethod
+    def divergences_for(
+        cls,
+        group: type[FeatureGroup],
+        feature_name: str,
+        options: Options,
+        *,
+        parts: frozenset[str] | None = None,
+    ) -> tuple[Divergence, ...]:
+        """The stamped non-GAP records that apply to the feature; parts is None for the whole feature."""
+        subtype = _canonical_subtype(group, feature_name, options)
+        return tuple(
+            r for r in cls.divergence_records() if r.kind is not DivergenceKind.GAP and r.applies_to(subtype, parts)
+        )
+
+    @classmethod
+    @abstractmethod
+    def calculate(cls, group: type[G], data: Any, features: FeatureSet, framework: ComputeFramework | None) -> Any:
+        """Compute the features; data is the input frame for an operation group, the SourceMatch for a source group."""
+
+
+def step_divergences(
+    group: type[FeatureGroup], implementation: type[Implementation[Any]] | None, features: FeatureSet
+) -> tuple[Divergence, ...]:
+    """Stamped group and implementation records applying to any feature of the set, GAP included, sorted."""
+    records = group.divergence_records() + (implementation.divergence_records() if implementation else ())
+    if not records:
+        return ()
+    found: set[Divergence] = set()
+    for feature in features.features:
+        subtype = _canonical_subtype(group, str(feature.name), feature.options)
+        parts = feature.requested_parts if feature.parts_only else None
+        found.update(r for r in records if r.applies_to(subtype, parts))
+    return tuple(sorted(found, key=divergence_order))
+
+
+def step_allowed_variants(features: FeatureSet) -> tuple[str, ...]:
+    """The sorted, credential-scrubbed union of the variants the set's features allow."""
+    allowed = frozenset().union(*(allowed_variants(f.options) for f in features.features))
+    return tuple(sorted(scrub_credentials(v) for v in allowed))
+
+
+def unallowed_variants(
+    group: type[FeatureGroup],
+    implementation: type[Implementation[Any]] | None,
+    feature_name: str,
+    options: Options,
+    part: str | None,
+) -> tuple[Divergence, ...]:
+    """The implementation's VARIANT records that apply to the feature and that it does not allow.
+
+    A variant the group does not list is never allowed."""
+    if implementation is None or not is_nominal_subclass(group, OperationFeatureGroup):
+        return ()
+    if not any(r.kind is DivergenceKind.VARIANT for r in implementation.divergences):
+        return ()
+    allowed = allowed_variants(options) & group.VARIANTS
+    parts = None if part is None else frozenset({part})
+    return tuple(
+        r
+        for r in implementation.divergences_for(group, feature_name, options, parts=parts)
+        if r.kind is DivergenceKind.VARIANT and r.variant not in allowed
+    )
+
+
+def variant_fix(
+    group: type[FeatureGroup],
+    blocked: Mapping[type[ComputeFramework], tuple[Divergence, ...]],
+    options: Options,
+) -> tuple[str, ...]:
+    """The allow_variants value that admits a blocked framework, empty when none is fully listed."""
+    admittable = [found for found in blocked.values() if all(r.variant in group.VARIANTS for r in found)]
+    listed = {str(r.variant) for found in admittable for r in found}
+    if not listed:
+        return ()
+    return tuple(sorted((allowed_variants(options) & group.VARIANTS) | listed))
+
+
+def variant_block_reason(
+    group: type[FeatureGroup],
+    blocked: Mapping[type[ComputeFramework], tuple[Divergence, ...]],
+    served: Mapping[type[ComputeFramework], type[Implementation[Any]] | None],
+    options: Options,
+    target: str = "the feature's options",
+) -> str:
+    """Why each blocked framework is dropped, with the allow_variants line that would admit it."""
+    listed = {
+        cfw: sorted({str(r.variant) for r in found if r.variant in group.VARIANTS}) for cfw, found in blocked.items()
+    }
+    suggested = sorted((allowed_variants(options) & group.VARIANTS) | {n for v in listed.values() for n in v})
+    suggestion = ", ".join(f'"{n}"' for n in suggested) + ("," if len(suggested) == 1 else "")
+    reasons = []
+    for cfw in sorted(blocked, key=lambda c: c.get_class_name()):
+        impl = served[cfw]
+        who = f"{impl.__name__ if impl else cfw.get_class_name()} on {cfw.get_class_name()} follows"
+        unlisted = sorted({str(r.variant) for r in blocked[cfw]} - set(listed[cfw]))
+        if unlisted:
+            quoted = ", ".join(f"'{n}'" for n in unlisted)
+            reasons.append(
+                f"{who} {'variants' if len(unlisted) > 1 else 'variant'} {quoted}, which "
+                f"{group.__name__}.VARIANTS does not list, so it cannot be allowed"
+            )
+        if listed[cfw]:
+            quoted = ", ".join(f"'{n}'" for n in listed[cfw])
+            reasons.append(
+                f"{who} {'variants' if len(listed[cfw]) > 1 else 'variant'} {quoted}, which this feature "
+                f'does not allow; to allow it add {{"allow_variants": ({suggestion})}} to {target}'
+            )
+    return "; ".join(reasons)
+
+
+def named_implementations(
+    name: str, implementations: Iterable[type[Implementation[Any]]]
+) -> list[type[Implementation[Any]]]:
+    """The implementations a pin name selects: bare class name or module:qualname."""
+    return [c for c in implementations if name in (c.__name__, f"{c.__module__}:{c.__qualname__}")]
+
+
+def serving_implementation(
+    group: type[FeatureGroup],
+    compute_framework: type[ComputeFramework],
+    implementations: Iterable[type[Implementation[Any]]],
+    stop_after: str | None = None,
+) -> type[Implementation[Any]] | None:
+    """The most derived implementation for group and framework (group MRO outer, framework MRO inner)."""
+    by_pair: dict[tuple[type, type], list[type[Implementation[Any]]]] = {}
+    for impl in implementations:
+        by_pair.setdefault((impl.feature_group, impl.compute_framework), []).append(impl)
+    for klass in group.__mro__:
+        for framework_class in compute_framework.__mro__:
+            candidates = by_pair.get((klass, framework_class))
+            if candidates:
+                return next(
+                    c for c in candidates if not any(o is not c and is_nominal_subclass(o, c) for o in candidates)
+                )
+        if stop_after is not None and stop_after in klass.__dict__:
+            return None
+    return None
+
+
+def loaded_implementations() -> list[type[Implementation[Any]]]:
+    """Concrete loaded Implementation classes naming a valid pair."""
+    return [impl for impl in _registry.members() if _is_concrete(impl) and _is_pair(impl)]
+
+
+def unregistered_named_implementations(name: str) -> list[type[Implementation[Any]]]:
+    """Live concrete Implementation subclasses matching a pin name that skipped registration."""
+    registered = _registry.members()
+    named = named_implementations(name, get_all_subclasses(Implementation))
+    return [impl for impl in named if impl not in registered and _is_concrete(impl) and _is_pair(impl)]
+
+
+_ACCESSIBLE: ContextVar[frozenset[type[Implementation[Any]]] | None] = ContextVar(
+    "mloda_accessible_implementations", default=None
+)
+
+
+def accessible_implementations(
+    implementations: Iterable[type[Implementation[Any]]],
+) -> VarScope[frozenset[type[Implementation[Any]]] | None]:
+    """Make the run's accessible implementations current for capability checks inside the block."""
+    return VarScope(_ACCESSIBLE, frozenset(implementations))
+
+
+def current_implementations() -> Iterable[type[Implementation[Any]]]:
+    """The accessible implementations of the run being planned, else every loaded one."""
+    accessible = _ACCESSIBLE.get()
+    return loaded_implementations() if accessible is None else accessible

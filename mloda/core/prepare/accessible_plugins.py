@@ -1,0 +1,613 @@
+from __future__ import annotations
+
+import inspect
+import itertools
+import logging
+import sys
+from collections.abc import Sequence
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+from mloda.core.abstract_plugins.components.base_feature_group_version import (
+    SOURCE_INTROSPECTION_ERRORS,
+    BaseFeatureGroupVersion,
+)
+from mloda.core.abstract_plugins.components.plugin_option.plugin_collector import (
+    PluginCollector,
+    strict_mode_from_env,
+)
+from mloda.core.abstract_plugins.plugin_registry.plugin_policy import _module_matches_prefix
+from mloda.core.abstract_plugins.plugin_registry.plugin_registry import PluginRegistry
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework, compute_framework_subclasses
+from mloda.core.abstract_plugins.feature_group import FeatureGroup, feature_group_subclasses
+from mloda.core.abstract_plugins.function_extender import Extender
+from mloda.core.abstract_plugins.implementation import (
+    Implementation,
+    accessible_implementations,
+    loaded_implementations,
+)
+from mloda.core.abstract_plugins.operation_feature_group import OperationFeatureGroup
+from mloda.core.abstract_plugins.components.utils import get_all_subclasses, is_nominal_subclass, safe_field
+
+if TYPE_CHECKING:
+    from mloda.core.prepare.resolution_types import ResolutionRecord
+
+logger = logging.getLogger(__name__)
+
+_warned_unregistered: set[str] = set()
+
+
+def _warn_once_unregistered(unregistered_names: list[str], plugin_kind: str) -> None:
+    """Warn about registry-missing plugins, remembering names so each is warned at most once across runs."""
+    new_names = [name for name in unregistered_names if name not in _warned_unregistered]
+    if new_names:
+        _warned_unregistered.update(new_names)
+        logger.warning("%s not registered in the plugin registry: %s.", plugin_kind, ", ".join(new_names))
+
+
+def _qualified_name(cls: type[Any]) -> str:
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+_PluginClassT = TypeVar("_PluginClassT", bound=type[Any])
+
+FeatureGroupEnvironmentMapping = dict[type[FeatureGroup], set[type[ComputeFramework]]]
+
+
+def registry_for(plugin_collector: PluginCollector | None) -> PluginRegistry:
+    """Return the collector's injected registry when set, else the default registry."""
+    if plugin_collector is not None and plugin_collector.registry is not None:
+        return plugin_collector.registry
+    return PluginRegistry.default()
+
+
+# The wheel owns both roots (pyproject packages: mloda*, mloda_plugins*), minus the namespaces below that
+# are reserved for third-party distributions.
+_FIRST_PARTY_ROOTS = frozenset({"mloda", "mloda_plugins"})
+
+# ``mloda`` is a shared PEP 420 namespace: pyproject keeps these out of the wheel and other distributions
+# (mloda-registry) ship into them ([tool.setuptools.packages.find] exclude).
+_THIRD_PARTY_NAMESPACES = frozenset({"mloda.community", "mloda.enterprise", "mloda.registry", "mloda.testing"})
+
+
+def _is_bundled_plugin(cls: type[Any]) -> bool:
+    """True for classes shipped in the mloda wheel (package root ``mloda`` or ``mloda_plugins``).
+
+    ComputeFrameworks are the only kind with this bypass. FeatureGroups and Extenders cannot get one:
+    registry membership is their sole strict-mode gate, and bundled ones already earn an entry by being
+    loaded (``PluginLoader`` scans ``mloda_plugins``) or listed in ``CORE_PLUGIN_MODULES``. Exempting them
+    by package root instead would gut the gate the registry exists to provide; the first-party registration
+    guard test is what keeps that list honest.
+
+    ``_THIRD_PARTY_NAMESPACES`` is excluded: those are shared-namespace third-party packages, not in the
+    wheel, so they stay registry-gated.
+    """
+    module = cls.__module__
+    if module.split(".", 1)[0] not in _FIRST_PARTY_ROOTS:
+        return False
+    return not any(_module_matches_prefix(module, namespace) for namespace in _THIRD_PARTY_NAMESPACES)
+
+
+def filter_extenders_by_strict_mode(
+    extenders: set[Extender] | None,
+    plugin_collector: PluginCollector | None,
+) -> set[Extender] | None:
+    """Filter function-extender instances by the registry strict mode."""
+    if extenders is None:
+        return extenders
+
+    strict_mode = plugin_collector.strict_mode if plugin_collector is not None else strict_mode_from_env()
+    if strict_mode == "off":
+        return extenders
+
+    registered = registry_for(plugin_collector).registered_classes()
+    unregistered = {extender for extender in extenders if type(extender) not in registered}
+    unregistered_names = sorted({f"{type(e).__module__}:{type(e).__qualname__}" for e in unregistered})
+
+    if strict_mode == "warn":
+        _warn_once_unregistered(unregistered_names, "Extenders")
+        return extenders
+
+    gates = sorted(
+        {
+            f"{type(e).__module__}:{type(e).__qualname__}"
+            for e in unregistered
+            if e.never_fall_back or e.raise_on_run_complete
+        }
+    )
+    if gates:
+        raise EnvironmentPreconditionError(
+            f"Strict mode found unregistered gate Extenders: {', '.join(gates)}. Register them in the plugin registry."
+        )
+
+    if unregistered:
+        logger.warning(
+            "Strict mode dropped Extenders not registered in the plugin registry: %s.",
+            ", ".join(unregistered_names),
+        )
+    return extenders - unregistered
+
+
+class EnvironmentPreconditionError(ValueError):
+    """Raised when one of mloda's OWN preconditions for building the environment fails.
+
+    Marks mloda's policy failing (nothing loaded, strict mode filtering everything out) as opposed to a
+    plugin failing, which propagates raw so callers can attribute it to that plugin. Each message is
+    already a complete user-facing sentence naming its own fix, so callers project it as-is. Subclasses
+    ``ValueError`` so existing ``except ValueError:`` callers stay compatible. An error raised after planning
+    carries the resolved records in ``partial_records``.
+    """
+
+    def __init__(self, message: str, partial_records: Sequence[ResolutionRecord] = ()) -> None:
+        super().__init__(message)
+        self.partial_records: tuple[ResolutionRecord, ...] = tuple(deepcopy(record) for record in partial_records)
+
+
+class RedefinitionConflictError(ValueError):
+    """Raised by dedup when same-key FeatureGroup classes differ in source.
+
+    The message is a complete user-facing text that callers project as-is. Subclasses ``ValueError``
+    so existing ``except ValueError:`` callers stay compatible.
+    """
+
+
+class FrameworkDeclarationError(ValueError):
+    """A FeatureGroup raised while declaring its compute frameworks; carries the culprit's identity.
+
+    The environment build always attributes the culprit on every path (engine and resolve_feature), so the
+    broken plugin is named rather than its raw exception propagated (#850). The message is a complete
+    user-facing sentence that callers project as-is. Subclasses ``ValueError`` like the sibling build errors.
+    """
+
+    def __init__(self, feature_group_identity: str, original: BaseException) -> None:
+        self.feature_group_identity = feature_group_identity
+        super().__init__(
+            f"Failed to build the plugin environment: {type(original).__name__}: {original} "
+            f"(raised by {feature_group_identity} while declaring its compute frameworks)"
+        )
+
+
+def _running_in_zmq_shell() -> bool:
+    """Detect IPython kernel (Jupyter) environment for the kernel-restart hint."""
+    try:
+        from IPython import get_ipython  # type: ignore[attr-defined]
+    except ImportError:
+        return False
+
+    ipython_instance = get_ipython()  # type: ignore[no-untyped-call]
+    if ipython_instance is None:
+        return False
+    return bool(ipython_instance.__class__.__name__ == "ZMQInteractiveShell")
+
+
+def _safe_class_source_hash(cls: type[Any]) -> str | None:
+    """Return source hash for a FeatureGroup subclass or None if unavailable.
+
+    ``inspect.getsource`` raises ``OSError`` (no source backing) or ``TypeError``
+    (built-in class) for classes built dynamically via ``type()``. Both leave the
+    class without a stable source hash, so we return ``None``.
+    """
+    return safe_field(
+        lambda: BaseFeatureGroupVersion.class_source_hash(cls), None, catching=SOURCE_INTROSPECTION_ERRORS
+    )
+
+
+def dedup_feature_group_subclasses(
+    classes: set[_PluginClassT],
+    allow_redefinition: bool = False,
+    kind: str = "FeatureGroup",
+) -> set[_PluginClassT]:
+    """Deduplicate FeatureGroup or Implementation subclasses sharing the same ``(module, qualname)``.
+
+    Long-lived namespaces (Jupyter notebooks, ``importlib.reload``) accumulate stale
+    class objects in ``FeatureGroup.__subclasses__()``. This helper collapses
+    identical-content duplicates silently and raises a clear ``ValueError`` when
+    duplicates differ in source (override via ``allow_redefinition=True``).
+    """
+    grouped: dict[tuple[str, str], list[_PluginClassT]] = {}
+    for cls in classes:
+        key = (cls.__module__, cls.__qualname__)
+        grouped.setdefault(key, []).append(cls)
+
+    survivors: set[_PluginClassT] = set()
+    conflicts: list[tuple[tuple[str, str], list[tuple[type[Any], str]]]] = []
+
+    for key, members in grouped.items():
+        if len(members) == 1:
+            survivors.add(members[0])
+            continue
+
+        # Factory pattern: groups whose members are not bound under their name in
+        # any module namespace are produced by factories or held only via
+        # closures. They are intentionally distinct objects, so preserve all.
+        if not _any_live_in_module(members):
+            logger.debug(
+                "dedup_feature_group_subclasses: preserving group %s (no member bound in its module)",
+                key,
+            )
+            survivors.update(members)
+            continue
+
+        # Live-descendants check: preserve the whole group if any member has
+        # subclasses already alive in the FG tree.
+        has_live_descendants = any(len(get_all_subclasses(member)) > 0 for member in members)
+        if has_live_descendants:
+            logger.debug("dedup_feature_group_subclasses: preserving group %s due to live descendants", key)
+            survivors.update(members)
+            continue
+
+        hashes = [_safe_class_source_hash(m) for m in members]
+        if any(h is None for h in hashes):
+            logger.debug("dedup_feature_group_subclasses: preserving group %s (source unavailable)", key)
+            survivors.update(members)
+            continue
+
+        hashes_str: list[str] = cast(list[str], hashes)
+        unique_hashes = set(hashes_str)
+        if len(unique_hashes) == 1:
+            survivor = _pick_survivor(members)
+            logger.debug(
+                "dedup_feature_group_subclasses: collapsed %d identical members of %s",
+                len(members),
+                key,
+            )
+            survivors.add(survivor)
+            continue
+
+        if allow_redefinition:
+            survivor = _pick_survivor(members)
+            logger.debug(
+                "dedup_feature_group_subclasses: kept newest of %d differing members of %s (allow_redefinition=True)",
+                len(members),
+                key,
+            )
+            survivors.add(survivor)
+            continue
+
+        conflicts.append((key, list(zip(members, hashes_str))))
+
+    if conflicts:
+        raise RedefinitionConflictError(_build_conflict_error(conflicts, kind))
+
+    return survivors
+
+
+def _pick_survivor(members: list[_PluginClassT]) -> _PluginClassT:
+    """Pick the live-in-module class.
+
+    Invariant: ``_pick_survivor`` is only called after ``_any_live_in_module(members)``
+    returned True at the dedup call site, so at least one member satisfies
+    ``_is_live_in_module``. And ``_is_live_in_module`` checks
+    ``getattr(module, cls.__name__, None) is cls``, which is single-valued: at most
+    one member can match because the module attribute resolves to exactly one
+    class object. The for-loop is therefore fully deterministic: set-iteration
+    order does not affect which class is returned.
+
+    The ``return members[-1]`` fallback is only theoretically reachable in
+    pathological multi-thread states where ``sys.modules`` is mutated between
+    ``_any_live_in_module`` and this call.
+    """
+    for cls in members:
+        if _is_live_in_module(cls):
+            return cls
+    return members[-1]
+
+
+def _is_live_in_module(cls: type[Any]) -> bool:
+    """True if ``cls`` is currently bound under its name in its own module."""
+    module = sys.modules.get(cls.__module__)
+    if module is None:
+        return False
+    return getattr(module, cls.__name__, None) is cls
+
+
+def _any_live_in_module(members: Sequence[type[Any]]) -> bool:
+    """True if any class is currently bound under its name in its module."""
+    return any(_is_live_in_module(cls) for cls in members)
+
+
+def _cell_label(cls: type[Any]) -> str | None:
+    """Return the first synthetic ``<...>`` filename a class's methods live in.
+
+    Returns ``None`` for classes whose methods all live in real source files.
+    Mirrors the synthetic-filename detection in ``_linecache_source_for_class``
+    but stops at the first match, sufficient for "where was this class defined"
+    in the redef-conflict error message.
+    """
+    for value in cls.__dict__.values():
+        func = value.__func__ if hasattr(value, "__func__") else value
+        code = getattr(func, "__code__", None)
+        if code is None:
+            continue
+        co_filename = code.co_filename
+        if co_filename.startswith("<") and co_filename.endswith(">"):
+            return str(co_filename)
+    return None
+
+
+def _build_conflict_error(
+    conflicts: list[tuple[tuple[str, str], list[tuple[type[Any], str]]]],
+    kind: str = "FeatureGroup",
+) -> str:
+    lines = [f"{kind} redefined with different source code:"]
+    for (module, qualname), hashed in conflicts:
+        for _cls, source_hash in hashed:
+            cell = _cell_label(_cls)
+            location = f"{module} {cell}" if cell else module
+            lines.append(f"  - {qualname} ({location}) source hash {source_hash[:8]}")
+    lines.append(
+        "Set PluginCollector(...).set_allow_redefinition() to keep only the most "
+        "recently defined version of each class."
+    )
+    if _running_in_zmq_shell():
+        lines.append("If you are running this in a notebook, restart the kernel to clear stale class definitions.")
+    return "\n".join(lines)
+
+
+class PreFilterPlugins:
+    def __init__(
+        self,
+        compute_frameworks: set[type[ComputeFramework]],
+        plugin_collector: PluginCollector | None = None,
+    ) -> None:
+        self.excluded_feature_groups: dict[type[FeatureGroup], str] = {}
+        self._unregistered_implementation_names: list[str] = []
+        self.implementations = self._set_implementations(plugin_collector)
+        feature_groups = self._set_feature_groups(plugin_collector)
+        compute_frameworks = self._set_compute_frameworks(compute_frameworks, plugin_collector)
+
+        with accessible_implementations(self.implementations):
+            self.accessible_plugins = self.resolve_feature_group_compute_framework_limitations(
+                feature_groups, compute_frameworks
+            )
+
+    def get_accessible_plugins(self) -> FeatureGroupEnvironmentMapping:
+        return self.accessible_plugins
+
+    @staticmethod
+    def _unregistered_enabled_hint(plugin_collector: PluginCollector | None, universe: set[type[FeatureGroup]]) -> str:
+        if plugin_collector is None:
+            return ""
+        names = sorted(
+            entry.__name__
+            for entry in plugin_collector.enabled_feature_group_classes
+            if is_nominal_subclass(entry, FeatureGroup) and entry is not FeatureGroup and entry not in universe
+        )
+        if not names:
+            return ""
+        return (
+            f" {names} subclass FeatureGroup without reaching FeatureGroup.__init_subclass__: "
+            "an __init_subclass__ override must call super().__init_subclass__()."
+        )
+
+    def _set_feature_groups(self, plugin_collector: PluginCollector | None = None) -> set[type[FeatureGroup]]:
+        accessible_feature_groups = self.get_featuregroup_subclasses()
+
+        loaded_universe_was_non_empty = bool(accessible_feature_groups)
+        unregistered_hint = self._unregistered_enabled_hint(plugin_collector, accessible_feature_groups)
+        if plugin_collector:
+            for accessible_fg in deepcopy(accessible_feature_groups):
+                if not plugin_collector.applicable_feature_group_class(accessible_fg):
+                    accessible_feature_groups.remove(accessible_fg)
+                    self.excluded_feature_groups[accessible_fg] = "disabled by the PluginCollector"
+        collector_filtered_everything = (
+            plugin_collector is not None and loaded_universe_was_non_empty and len(accessible_feature_groups) == 0
+        )
+
+        allow_redefinition = plugin_collector.allow_redefinition if plugin_collector is not None else False
+        strict_mode = plugin_collector.strict_mode if plugin_collector is not None else strict_mode_from_env()
+
+        registered: set[type[Any]] = set()
+        if strict_mode != "off":
+            registered = registry_for(plugin_collector).registered_classes()
+
+        if strict_mode == "strict":
+            before_strict = accessible_feature_groups
+            accessible_feature_groups = {
+                fg for fg in accessible_feature_groups if fg in registered or inspect.isabstract(fg)
+            }
+            for fg in before_strict - accessible_feature_groups:
+                self.excluded_feature_groups[fg] = (
+                    "dropped by strict mode: not registered in the plugin registry (a plugin policy may have denied it)"
+                )
+            if plugin_collector is not None:
+                dropped_enabled = sorted(
+                    f"{fg.__module__}:{fg.__qualname__}"
+                    for fg in before_strict - accessible_feature_groups
+                    if fg in plugin_collector.enabled_feature_group_classes
+                )
+                if dropped_enabled:
+                    logger.warning(
+                        "Explicitly enabled FeatureGroups were dropped by strict mode because they are "
+                        "not registered in the plugin registry: %s.",
+                        ", ".join(dropped_enabled),
+                    )
+            had_concrete = any(not inspect.isabstract(fg) for fg in before_strict)
+            has_concrete = any(not inspect.isabstract(fg) for fg in accessible_feature_groups)
+            if had_concrete and not has_concrete:
+                raise EnvironmentPreconditionError(
+                    "Strict mode filtered out all FeatureGroups: none of the accessible FeatureGroups "
+                    "are registered in the plugin registry. Register them via mloda.user.register_plugin() or "
+                    "relax MLODA_PLUGIN_REGISTRY_STRICT to disable strict mode."
+                )
+
+        accessible_feature_groups = dedup_feature_group_subclasses(
+            accessible_feature_groups, allow_redefinition=allow_redefinition
+        )
+
+        if strict_mode == "warn":
+            unregistered = sorted(
+                f"{fg.__module__}:{fg.__qualname__}"
+                for fg in accessible_feature_groups
+                if fg not in registered and not inspect.isabstract(fg)
+            )
+            kinds = [
+                kind
+                for kind, names in (
+                    ("FeatureGroups", unregistered),
+                    ("Implementations", self._unregistered_implementation_names),
+                )
+                if names
+            ]
+            _warn_once_unregistered(unregistered + self._unregistered_implementation_names, " and ".join(kinds))
+
+        will_raise_with_hint = collector_filtered_everything and len(accessible_feature_groups) == 0
+        if unregistered_hint and not will_raise_with_hint:
+            logger.warning("%s", unregistered_hint.strip())
+
+        if len(accessible_feature_groups) == 0:
+            if collector_filtered_everything:
+                raise EnvironmentPreconditionError(
+                    "The PluginCollector filtered out every FeatureGroup: none of the loaded FeatureGroups "
+                    "satisfied its enabled/disabled configuration. Adjust the classes passed to "
+                    "enabled_feature_groups()/disabled_feature_groups() (or the collector's applicability filter)."
+                    + unregistered_hint
+                )
+            raise EnvironmentPreconditionError("No feature groups are loaded. Did you call PluginLoader.all()?")
+        return accessible_feature_groups
+
+    def _set_implementations(
+        self, plugin_collector: PluginCollector | None = None
+    ) -> frozenset[type[Implementation[Any]]]:
+        allow_redefinition = plugin_collector.allow_redefinition if plugin_collector is not None else False
+        strict_mode = plugin_collector.strict_mode if plugin_collector is not None else strict_mode_from_env()
+
+        implementations = set(loaded_implementations())
+        if plugin_collector is not None:
+            implementations = {i for i in implementations if plugin_collector.applicable_implementation_class(i)}
+
+        if strict_mode != "off":
+            registered = registry_for(plugin_collector).registered_classes()
+            unregistered = {i for i in implementations if i not in registered}
+            names = sorted(f"{i.__module__}:{i.__qualname__}" for i in unregistered)
+            if strict_mode == "warn":
+                self._unregistered_implementation_names = names
+            elif unregistered:
+                logger.warning(
+                    "Strict mode dropped Implementations not registered in the plugin registry: %s.", ", ".join(names)
+                )
+                implementations -= unregistered
+
+        implementations = dedup_feature_group_subclasses(
+            implementations, allow_redefinition=allow_redefinition, kind="Implementation"
+        )
+        self._raise_on_conflicting_implementations(implementations)
+        return frozenset(implementations)
+
+    @staticmethod
+    def _raise_on_conflicting_implementations(implementations: set[type[Implementation[Any]]]) -> None:
+        by_pair: dict[tuple[type[Any], type[Any]], list[type[Implementation[Any]]]] = {}
+        for impl in implementations:
+            by_pair.setdefault((impl.feature_group, impl.compute_framework), []).append(impl)
+        for members in by_pair.values():
+            for first, second in itertools.combinations(sorted(members, key=_qualified_name), 2):
+                if is_nominal_subclass(first, second) or is_nominal_subclass(second, first):
+                    continue
+                raise EnvironmentPreconditionError(
+                    f"Implementations {_qualified_name(first)} and {_qualified_name(second)} both serve "
+                    f"{_qualified_name(first.feature_group)} on {_qualified_name(first.compute_framework)} and neither "
+                    "subclasses the other. Disable one with PluginCollector.add_disabled_implementation_classes(), "
+                    "or enable strict mode with a plugin policy that denies one of them."
+                )
+
+    def _set_compute_frameworks(
+        self,
+        compute_frameworks: set[type[ComputeFramework]],
+        plugin_collector: PluginCollector | None = None,
+    ) -> set[type[ComputeFramework]]:
+        compute_frameworks = compute_frameworks.intersection(self.get_cfw_subclasses())
+
+        strict_mode = plugin_collector.strict_mode if plugin_collector is not None else strict_mode_from_env()
+        if strict_mode == "off":
+            return compute_frameworks
+
+        registered = registry_for(plugin_collector).registered_classes()
+        # Bundled plugin frameworks ship with mloda, like abstract classes: never filtered or flagged.
+        unregistered = {
+            cfw
+            for cfw in compute_frameworks
+            if cfw not in registered and not inspect.isabstract(cfw) and not _is_bundled_plugin(cfw)
+        }
+        unregistered_names = sorted(f"{cfw.__module__}:{cfw.__qualname__}" for cfw in unregistered)
+
+        if strict_mode == "warn":
+            _warn_once_unregistered(unregistered_names, "ComputeFrameworks")
+            return compute_frameworks
+
+        surviving = compute_frameworks - unregistered
+        had_concrete = any(not inspect.isabstract(cfw) for cfw in compute_frameworks)
+        has_concrete = any(not inspect.isabstract(cfw) for cfw in surviving)
+        if had_concrete and not has_concrete:
+            raise EnvironmentPreconditionError(
+                "Strict mode filtered out all ComputeFrameworks: none of the requested ComputeFrameworks "
+                "are registered in the plugin registry. Register them via mloda.user.register_plugin() or "
+                "relax MLODA_PLUGIN_REGISTRY_STRICT to disable strict mode."
+            )
+        return surviving
+
+    def resolve_feature_group_compute_framework_limitations(
+        self,
+        feature_groups: set[type[FeatureGroup]],
+        compute_frameworks: set[type[ComputeFramework]],
+    ) -> FeatureGroupEnvironmentMapping:
+        # Fail closed: a provider that raises while declaring its frameworks aborts the build. The build
+        # always attributes a raising provider as FrameworkDeclarationError, on both the engine and
+        # resolve_feature paths (#850).
+        accessible_plugins: FeatureGroupEnvironmentMapping = {}
+        for feature_group in feature_groups:
+            try:
+                definition = feature_group.compute_framework_definition()
+            except Exception as exc:  # noqa: BLE001  attribute the culprit, then re-raise typed
+                identity = f"{feature_group.__module__}:{feature_group.__qualname__}"
+                raise FrameworkDeclarationError(identity, exc) from exc
+            new_set_of_compute_frameworks = {cp_fg for cp_fg in definition if cp_fg in compute_frameworks}
+            if is_nominal_subclass(feature_group, OperationFeatureGroup):
+                new_set_of_compute_frameworks = {
+                    cp_fg
+                    for cp_fg in new_set_of_compute_frameworks
+                    if feature_group.select_implementation(cp_fg, self.implementations) is not None
+                }
+                if not new_set_of_compute_frameworks and any(
+                    is_nominal_subclass(feature_group, impl.feature_group) for impl in self.implementations
+                ):
+                    reason = self._disabled_implementation_reason(feature_group, compute_frameworks)
+                    if reason is not None:
+                        # Also carries why an accessible group has an empty framework set.
+                        self.excluded_feature_groups[feature_group] = reason
+            accessible_plugins[feature_group] = new_set_of_compute_frameworks
+
+        return accessible_plugins
+
+    def _disabled_implementation_reason(
+        self, feature_group: type[OperationFeatureGroup], compute_frameworks: set[type[ComputeFramework]]
+    ) -> str | None:
+        rule = feature_group.compute_framework_rule()
+        loaded = loaded_implementations()
+        names = sorted(
+            f"{impl.__name__} implementation for {cfw.get_class_name()}"
+            for cfw in compute_frameworks
+            if rule is None or cfw in rule
+            if feature_group.select_implementation(cfw, self.implementations) is None
+            if (impl := feature_group.select_implementation(cfw, loaded)) is not None
+        )
+        if not names:
+            return None
+        if len(names) == 1:
+            return (
+                f"its {names[0]} is disabled or denied for this run; "
+                "re-enable it on the PluginCollector or register it in the plugin registry"
+            )
+        return (
+            f"its {', '.join(names)} are disabled or denied for this run; "
+            "re-enable them on the PluginCollector or register them in the plugin registry"
+        )
+
+    @staticmethod
+    def get_cfw_subclasses() -> set[type[ComputeFramework]]:
+        all_subclasses = compute_framework_subclasses()
+        available_subclasses = {cls for cls in all_subclasses if cls.is_available()}
+        return available_subclasses
+
+    @staticmethod
+    def get_featuregroup_subclasses() -> set[type[FeatureGroup]]:
+        return feature_group_subclasses()

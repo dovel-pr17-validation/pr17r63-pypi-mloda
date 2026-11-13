@@ -1,0 +1,239 @@
+from typing import Any
+import pytest
+import pyarrow as pa
+
+from mloda._testing.compute_framework.dtype_suite import DataTypeValidatorSuite, DtypeExtractionSuite
+from mloda._testing.compute_framework.frame_suite import AppendColumnsSuite, EmptyResultSuite
+from mloda._testing.framework_adapter import PyArrowAdapter
+from mloda.provider import EmptyResultError
+from mloda.user import FeatureName
+from mloda.user import ParallelizationMode
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from tests.helpers.availability_test_helper import (
+    assert_unavailable_when_import_blocked,
+)
+
+
+class TestPyArrowTableAvailability:
+    def test_is_available_when_pyarrow_not_installed(self) -> None:
+        """Test that is_available() returns False when pyarrow import fails."""
+        assert_unavailable_when_import_blocked(PyArrowTable, ["pyarrow"])
+
+
+class TestPyArrowTableComputeFramework:
+    @pytest.fixture
+    def pyarrow_table(self) -> PyArrowTable:
+        """Create a fresh PyArrowTable instance for each test."""
+        return PyArrowTable(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+    @pytest.fixture
+    def expected_data(self, dict_data: dict[str, list[int]]) -> Any:
+        """Create fresh expected PyArrow table for each test."""
+        return pa.table(dict_data)
+
+    def test_expected_data_framework(self, pyarrow_table: PyArrowTable) -> None:
+        assert pyarrow_table.expected_data_framework() == pa.Table
+
+    def test_transform_dict_to_table(
+        self, pyarrow_table: PyArrowTable, dict_data: dict[str, list[int]], expected_data: Any
+    ) -> None:
+        assert pyarrow_table.transform(dict_data, []) == expected_data
+
+    def test_transform_arrays(self) -> None:
+        chunked_array = pa.chunked_array([pa.array([1, 2]), pa.array([3])])
+        pa_array = pa.array([1, 2, 3])
+
+        for data in [chunked_array, pa_array]:
+            _pytable = PyArrowTable(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+            _pytable.set_data(pa.table({"existing_column": [4, 5, 6]}))
+
+            data = _pytable.transform(data=data, feature_names=["new_column"])
+            assert data.equals(pa.table({"existing_column": [4, 5, 6], "new_column": [1, 2, 3]}))
+
+    def test_transform_invalid_data(self, pyarrow_table: PyArrowTable) -> None:
+        with pytest.raises(ValueError):
+            pyarrow_table.transform(data=["a"], feature_names=[])
+
+    def test_select_data_by_column_names(self, pyarrow_table: PyArrowTable, expected_data: Any) -> None:
+        data = pyarrow_table.select_data_by_column_names(expected_data, [FeatureName("column1")])
+        assert data.schema.names == ["column1"]
+
+    def test_set_column_names(self, pyarrow_table: PyArrowTable, expected_data: Any) -> None:
+        pyarrow_table.data = expected_data
+        pyarrow_table.set_column_names()
+        assert pyarrow_table.column_names == {"column1", "column2"}
+
+
+class TestPyArrowDtypeExtractionSuite(DtypeExtractionSuite):
+    adapter_class = PyArrowAdapter
+
+
+class TestPyArrowDataTypeValidatorSuite(DataTypeValidatorSuite):
+    adapter_class = PyArrowAdapter
+
+
+class TestPyArrowEmptyResultSuite(EmptyResultSuite):
+    adapter_class = PyArrowAdapter
+
+
+class TestPyArrowAppendColumnsSuite(AppendColumnsSuite):
+    adapter_class = PyArrowAdapter
+
+    def single_column(self, values: list[Any]) -> Any | None:
+        return pa.array(values)
+
+
+class _FakeGuardFeatureGroup:
+    """Minimal FeatureGroup stand-in for the empty-result guard.
+
+    ``run_validate_output_features`` uses ``get_class_name()`` for the error message and
+    finally calls ``validate_output_features`` (no-op). The guard now keys purely on schema
+    presence (zero columns), so there is no opt-in flag to declare.
+    """
+
+    def get_class_name(self) -> str:
+        return "FakeGuardFeatureGroup"
+
+    def validate_output_features(self, data: Any, features: Any) -> None:
+        return None
+
+
+class _FakeGuardFeatures:
+    """Minimal FeatureSet stand-in for the empty-result guard.
+
+    The guard reads ``get_initial_requested_features()`` (non-empty so the guard
+    applies to a final feature). Past the guard, ``DataTypeValidator.validate``
+    iterates ``features.features``; an empty list makes validation a no-op.
+    """
+
+    def __init__(self) -> None:
+        self.features: list[Any] = []
+
+    def get_initial_requested_features(self) -> set[str]:
+        return {"a"}
+
+
+class _FakeGuardMultiFeatures:
+    """FeatureSet stand-in requesting two features.
+
+    Mirrors the real ``FeatureSet.get_initial_requested_features()``, which returns a
+    sorted tuple, so the rendered example dict has a deterministic order.
+    """
+
+    def __init__(self) -> None:
+        self.features: list[Any] = []
+
+    def get_initial_requested_features(self) -> tuple[str, ...]:
+        return ("a", "b")
+
+
+class TestPyArrowEmptyResultGuard:
+    """Direct unit tests for the EmptyResultError guard on a schema-bearing framework.
+
+    The guard firing end-to-end is only exercised via python_dict; this pins the guard
+    contract directly on PyArrow: zero COLUMNS raises, zero ROWS with a schema does not.
+    """
+
+    def test_zero_columns_raises_empty_result_error(self) -> None:
+        """A schema-less result (zero-column table) trips the guard for a final feature."""
+        framework = PyArrowTable(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        framework.data = pa.table({})
+        # run_calculation always sets column names before validating; the direct call mirrors that sequence.
+        framework.set_column_names()
+
+        with pytest.raises(EmptyResultError):
+            framework.run_validate_output_features(_FakeGuardFeatureGroup(), _FakeGuardFeatures())
+
+    def test_message_states_the_remedy_with_a_requested_feature_name(self) -> None:
+        """The guard message must name the remedy using an actually requested feature name.
+
+        ``_FakeGuardFeatures.get_initial_requested_features()`` requests ``"a"``, so the
+        example dict in the message has to read ``{"a": []}`` rather than a placeholder.
+        """
+        framework = PyArrowTable(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        framework.data = pa.table({})
+        framework.set_column_names()
+
+        with pytest.raises(EmptyResultError) as excinfo:
+            framework.run_validate_output_features(_FakeGuardFeatureGroup(), _FakeGuardFeatures())
+
+        message = str(excinfo.value)
+        assert "empty list" in message
+        assert '{"a": []}' in message
+
+    def test_message_lists_all_requested_feature_names(self) -> None:
+        """With several requested features, the example dict must list all of them.
+
+        Showing only the first name leads users to return a partial dict, which clears
+        this guard and then fails downstream on missing-column validation.
+        """
+        framework = PyArrowTable(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        framework.data = pa.table({})
+        framework.set_column_names()
+
+        with pytest.raises(EmptyResultError) as excinfo:
+            framework.run_validate_output_features(_FakeGuardFeatureGroup(), _FakeGuardMultiFeatures())
+
+        assert '{"a": [], "b": []}' in str(excinfo.value)
+
+    def test_zero_rows_with_schema_does_not_raise(self) -> None:
+        """A zero-row but column-bearing table is a valid result; the guard must not fire.
+
+        The call proceeds through DataTypeValidator.validate (no-op: no features with
+        declared data types) and validate_output_features (no-op fake).
+        """
+        framework = PyArrowTable(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        framework.data = pa.table({"a": pa.array([], pa.int64())})
+        # run_calculation always sets column names before validating; the direct call mirrors that sequence.
+        framework.set_column_names()
+
+        # Must not raise.
+        framework.run_validate_output_features(_FakeGuardFeatureGroup(), _FakeGuardFeatures())
+
+
+class TestPyArrowIsMissingColumnError:
+    def test_other_arrow_invalid_is_not_a_missing_column(self) -> None:
+        assert PyArrowTable.is_missing_column_error(pa.ArrowInvalid("Could not convert 'a' with type str")) is False
+
+
+def _arrow_framework() -> PyArrowTable:
+    return PyArrowTable(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+
+_ARROW_LENIENT = [
+    (pa.large_string(), "STRING"),
+    (pa.large_binary(), "BINARY"),
+]
+
+
+@pytest.mark.parametrize("arrow_type, expected", _ARROW_LENIENT, ids=[str(t) for t, _ in _ARROW_LENIENT])
+def test_extract_column_data_type_folds_inexact_arrow_types(arrow_type: pa.DataType, expected: str) -> None:
+    from mloda.user import DataType
+
+    table = pa.table({"c": pa.array([], type=arrow_type)})
+    assert _arrow_framework()._extract_column_data_type(table, "c") == DataType[expected]
+
+
+_ARROW_EXACT = [
+    (pa.int16(), None),
+    (pa.int32(), "INT32"),
+    (pa.large_string(), None),
+    (pa.timestamp("ns"), None),
+    (pa.decimal128(38, 18), "DECIMAL"),
+    (pa.decimal128(10, 2), None),
+    (pa.list_(pa.int64()), "LIST"),
+    (pa.timestamp("us", tz="UTC"), "TIMESTAMP_MICROS_TZ"),
+]
+
+
+@pytest.mark.parametrize("arrow_type, expected", _ARROW_EXACT, ids=[str(t) for t, _ in _ARROW_EXACT])
+def test_exact_column_data_type(arrow_type: pa.DataType, expected: str | None) -> None:
+    from mloda.user import DataType
+
+    table = pa.table({"c": pa.array([], type=arrow_type)})
+    result = _arrow_framework()._exact_column_data_type(table, "c")
+    assert result == (DataType[expected] if expected else None)
+
+
+def test_exact_column_data_type_missing_column_is_none() -> None:
+    assert _arrow_framework()._exact_column_data_type(pa.table({"c": [1]}), "nope") is None

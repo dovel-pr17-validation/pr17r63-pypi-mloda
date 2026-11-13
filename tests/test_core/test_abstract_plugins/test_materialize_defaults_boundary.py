@@ -1,0 +1,1042 @@
+"""Pin runtime materialization of declared PropertySpec defaults at the calculate_feature boundary (#796).
+
+``FeatureGroup.options_with_defaults`` (#766) fills absent PROPERTY_MAPPING keys that declare a concrete
+default, but the framework still hands the ORIGINAL pre-default FeatureSet to ``calculate_feature``, so a
+plugin reading ``feature.options`` directly never sees declared defaults. The pinned contract:
+
+- ``FeatureSet.materialize_option_defaults(feature_group)`` rebinds every ``feature.options`` (and
+  ``self.options``) through ``feature_group.options_with_defaults``, memoized by Options object identity so
+  aliased Options stay aliased, rebuilding ``self.features`` when anything was rebound (Feature.__hash__
+  includes options). It is an identity no-op when the feature group declares no concrete defaults, and it
+  never mutates the input Options objects.
+- ``ComputeFramework.run_calculate_feature`` invokes it up front, so BOTH the direct ``calculate_feature``
+  call and the FEATURE_GROUP_CALCULATE_FEATURE extender path observe materialized options: absent keys carry
+  their declared defaults, present values (even falsy) win, and an ``allow_explicit_none=True`` explicit
+  None is retained.
+
+The engine canonicalizes default-equivalent twins at intake, so the compute-boundary call is
+an idempotent safety net and its collapse ValueError is unreachable from engine-driven requests.
+"""
+
+from __future__ import annotations
+
+import pickle  # nosec B403
+import re
+from copy import copy
+from typing import Any, Callable
+from unittest.mock import patch
+from uuid import uuid4
+
+import pytest
+
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.components.validators.datatype_validator import DataTypeMismatchError
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.abstract_plugins.function_extender import Extender, ExtenderHook
+from mloda.provider import DataCreatorFeatureGroup, DefaultOptionKeys, PropertySpec
+from mloda.user import DataType, GlobalFilter, PluginCollector, mloda
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.base import AggregatedFeatureGroup
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.pyarrow import PyArrowAggregation  # noqa: F401
+from tests.test_core.test_abstract_plugins.name_bound_fixtures import make_name_bound_fg, make_root_fg
+from tests.test_plugins.integration_plugins.test_data_creator import ATestDataCreator
+
+
+# PROPERTY_MAPPING keys for the throwaway probes; the mdb_ prefix keeps them unique to this module.
+MDB_CTX_KEY = "mdb_ctx_default"  # context concrete default
+MDB_GRP_KEY = "mdb_grp_default"  # group concrete default (context=False)
+MDB_FALSY_KEY = "mdb_falsy_default"  # concrete default overridable by a falsy explicit value
+MDB_EN_KEY = "mdb_explicit_none_optin"  # allow_explicit_none=True with a concrete default
+MDB_SIBLING_KEY = "mdb_en_sibling_default"  # plain concrete default next to the opted-in key
+MDB_REQ_KEY = "mdb_required"  # NO_DEFAULT (no concrete default, never filled)
+
+CTX_DEFAULT = "mdb_ctx_val"
+GRP_DEFAULT = "mdb_grp_val"
+FALSY_DEFAULT = "mdb_nonfalsy"
+EN_DEFAULT = "mdb_en_val"
+SIBLING_DEFAULT = "mdb_sibling_val"
+
+
+def _make_boundary_probe_fg(feature_name: str) -> type[FeatureGroup]:
+    """A throwaway root FeatureGroup whose calculate_feature reads feature.options DIRECTLY.
+
+    It never calls options_with_defaults itself: the observed payload therefore proves (or
+    disproves) that the framework materialized the declared defaults before the call.
+    """
+
+    class MdbBoundaryProbeFeatureGroup(DataCreatorFeatureGroup):
+        PROPERTY_MAPPING = {
+            MDB_CTX_KEY: PropertySpec("A context concrete default.", context=True, default=CTX_DEFAULT),
+            MDB_GRP_KEY: PropertySpec("A group concrete default.", context=False, default=GRP_DEFAULT),
+            MDB_FALSY_KEY: PropertySpec("Overridable by a falsy explicit value.", context=True, default=FALSY_DEFAULT),
+        }
+
+        @classmethod
+        def feature_names_supported(cls) -> set[str]:
+            return {feature_name}
+
+        @classmethod
+        def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+            out: dict[str, list[Any]] = {}
+            for feature in features.features:
+                out[str(feature.name)] = [
+                    {
+                        "ctx": feature.options.get(MDB_CTX_KEY),
+                        "grp": feature.options.get(MDB_GRP_KEY),
+                        "falsy": feature.options.get(MDB_FALSY_KEY),
+                    }
+                ]
+            return out
+
+    return MdbBoundaryProbeFeatureGroup
+
+
+def _make_explicit_none_probe_fg(feature_name: str) -> type[FeatureGroup]:
+    """A throwaway root FeatureGroup pairing an opted-in explicit-None key with a plain default."""
+
+    class MdbExplicitNoneProbeFeatureGroup(DataCreatorFeatureGroup):
+        PROPERTY_MAPPING = {
+            MDB_EN_KEY: PropertySpec(
+                "Opted-in: an explicit None is honored.", context=True, default=EN_DEFAULT, allow_explicit_none=True
+            ),
+            MDB_SIBLING_KEY: PropertySpec("A plain context concrete default.", context=True, default=SIBLING_DEFAULT),
+        }
+
+        @classmethod
+        def feature_names_supported(cls) -> set[str]:
+            return {feature_name}
+
+        @classmethod
+        def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+            out: dict[str, list[Any]] = {}
+            for feature in features.features:
+                out[str(feature.name)] = [
+                    {
+                        "en": feature.options.get(MDB_EN_KEY),
+                        "sibling": feature.options.get(MDB_SIBLING_KEY),
+                    }
+                ]
+            return out
+
+    return MdbExplicitNoneProbeFeatureGroup
+
+
+def _make_unit_group_default_fg() -> type[FeatureGroup]:
+    """A throwaway FeatureGroup with a single group concrete default, for the FeatureSet unit tests."""
+
+    class MdbUnitGroupDefaultFeatureGroup(FeatureGroup):
+        PROPERTY_MAPPING = {
+            MDB_GRP_KEY: PropertySpec("A group concrete default.", context=False, default=GRP_DEFAULT),
+        }
+
+        @classmethod
+        def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+            return data
+
+    return MdbUnitGroupDefaultFeatureGroup
+
+
+def _make_unit_context_default_fg() -> type[FeatureGroup]:
+    """A throwaway FeatureGroup with a single context concrete default, for the collapse unit test."""
+
+    class MdbUnitContextDefaultFeatureGroup(FeatureGroup):
+        PROPERTY_MAPPING = {
+            MDB_CTX_KEY: PropertySpec("A context concrete default.", context=True, default=CTX_DEFAULT),
+        }
+
+        @classmethod
+        def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+            return data
+
+    return MdbUnitContextDefaultFeatureGroup
+
+
+def _make_unit_no_defaults_fg() -> type[FeatureGroup]:
+    """A throwaway FeatureGroup declaring no concrete defaults (NO_DEFAULT only)."""
+
+    class MdbUnitNoDefaultsFeatureGroup(FeatureGroup):
+        PROPERTY_MAPPING = {
+            MDB_REQ_KEY: PropertySpec("Required by omission (NO_DEFAULT).", context=True),
+        }
+
+        @classmethod
+        def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+            return data
+
+    return MdbUnitNoDefaultsFeatureGroup
+
+
+MDB_FIRST = "mdb_first"
+MDB_SECOND = "mdb_second"
+
+
+def _make_two_keys_fg(with_defaults: bool, seen: dict[str, Any]) -> type[FeatureGroup]:
+    return make_name_bound_fg(
+        "Mdb",
+        __name__,
+        "mdbop",
+        (MDB_FIRST, MDB_SECOND),
+        defaults={MDB_FIRST: "a", MDB_SECOND: "a"} if with_defaults else None,
+        seen=seen,
+        input_column="mdb_src",
+    )
+
+
+def _run_two_keys(
+    with_defaults: bool, name: str, options: Options | None = None, extender: Extender | None = None
+) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    fg = _make_two_keys_fg(with_defaults, seen)
+    source = make_root_fg("MdbTwoKeys", __name__, "mdb_src", [1, 2])
+    mloda.run_all(
+        [Feature(name, options if options is not None else Options())],
+        compute_frameworks=[PythonDictFramework],
+        plugin_collector=PluginCollector.enabled_feature_groups({fg, source}),
+        function_extender={extender} if extender is not None else None,
+    )
+    return seen
+
+
+class _AgreeingInFeaturesSource(ATestDataCreator):
+    compute_framework = PyArrowTable
+
+    @classmethod
+    def get_raw_data(cls) -> dict[str, Any]:
+        return {"agree_src": [1, 2, 3]}
+
+
+MDB_DIRECT = "mdb_src__mdbop_q_b"
+MDB_CHAINED = "mdb_src__mdbop_q_b__mdbop_r_c"
+
+
+def _run_direct_and_chained(
+    calls: list[list[str]],
+    extender: Extender | None = None,
+    framework: type[Any] | list[type[Any]] = PythonDictFramework,
+    append_columns: bool = False,
+    direct_first: bool = True,
+    include_direct: bool = True,
+    filter_on: str | None = None,
+    direct_data_type: DataType | None = None,
+    chained_options: Options | None = None,
+    direct_options: Options | None = None,
+    extra_requests: list[Feature] | None = None,
+    direct_compute_framework: str | None = None,
+    include_chained: bool = True,
+    replaces_rows: bool = False,
+    unbound_keys: tuple[str, ...] = (),
+    include_name_bound: bool = True,
+    root_calls: list[list[str]] | None = None,
+    root_append_columns: bool = False,
+    chained_input_compute_framework: str | None = None,
+) -> list[Any]:
+    fg = make_name_bound_fg(
+        "Mdb",
+        __name__,
+        "mdbop",
+        (MDB_FIRST, MDB_SECOND),
+        unbound_keys=unbound_keys,
+        defaults={key: "a" for key in (MDB_FIRST, MDB_SECOND, *unbound_keys)},
+        input_column="mdb_src",
+        calls=calls,
+        append_columns=append_columns,
+        replaces_rows=replaces_rows,
+        input_compute_framework=chained_input_compute_framework,
+    )
+    source = make_root_fg(
+        "MdbTwoKeys", __name__, "mdb_src", [1, 2], append_columns=root_append_columns, calls=root_calls
+    )
+    direct = Feature(
+        MDB_DIRECT,
+        direct_options if direct_options is not None else Options(),
+        data_type=direct_data_type,
+        compute_framework=direct_compute_framework,
+    )
+    chained = Feature(MDB_CHAINED, chained_options if chained_options is not None else Options())
+    requests = [direct, chained] if direct_first else [chained, direct]
+    if not include_direct:
+        requests = [chained]
+    if not include_chained:
+        requests = [direct]
+    if not include_name_bound:
+        requests = []
+    requests = requests + (extra_requests or [])
+    global_filter = None
+    if filter_on is not None:
+        global_filter = GlobalFilter()
+        global_filter.add_filter(filter_on, "min", {"value": 2})
+    return list(
+        mloda.run_all(
+            requests,
+            global_filter=global_filter,
+            compute_frameworks=framework if isinstance(framework, list) else [framework],
+            plugin_collector=PluginCollector.enabled_feature_groups({fg, source}),
+            function_extender={extender} if extender is not None else None,
+        )
+    )
+
+
+def _frame_columns(frame: Any) -> list[str]:
+    """Column names of an Arrow table, columnar dict, or list of row dicts."""
+    if isinstance(frame, dict):
+        return list(frame)
+    if isinstance(frame, list):
+        return list(frame[0])
+    return list(frame.column_names)
+
+
+def _column_values(frame: Any, name: str) -> list[Any]:
+    """Values of one column of an Arrow table, columnar dict, or list of row dicts."""
+    if isinstance(frame, dict):
+        return list(frame[name])
+    if isinstance(frame, list):
+        return [row[name] for row in frame]
+    return list(frame[name].to_pylist())
+
+
+def _single_row(frame: Any, column: str) -> Any:
+    """Extract the single payload row, tolerant of columnar dict or list-of-row-dicts results."""
+    if isinstance(frame, dict):
+        values = list(frame[column])
+    else:
+        values = [row[column] for row in frame]
+    assert len(values) == 1, f"expected exactly one row for {column}, got {values!r}"
+    return values[0]
+
+
+def _run_probe(
+    make_fg: Callable[[str], type[FeatureGroup]], feature_name: str, options: Options | None = None
+) -> dict[str, Any]:
+    """Run one tiny end-to-end computation and return the observed payload of the single feature.
+
+    The probe class and collector stay locals of THIS frame, so a failing assert in the
+    caller never pins the throwaway class in a traceback and the no-leak guard stays green.
+    """
+    fg = make_fg(feature_name)
+    collector = PluginCollector.enabled_feature_groups({fg})
+    results = mloda.run_all(
+        [Feature(feature_name, options if options is not None else Options())],
+        compute_frameworks=[PythonDictFramework],
+        plugin_collector=collector,
+    )
+    assert len(results) == 1, f"expected exactly one result frame, got: {results!r}"
+    payload = _single_row(results[0], feature_name)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _materialize(feature_set: FeatureSet, make_fg: Callable[[], type[FeatureGroup]]) -> None:
+    """Invoke ``FeatureSet.materialize_option_defaults`` directly; the method now lives on FeatureSet.
+
+    The direct typed call retires the dynamic ``getattr`` seam the RED phase needed while the
+    method was still absent.
+    """
+    feature_set.materialize_option_defaults(make_fg())
+
+
+def _stamp_group_scenario(same_group: bool) -> dict[str, Any]:
+    """Stamp a defaults-present set, materialize for the same or another group; classes stay in this frame."""
+    stamped_fg = _make_unit_group_default_fg()
+    target_fg = stamped_fg if same_group else _make_unit_group_default_fg()
+    options = Options(group={MDB_GRP_KEY: GRP_DEFAULT})
+    feature = Feature("mdb_unit_stamp_group", options)
+    feature_set = FeatureSet([feature])
+    feature_set._stamp_option_defaults_materialized(stamped_fg)
+    marker_is_stamped = feature_set._defaults_materialized_for is stamped_fg
+    with patch.object(target_fg, "options_with_defaults", wraps=target_fg.options_with_defaults) as spy:
+        feature_set.materialize_option_defaults(target_fg)
+    return {
+        "marker_is_stamped": marker_is_stamped,
+        "spy_calls": int(spy.call_count),
+        "options_identical": feature.options is options and feature_set.options is options,
+    }
+
+
+def _stamp_noop_scenario(set_level: bool) -> dict[str, Any]:
+    """Stamp a set whose defaults are missing (or only set-level options would change); report what changed."""
+    if set_level:
+        fg = _make_two_keys_fg(True, {})
+        shared = Options()
+        features = [Feature("mdb_src__mdbop_q_b", shared), Feature("mdb_src__mdbop_r_c", shared)]
+    else:
+        fg = _make_unit_group_default_fg()
+        features = [Feature("mdb_unit_stamp_missing", Options())]
+    options_before = [f.options for f in features]
+    feature_set = FeatureSet(features)
+    features_before = feature_set.features
+    set_options_before = feature_set.options
+    declared_before = {k: v for k, v in vars(feature_set).items() if k.startswith("declared_input_")}
+    feature_set._stamp_option_defaults_materialized(fg)
+    declared_after = {k: v for k, v in vars(feature_set).items() if k.startswith("declared_input_")}
+    nothing_written = (
+        [f.options for f in features] == options_before
+        and all(f.options is o for f, o in zip(features, options_before))
+        and feature_set.options is set_options_before
+        and feature_set.features is features_before
+        and declared_after == declared_before
+        and all(MDB_GRP_KEY not in o.group for o in options_before)
+    )
+    marker_is_none = feature_set._defaults_materialized_for is None
+    filled: bool | None = None
+    if not set_level:
+        feature_set.materialize_option_defaults(fg)
+        filled = features[0].options.get(MDB_GRP_KEY) == GRP_DEFAULT
+    return {"marker_is_none": marker_is_none, "nothing_written": nothing_written, "filled_after_materialize": filled}
+
+
+def _stamp_mutation_scenario(mutation: str) -> dict[str, Any]:
+    fg = _make_unit_group_default_fg()
+    options = Options(group={MDB_GRP_KEY: GRP_DEFAULT})
+    first = Feature("mdb_unit_stamp_add_a", options)
+    second = Feature("mdb_unit_stamp_add_b", options)
+    feature_set = FeatureSet([first, second] if mutation == "remove" else [first])
+    feature_set._stamp_option_defaults_materialized(fg)
+    stamped = feature_set._defaults_materialized_for is fg
+    if mutation == "add":
+        feature_set.add(second)
+    else:
+        feature_set.remove(second)
+    return {"stamped": stamped, "cleared": feature_set._defaults_materialized_for is None}
+
+
+def _stale_replacement_scenario() -> dict[str, Any]:
+    """Stamp, replace a feature's options with a fresh Options, materialize again."""
+    fg = _make_unit_group_default_fg()
+    feature = Feature("mdb_unit_stale_feature", Options(group={MDB_GRP_KEY: GRP_DEFAULT}))
+    feature_set = FeatureSet([feature])
+    feature_set._stamp_option_defaults_materialized(fg)
+    stamped = feature_set._defaults_materialized_for is fg
+    feature.options = Options()
+    feature_set.materialize_option_defaults(fg)
+    return {"stamped": stamped, "filled": feature.options.get(MDB_GRP_KEY) == GRP_DEFAULT}
+
+
+def _stamp_copy_scenario() -> dict[str, Any]:
+    fg = _make_unit_group_default_fg()
+    feature_set = FeatureSet([Feature("mdb_unit_stamp_copy", Options(group={MDB_GRP_KEY: GRP_DEFAULT}))])
+    feature_set._stamp_option_defaults_materialized(fg)
+    return {
+        "stamped": feature_set._defaults_materialized_for is fg,
+        "copied": copy(feature_set)._defaults_materialized_for is fg,
+    }
+
+
+class TestRuntimeDefaultMaterializationEndToEnd:
+    """calculate_feature observes declared defaults through the real engine (the #796 regression)."""
+
+    def test_declared_defaults_visible_in_calculate_feature(self) -> None:
+        """Absent context and group keys with concrete defaults are materialized before calculate_feature."""
+        observed = _run_probe(_make_boundary_probe_fg, "mdb_e2e_defaults_feature")
+        assert observed["ctx"] == CTX_DEFAULT, f"context default not materialized at runtime: {observed!r}"
+        assert observed["grp"] == GRP_DEFAULT, f"group default not materialized at runtime: {observed!r}"
+
+    def test_engine_path_never_calls_materialize_option_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A prepared (frozen) FeatureSet already carries the defaults, so the compute boundary skips the call."""
+
+        def refuse(self: FeatureSet, feature_group: Any) -> None:
+            raise AssertionError("materialize_option_defaults must not run on the engine path")
+
+        monkeypatch.setattr(FeatureSet, "materialize_option_defaults", refuse)
+        observed = _run_probe(_make_boundary_probe_fg, "mdb_e2e_engine_skip_feature")
+        assert observed["ctx"] == CTX_DEFAULT
+        assert observed["grp"] == GRP_DEFAULT
+
+    def test_explicit_and_falsy_values_win_while_absent_key_materializes(self) -> None:
+        """Explicit (even falsy) values are never overridden, while the untouched key still gets its default."""
+        options = Options(context={MDB_CTX_KEY: "mdb_explicit", MDB_FALSY_KEY: ""})
+        observed = _run_probe(_make_boundary_probe_fg, "mdb_e2e_explicit_feature", options)
+        assert observed["ctx"] == "mdb_explicit", f"explicit value was overridden: {observed!r}"
+        assert observed["falsy"] == "", f"falsy explicit value was overridden: {observed!r}"
+        assert observed["grp"] == GRP_DEFAULT, f"absent group key not materialized in the same run: {observed!r}"
+
+    def test_opted_in_explicit_none_retained_while_sibling_default_materializes(self) -> None:
+        """An allow_explicit_none=True explicit None survives materialization; the sibling default is filled."""
+        options = Options(context={MDB_EN_KEY: None})
+        observed = _run_probe(_make_explicit_none_probe_fg, "mdb_e2e_explicit_none_feature", options)
+        assert observed["sibling"] == SIBLING_DEFAULT, f"sibling default not materialized: {observed!r}"
+        assert observed["en"] is None, f"opted-in explicit None was overwritten by the default: {observed!r}"
+
+    @pytest.mark.parametrize("with_defaults", [True, False], ids=["declared_defaults", "no_defaults"])
+    def test_name_bound_values_reach_calculate_feature(self, with_defaults: bool) -> None:
+        name = "mdb_src__mdbop_q_b"
+        seen = _run_two_keys(with_defaults, name)
+        assert seen[name] == ("q", "b")
+
+    @pytest.mark.parametrize("with_defaults", [True, False], ids=["declared_defaults", "no_defaults"])
+    def test_name_only_twin_and_agreeing_context_twin_merge_into_one_feature(self, with_defaults: bool) -> None:
+        name = "mdb_src__mdbop_q_b"
+        seen: dict[str, Any] = {}
+        fg = _make_two_keys_fg(with_defaults, seen)
+        source = make_root_fg("MdbTwoKeys", __name__, "mdb_src", [1, 2])
+        results = mloda.run_all(
+            [Feature(name), Feature(name, Options(context={MDB_FIRST: "q"}))],
+            compute_frameworks=[PythonDictFramework],
+            plugin_collector=PluginCollector.enabled_feature_groups({fg, source}),
+        )
+        assert len(results) == 1
+        frame = results[0]
+        columns = list(frame.keys()) if isinstance(frame, dict) else list(frame[0].keys())
+        assert columns == [name]
+        assert seen[name] == ("q", "b")
+
+    @pytest.mark.parametrize("direct_first", [True, False], ids=["direct_first", "chained_first"])
+    @pytest.mark.parametrize("direct_data_type", [None, DataType.INT64], ids=["untyped", "typed"])
+    def test_direct_and_chained_request_reach_calculate_feature_once_per_name(
+        self, direct_first: bool, direct_data_type: DataType | None
+    ) -> None:
+        calls: list[list[str]] = []
+        extender = _CapturingExtender()
+        results = _run_direct_and_chained(
+            calls, extender=extender, direct_first=direct_first, direct_data_type=direct_data_type
+        )
+        for recorded in (calls, extender.names):
+            assert sum(names.count(MDB_DIRECT) for names in recorded) == 1, recorded
+        observed = [f for features in extender.captured for f in features.features if f.name == MDB_DIRECT]
+        assert len(observed) == 1
+        assert observed[0].data_type is direct_data_type
+        assert observed[0].initial_requested_data
+        direct_frames = [r for r in results if MDB_DIRECT in (r if isinstance(r, dict) else r[0])]
+        assert len(direct_frames) == 1
+
+    @pytest.mark.parametrize("direct_first", [True, False], ids=["direct_first", "chained_first"])
+    @pytest.mark.parametrize(
+        ("pinned", "direct_data_type"),
+        [
+            pytest.param("one_framework", None, id="untyped"),
+            pytest.param("one_framework", DataType.INT64, id="typed"),
+            pytest.param("direct_pinned_of_two", None, id="untyped_direct_pinned_of_two"),
+            pytest.param("direct_pinned_of_two", DataType.INT64, id="typed_direct_pinned_of_two"),
+            pytest.param("chained_input_pinned_of_two", DataType.INT64, id="typed_chained_input_pinned_of_two"),
+            pytest.param("chained_input_pinned_of_two", None, id="untyped_chained_input_pinned_of_two"),
+        ],
+    )
+    def test_direct_and_chained_request_append_style_group_pyarrow(
+        self, direct_first: bool, pinned: str, direct_data_type: DataType | None
+    ) -> None:
+        calls: list[list[str]] = []
+        two = pinned == "direct_pinned_of_two"
+        chained_two = pinned == "chained_input_pinned_of_two"
+        results = _run_direct_and_chained(
+            calls,
+            framework=[PyArrowTable, PythonDictFramework] if two or chained_two else PyArrowTable,
+            append_columns=True,
+            direct_first=direct_first,
+            direct_data_type=direct_data_type,
+            direct_compute_framework="PyArrowTable" if two else None,
+            chained_input_compute_framework="PyArrowTable" if chained_two else None,
+        )
+        names = [name for frame in results for name in _frame_columns(frame)]
+        assert names.count(MDB_DIRECT) == 1
+        assert names.count(MDB_CHAINED) == 1
+        assert sum(c.count(MDB_DIRECT) for c in calls) == 1, calls
+        for name in (MDB_DIRECT, MDB_CHAINED):
+            (frame,) = [f for f in results if name in _frame_columns(f)]
+            assert _column_values(frame, name) == [1, 2]
+            if not isinstance(frame, (dict, list)):
+                assert frame.schema.field(name).type == DataType.to_arrow_type(DataType.INT64)
+
+    @pytest.mark.parametrize("direct_first", [True, False], ids=["direct_first", "chained_first"])
+    @pytest.mark.parametrize("pinned", ["one_framework", "direct_pinned_of_two", "chained_input_pinned_of_two"])
+    def test_typed_direct_and_untyped_input_keep_runtime_type_enforcement(
+        self, direct_first: bool, pinned: str
+    ) -> None:
+        two = pinned == "direct_pinned_of_two"
+        chained_two = pinned == "chained_input_pinned_of_two"
+        with pytest.raises(DataTypeMismatchError, match=MDB_DIRECT):
+            _run_direct_and_chained(
+                [],
+                framework=[PyArrowTable, PythonDictFramework] if two or chained_two else PythonDictFramework,
+                direct_first=direct_first,
+                direct_data_type=DataType.STRING,
+                direct_compute_framework="PyArrowTable" if two else None,
+                chained_input_compute_framework="PyArrowTable" if chained_two else None,
+            )
+
+    @pytest.mark.parametrize(
+        ("include_direct", "filter_on", "direct_data_type", "direct_first", "pinned"),
+        [
+            (False, "mdb_src", None, True, "one_framework"),
+            (False, MDB_DIRECT, None, True, "one_framework"),
+            (True, MDB_DIRECT, None, True, "one_framework"),
+            (True, MDB_DIRECT, DataType.INT64, True, "one_framework"),
+            (True, MDB_DIRECT, DataType.INT64, False, "one_framework"),
+            (True, MDB_DIRECT, DataType.INT64, True, "direct_pinned_of_two"),
+            (True, MDB_DIRECT, DataType.INT64, False, "direct_pinned_of_two"),
+        ],
+        ids=[
+            "chained_only_src",
+            "chained_only_direct",
+            "direct_and_chained_direct",
+            "typed_first",
+            "typed_last",
+            "typed_pinned_of_two_first",
+            "typed_pinned_of_two_last",
+        ],
+    )
+    def test_global_filter_on_column_reaching_group_as_input_copy(
+        self, include_direct: bool, filter_on: str, direct_data_type: DataType | None, direct_first: bool, pinned: str
+    ) -> None:
+        two = pinned == "direct_pinned_of_two"
+        results = _run_direct_and_chained(
+            [],
+            include_direct=include_direct,
+            filter_on=filter_on,
+            direct_data_type=direct_data_type,
+            direct_first=direct_first,
+            framework=[PyArrowTable, PythonDictFramework] if two else PythonDictFramework,
+            direct_compute_framework="PyArrowTable" if two else None,
+        )
+        (frame,) = [r for r in results if MDB_CHAINED in _frame_columns(r)]
+        assert _column_values(frame, MDB_CHAINED) == [2]
+
+    @pytest.mark.parametrize("direct_first", [True, False], ids=["direct_first", "chained_first"])
+    @pytest.mark.parametrize(
+        ("framework", "append_columns"),
+        [(PyArrowTable, True), (PythonDictFramework, False)],
+        ids=["pyarrow_append", "python_dict"],
+    )
+    @pytest.mark.parametrize("pinned", ["one_framework", "direct_pinned_of_two"])
+    @pytest.mark.parametrize("direct_data_type", [None, DataType.INT64], ids=["untyped", "typed"])
+    def test_direct_and_propagating_consumer_with_differing_context_raises(
+        self,
+        framework: type[Any],
+        append_columns: bool,
+        direct_first: bool,
+        pinned: str,
+        direct_data_type: DataType | None,
+    ) -> None:
+        calls: list[list[str]] = []
+        propagate = Options(context={"x": 1}, propagate_context_keys=frozenset({"x"}))
+        two = pinned == "direct_pinned_of_two"
+        with pytest.raises(ValueError, match=rf"{re.escape(MDB_DIRECT)}.*\bx\b"):
+            _run_direct_and_chained(
+                calls,
+                framework=[PyArrowTable, PythonDictFramework] if two else framework,
+                append_columns=append_columns,
+                direct_first=direct_first,
+                chained_options=propagate,
+                direct_data_type=direct_data_type,
+                direct_compute_framework=framework.__name__ if two else None,
+            )
+        assert calls == []
+
+    @pytest.mark.parametrize("shape", ["two_direct", "direct_and_chained_input", "declared_unbound_key", "root_copies"])
+    @pytest.mark.parametrize(
+        ("framework", "append_columns"),
+        [(PyArrowTable, True), (PythonDictFramework, False)],
+        ids=["pyarrow_append", "python_dict"],
+    )
+    def test_same_named_copies_with_differing_plain_context_raise(
+        self, framework: type[Any], append_columns: bool, shape: str
+    ) -> None:
+        calls: list[list[str]] = []
+        root_calls: list[list[str]] = []
+        key = "u" if shape == "declared_unbound_key" else "y"
+        name = "mdb_src" if shape == "root_copies" else MDB_DIRECT
+        first, second = Options(context={key: 1}), Options(context={key: 2})
+        if shape == "two_direct":
+            kwargs: dict[str, Any] = {"include_chained": False, "extra_requests": [Feature(name, first)]}
+        elif shape == "direct_and_chained_input":
+            kwargs = {"direct_options": first, "extra_requests": None}
+        elif shape == "root_copies":
+            kwargs = {"include_name_bound": False, "extra_requests": [Feature(name, first), Feature(name, second)]}
+        else:
+            kwargs = {"include_chained": False, "direct_options": first, "extra_requests": [Feature(name, second)]}
+        with pytest.raises(ValueError, match=rf"{re.escape(name)}.*\b{key}\b") as excinfo:
+            _run_direct_and_chained(
+                calls,
+                framework=framework,
+                append_columns=append_columns,
+                unbound_keys=("u",) if shape == "declared_unbound_key" else (),
+                root_calls=root_calls,
+                root_append_columns=append_columns,
+                **kwargs,
+            )
+        assert calls == []
+        assert root_calls == []
+        if shape == "root_copies":
+            assert "cascade_context_keys" not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        ("framework", "append_columns"),
+        [(PyArrowTable, True), (PythonDictFramework, False)],
+        ids=["pyarrow_append", "python_dict"],
+    )
+    def test_requested_root_split_by_propagated_values_computes_per_value(
+        self, framework: type[Any], append_columns: bool
+    ) -> None:
+        root_calls: list[list[str]] = []
+        propagate_1 = Options(context={"x": 1}, propagate_context_keys=frozenset({"x"}))
+        propagate_2 = Options(context={"x": 2}, propagate_context_keys=frozenset({"x"}))
+        _run_direct_and_chained(
+            [],
+            framework=framework,
+            append_columns=append_columns,
+            include_chained=False,
+            direct_options=propagate_1,
+            extra_requests=[
+                Feature("mdb_src__mdbop_r_c", propagate_2),
+                Feature("mdb_src", Options(context={"x": 1})),
+                Feature("mdb_src", Options(context={"x": 2})),
+            ],
+            root_calls=root_calls,
+            root_append_columns=append_columns,
+        )
+        assert len(root_calls) >= 2
+
+    def test_in_features_agreeing_with_name_succeeds(self) -> None:
+        plugins = PluginCollector.enabled_feature_groups({_AgreeingInFeaturesSource, AggregatedFeatureGroup})
+        results = mloda.run_all(
+            [
+                Feature("agree_src__sum_aggr"),
+                Feature("agree_src__sum_aggr", Options(context={DefaultOptionKeys.in_features: "agree_src"})),
+            ],
+            compute_frameworks=[PyArrowTable],
+            plugin_collector=plugins,
+        )
+        (table,) = results
+        assert table["agree_src__sum_aggr"].to_pylist() == [6, 6, 6]
+
+    def test_config_based_name_twins_differing_in_declared_key_raise(self) -> None:
+        plugins = PluginCollector.enabled_feature_groups({_AgreeingInFeaturesSource, AggregatedFeatureGroup})
+        in_features = DefaultOptionKeys.in_features
+        with pytest.raises(ValueError, match=r"my_agg.*aggregation_type"):
+            mloda.run_all(
+                [
+                    Feature("my_agg", Options(context={"aggregation_type": "sum", in_features: "agree_src"})),
+                    Feature("my_agg", Options(context={"aggregation_type": "max", in_features: "agree_src"})),
+                ],
+                compute_frameworks=[PyArrowTable],
+                plugin_collector=plugins,
+            )
+
+    def test_two_direct_copies_with_differing_context_on_different_frameworks_succeed(self) -> None:
+        calls: list[list[str]] = []
+        results = _run_direct_and_chained(
+            calls,
+            framework=[PyArrowTable, PythonDictFramework],
+            append_columns=False,
+            include_chained=False,
+            direct_compute_framework="PyArrowTable",
+            extra_requests=[Feature(MDB_DIRECT, Options(context={"y": 1}), compute_framework="PythonDictFramework")],
+        )
+        assert len(calls) == 2
+        assert all(c.count(MDB_DIRECT) == 1 for c in calls)
+        assert len(results) == 2
+
+    def test_replaces_rows_group_with_split_context_on_one_framework_succeeds(self) -> None:
+        """All copies resolve to PyArrowTable; each replaces_rows step writes its own frame, so the split copies do not collide."""
+        calls: list[list[str]] = []
+        propagate = Options(context={"x": 1}, propagate_context_keys=frozenset({"x"}))
+        results = _run_direct_and_chained(
+            calls,
+            framework=[PyArrowTable, PythonDictFramework],
+            append_columns=False,
+            replaces_rows=True,
+            direct_compute_framework="PyArrowTable",
+            chained_options=propagate,
+        )
+        for name in (MDB_DIRECT, MDB_CHAINED):
+            (frame,) = [r for r in results if name in (r if isinstance(r, dict) else r.column_names)]
+            assert list(frame[name] if isinstance(frame, dict) else frame[name].to_pylist()) == [1, 2]
+        assert len(calls) == 3
+
+    def test_two_consumers_propagating_different_values_into_shared_input_raise(self) -> None:
+        calls: list[list[str]] = []
+        propagate = Options(context={"x": 1}, propagate_context_keys=frozenset({"x"}))
+        other = Feature(
+            "mdb_src__mdbop_q_b__mdbop_s_d",
+            Options(context={"x": 2}, propagate_context_keys=frozenset({"x"})),
+        )
+        with pytest.raises(ValueError, match=rf"{re.escape(MDB_DIRECT)}.*\bx\b"):
+            _run_direct_and_chained(calls, include_direct=False, chained_options=propagate, extra_requests=[other])
+        assert calls == []
+
+    @pytest.mark.parametrize("direct_first", [True, False], ids=["direct_first", "chained_first"])
+    @pytest.mark.parametrize(
+        "direct_options",
+        [None, Options(context={"x": 1})],
+        ids=["no_direct_ctx", "matching_direct_ctx"],
+    )
+    @pytest.mark.parametrize("pinned", ["one_framework", "direct_pinned_of_two"])
+    def test_cascaded_context_succeeds(self, direct_first: bool, direct_options: Options | None, pinned: str) -> None:
+        cascade = Options(context={"x": 1}, cascade_context_keys=frozenset({"x"}))
+        two = pinned == "direct_pinned_of_two"
+        results = _run_direct_and_chained(
+            [],
+            framework=[PyArrowTable, PythonDictFramework] if two else PyArrowTable,
+            append_columns=True,
+            direct_first=direct_first,
+            chained_options=cascade,
+            direct_options=direct_options,
+            direct_compute_framework="PyArrowTable" if two else None,
+        )
+        names = [name for frame in results for name in _frame_columns(frame)]
+        assert names.count(MDB_DIRECT) == 1
+        assert names.count(MDB_CHAINED) == 1
+
+    @pytest.mark.parametrize("direct_first", [True, False], ids=["direct_first", "chained_first"])
+    @pytest.mark.parametrize(
+        "direct_data_type, direct_options",
+        [(DataType.INT64, Options(context={"x": 1})), (None, Options(context={"x": 1}))],
+        ids=["typed_direct_with_same_value", "direct_with_same_value"],
+    )
+    def test_propagated_context_with_direct_succeeds(
+        self, direct_first: bool, direct_data_type: DataType | None, direct_options: Options | None
+    ) -> None:
+        propagate = Options(context={"x": 1}, propagate_context_keys=frozenset({"x"}))
+        results = _run_direct_and_chained(
+            [],
+            framework=PyArrowTable,
+            append_columns=True,
+            direct_first=direct_first,
+            direct_data_type=direct_data_type,
+            chained_options=propagate,
+            direct_options=direct_options,
+        )
+        names = [name for table in results for name in table.column_names]
+        assert names.count(MDB_DIRECT) == 1
+        assert names.count(MDB_CHAINED) == 1
+
+    def test_explicit_option_agreeing_with_name_is_observed(self) -> None:
+        name = "mdb_src__mdbop_q_b"
+        seen = _run_two_keys(True, name, Options(context={MDB_FIRST: "q"}))
+        assert seen[name] == ("q", "b")
+
+
+class _CapturingExtender(Extender):
+    """Captures the ``features`` argument flowing through FEATURE_GROUP_CALCULATE_FEATURE."""
+
+    def __init__(self) -> None:
+        self.captured: list[Any] = []
+        self.names: list[list[str]] = []
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        # _invoke_extender passes (data, features); capture the FeatureSet the plugin will see.
+        self.captured.append(args[1])
+        # Snapshot the names at call time.
+        self.names.append([str(f.name) for f in args[1].features])
+        return func(*args, **kwargs)
+
+
+class TestExtenderPathObservesMaterializedOptions:
+    """run_calculate_feature materializes defaults BEFORE dispatching to a calculate-feature extender."""
+
+    def test_extender_receives_feature_set_with_materialized_defaults(self) -> None:
+        """The FeatureSet handed to the extender already carries the declared defaults."""
+        extender = _CapturingExtender()
+        cfw = PythonDictFramework(ParallelizationMode.SYNC, frozenset(), uuid4(), function_extender={extender})
+        feature = Feature("mdb_extender_feature")
+        feature_set = FeatureSet()
+        feature_set.add(feature)
+
+        # The probe class is created inline (no local binding), so a failing assert cannot pin it.
+        cfw.run_calculate_feature(_make_boundary_probe_fg("mdb_extender_feature"), feature_set)
+
+        assert len(extender.captured) == 1, "the extender must wrap exactly one calculate_feature call"
+        captured = extender.captured[0]
+        assert isinstance(captured, FeatureSet)
+        observed_ctx = [f.options.get(MDB_CTX_KEY) for f in captured.features]
+        observed_grp = [f.options.get(MDB_GRP_KEY) for f in captured.features]
+        assert observed_ctx == [CTX_DEFAULT], f"extender saw pre-default context options: {observed_ctx!r}"
+        assert observed_grp == [GRP_DEFAULT], f"extender saw pre-default group options: {observed_grp!r}"
+
+    @pytest.mark.parametrize("with_defaults", [True, False], ids=["declared_defaults", "no_defaults"])
+    def test_extender_sees_name_bound_values(self, with_defaults: bool) -> None:
+        extender = _CapturingExtender()
+        name = "mdb_src__mdbop_q_b"
+        _run_two_keys(with_defaults, name, extender=extender)
+        observed = [
+            (f.options.get(MDB_FIRST), f.options.get(MDB_SECOND)) for c in extender.captured for f in c.features
+        ]
+        assert ("q", "b") in observed
+
+
+class TestFeatureSetMaterializeOptionDefaults:
+    """Unit contract of FeatureSet.materialize_option_defaults (RED: the method does not exist yet)."""
+
+    def test_group_default_fill_rebinds_feature_and_feature_set_options(self) -> None:
+        """The fill lands on the feature, the set stays coherent, and self.options reflects the fill."""
+        feature = Feature("mdb_unit_fill_feature")
+        original_uuid = feature.uuid
+        feature_set = FeatureSet()
+        feature_set.add(feature)
+
+        _materialize(feature_set, _make_unit_group_default_fg)
+
+        assert feature.options.get(MDB_GRP_KEY) == GRP_DEFAULT
+        assert len(feature_set.features) == 1
+        # Feature.__hash__ includes options: only a rebuilt set answers fresh membership correctly.
+        assert feature in feature_set.features, "features set was not rebuilt after rebinding options"
+        assert feature.uuid == original_uuid
+        assert feature_set.options is not None
+        assert feature_set.options.get(MDB_GRP_KEY) == GRP_DEFAULT, "self.options stayed the stale pre-default object"
+        assert feature_set.options is feature.options, "self.options lost its alias to the feature's options"
+
+    def test_shared_options_object_stays_shared_after_fill(self) -> None:
+        """Two features sharing ONE Options object still share one materialized object afterwards."""
+        shared = Options()
+        feature_a = Feature("mdb_unit_alias_a", shared)
+        feature_b = Feature("mdb_unit_alias_b", shared)
+        feature_set = FeatureSet([feature_a, feature_b])
+
+        _materialize(feature_set, _make_unit_group_default_fg)
+
+        assert len(feature_set.features) == 2
+        assert feature_a.options is feature_b.options, "aliased Options diverged during materialization"
+        assert feature_a.options.get(MDB_GRP_KEY) == GRP_DEFAULT
+        assert feature_a.options is not shared, "the fill must rebind to a new Options, not mutate in place"
+
+    def test_bound_values_fill_context_ahead_of_defaults(self) -> None:
+        feature = Feature("mdb_src__mdbop_q_b")
+        feature_set = FeatureSet([feature])
+        hash_before = hash(feature)
+
+        feature_set.materialize_option_defaults(_make_two_keys_fg(True, {}))
+
+        assert feature.options.context.get(MDB_FIRST) == "q"
+        assert feature.options.context.get(MDB_SECOND) == "b"
+        assert MDB_FIRST not in feature.options.group
+        assert hash(feature) == hash_before
+
+    def test_shared_options_with_different_names_each_get_own_bindings(self) -> None:
+        shared = Options()
+        feature_a = Feature("mdb_src__mdbop_q_b", shared)
+        feature_b = Feature("mdb_src__mdbop_r_c", shared)
+        feature_set = FeatureSet([feature_a, feature_b])
+
+        feature_set.materialize_option_defaults(_make_two_keys_fg(True, {}))
+
+        assert (feature_a.options.get(MDB_FIRST), feature_a.options.get(MDB_SECOND)) == ("q", "b")
+        assert (feature_b.options.get(MDB_FIRST), feature_b.options.get(MDB_SECOND)) == ("r", "c")
+
+    def test_feature_set_options_hold_no_bound_value_and_no_default_for_bound_keys_when_aliasing_features_disagree(
+        self,
+    ) -> None:
+        shared = Options()
+        feature_set = FeatureSet([Feature("mdb_src__mdbop_q_b", shared), Feature("mdb_src__mdbop_r_c", shared)])
+
+        feature_set.materialize_option_defaults(_make_two_keys_fg(True, {}))
+
+        assert feature_set.options is not None
+        assert MDB_FIRST not in feature_set.options.context
+        assert MDB_FIRST not in feature_set.options.group
+        assert MDB_SECOND not in feature_set.options.context
+        assert MDB_SECOND not in feature_set.options.group
+
+    def test_intake_filled_bound_values_keep_the_declared_input_feature_memo(self) -> None:
+        feature = Feature("mdb_src__mdbop_q_b", Options(context={MDB_FIRST: "q", MDB_SECOND: "b"}))
+        feature_set = FeatureSet([feature])
+        # A set-level Options that never saw the fill (aliasing features disagreed before intake).
+        feature_set.options = Options()
+        feature_set.declared_input_features_resolved = True
+        feature_set.declared_input_feature_names = frozenset({"mdb_src"})
+
+        feature_set.materialize_option_defaults(_make_two_keys_fg(True, {}))
+
+        assert feature_set.declared_input_features_resolved is True
+        assert feature_set.declared_input_feature_names == frozenset({"mdb_src"})
+
+    def test_unbound_names_keep_aliasing_and_defaults(self) -> None:
+        shared = Options()
+        feature_a = Feature("mdb_plain_a", shared)
+        feature_b = Feature("mdb_plain_b", shared)
+        feature_set = FeatureSet([feature_a, feature_b])
+
+        feature_set.materialize_option_defaults(_make_two_keys_fg(True, {}))
+
+        assert feature_a.options is feature_b.options
+        assert feature_a.options.get(MDB_FIRST) == "a"
+        assert feature_set.options is feature_a.options
+
+    def test_no_concrete_defaults_is_identity_noop(self) -> None:
+        """A feature group without concrete defaults leaves every Options object identical (is)."""
+        options = Options(context={"mdb_unrelated": "kept"})
+        feature = Feature("mdb_unit_noop_feature", options)
+        feature_set = FeatureSet([feature])
+
+        _materialize(feature_set, _make_unit_no_defaults_fg)
+
+        rebound = next(iter(feature_set.features))
+        assert rebound.options is options, "no-defaults materialization must be an identity no-op"
+        assert feature_set.options is options
+        assert rebound.options.get("mdb_unrelated") == "kept"
+
+    def test_original_options_object_not_mutated(self) -> None:
+        """Materialization rebinds; the original Options object never gains the filled key."""
+        original = Options()
+        feature = Feature("mdb_unit_nomutate_feature", original)
+        feature_set = FeatureSet([feature])
+
+        _materialize(feature_set, _make_unit_group_default_fg)
+
+        assert MDB_GRP_KEY not in original.group, "the input Options was mutated"
+        assert MDB_GRP_KEY not in original.context, "the input Options was mutated"
+
+    @pytest.mark.parametrize("same_group", [True, False], ids=["same_group", "other_group"])
+    def test_stamp_skips_recompute_only_for_the_stamped_group(self, same_group: bool) -> None:
+        """A stamped set skips options_with_defaults for its own group but not for another group."""
+        observed = _stamp_group_scenario(same_group)
+        assert observed["marker_is_stamped"]
+        assert observed["spy_calls"] == (0 if same_group else 1)
+        if same_group:
+            assert observed["options_identical"]
+
+    @pytest.mark.parametrize("set_level", [False, True], ids=["defaults_missing", "set_level_only"])
+    def test_stamp_does_not_stamp_and_writes_nothing(self, set_level: bool) -> None:
+        """No stamp and no writes when a default is missing or only set-level options would change."""
+        observed = _stamp_noop_scenario(set_level)
+        assert observed["marker_is_none"]
+        assert observed["nothing_written"]
+        if not set_level:
+            assert observed["filled_after_materialize"]
+
+    @pytest.mark.parametrize("mutation", ["add", "remove"])
+    def test_add_or_remove_after_stamp_clears_marker(self, mutation: str) -> None:
+        observed = _stamp_mutation_scenario(mutation)
+        assert observed["stamped"]
+        assert observed["cleared"]
+
+    def test_replaced_options_after_stamp_are_materialized_again(self) -> None:
+        observed = _stale_replacement_scenario()
+        assert observed["stamped"]
+        assert observed["filled"]
+
+    def test_copy_keeps_marker(self) -> None:
+        observed = _stamp_copy_scenario()
+        assert observed["stamped"]
+        assert observed["copied"]
+
+    def test_pickle_drops_marker(self) -> None:
+        feature_set = FeatureSet([Feature("mdb_unit_pickle", Options())])
+        feature_set._defaults_materialized_for = FeatureGroup
+        assert pickle.loads(pickle.dumps(feature_set))._defaults_materialized_for is None  # nosec B301
+
+    def test_collapse_of_same_name_twins_raises_actionable_duplicate_message(self) -> None:
+        """Filling a context default on one twin of a same-name pair collapses the set: the ValueError
+        must name the duplicate-feature cause and list the affected names, not blame an upstream invariant.
+        The engine merges such twins at intake, so this raise is a defensive invariant for
+        direct FeatureSet/API use, unreachable from engine-driven requests."""
+        twin_name = "mdb_unit_twin_feature"
+        explicit = Feature(twin_name, Options(context={MDB_CTX_KEY: CTX_DEFAULT}))
+        absent = Feature(twin_name, Options())
+        feature_set = FeatureSet([explicit, absent])
+        # Precondition: group-only hash plus context-aware eq lets the twins coexist before the fill.
+        assert len(feature_set.features) == 2
+
+        with pytest.raises(ValueError) as excinfo:
+            _materialize(feature_set, _make_unit_context_default_fg)
+
+        message = str(excinfo.value)
+        # Drop the captured traceback before the message asserts: a failing assert would otherwise carry the
+        # probe class through teardown via excinfo and trip this module's no-leak guard.
+        del excinfo
+        assert "collapsed duplicate features" in message, f"message must name the duplicate-collapse cause: {message}"
+        assert twin_name in message, f"message must list the affected duplicate name: {message}"

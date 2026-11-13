@@ -1,0 +1,318 @@
+import sqlite3
+import sys
+from decimal import Decimal
+from typing import Any
+
+import pyarrow as pa
+import pytest
+
+from mloda._testing.compute_framework.dtype_suite import DataTypeValidatorSuite, DtypeExtractionSuite
+from mloda._testing.compute_framework.frame_suite import AppendColumnsSuite, EmptyResultSuite
+from mloda.provider import Cause
+from mloda._testing.framework_adapter import FrameworkAdapter, SqliteAdapter
+from mloda.user import DataType, FeatureName, ParallelizationMode
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_framework import SqliteFramework
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_relation import SqliteRelation
+from tests.helpers.availability_test_helper import (
+    assert_unavailable_when_import_blocked,
+)
+
+
+class TestSqliteFrameworkAvailability:
+    def test_is_available_when_pyarrow_not_installed(self) -> None:
+        """sqlite3 is stdlib, but the relation and merge engine speak Arrow, so a missing pyarrow
+        makes the framework unavailable (issue #736)."""
+        assert_unavailable_when_import_blocked(SqliteFramework, ["pyarrow"])
+
+
+class TestSqliteFrameworkBasics:
+    def test_is_available(self) -> None:
+        """No longer a tautology (issue #736): pyarrow decides sqlite availability, and it is installed
+        here only because the test extra ships it (this module imports pyarrow at module level and would
+        not even collect without it). The pyarrow-blocked case is pinned in TestSqliteFrameworkAvailability
+        above and in test_backend_import_policy.py.
+        """
+        assert SqliteFramework.is_available() is True
+
+    def test_expected_data_framework(self) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        assert fw.expected_data_framework() == SqliteRelation
+
+    def test_set_framework_connection_object(self, connection: sqlite3.Connection) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        fw.set_framework_connection_object(connection)
+        assert fw.framework_connection_object is connection
+        if sys.version_info >= (3, 12):
+            with pytest.raises(sqlite3.OperationalError, match="no such column"):
+                connection.execute('SELECT "no_such_col"')
+
+    def test_set_framework_connection_object_invalid(self) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        with pytest.raises(ValueError, match="Expected a sqlite3.Connection"):
+            fw.set_framework_connection_object("not_a_connection")
+
+    def test_connection_of_returns_the_relations_connection(self, connection: sqlite3.Connection) -> None:
+        relation = SqliteRelation.from_dict(connection, {"a": [1, 2]})
+
+        assert SqliteFramework.connection_of(relation) is connection
+
+    def test_connection_of_is_none_for_other_data(self) -> None:
+        assert SqliteFramework.connection_of({"a": [1, 2]}) is None
+
+    def test_transform_dict(self, connection: sqlite3.Connection) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        fw.set_framework_connection_object(connection)
+        dict_data = {"column1": [1, 2, 3], "column2": [4, 5, 6]}
+        result = fw.transform(dict_data, [])
+        assert isinstance(result, SqliteRelation)
+        assert len(result) == 3
+        assert set(result.columns) == {"column1", "column2"}
+
+    def test_transform_invalid_data(self) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        with pytest.raises(ValueError):
+            fw.transform(data=["a"], feature_names=[])
+
+    def test_select_data_by_column_names(self, connection: sqlite3.Connection) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        fw.set_framework_connection_object(connection)
+
+        arrow = pa.Table.from_pydict({"column1": [1, 2, 3], "column2": [4, 5, 6]})
+        data = SqliteRelation.from_arrow(connection, arrow)
+
+        result = fw.select_data_by_column_names(data, [FeatureName("column1")])
+        assert isinstance(result, pa.Table)
+        assert result.column_names == ["column1"]
+
+    def test_select_data_by_column_names_leaves_no_temp_view(self, connection: sqlite3.Connection) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        fw.set_framework_connection_object(connection)
+
+        arrow = pa.Table.from_pydict({"column1": [1, 2, 3], "column2": [4, 5, 6]})
+        data = SqliteRelation.from_arrow(connection, arrow)
+        view_count_sql = "SELECT COUNT(*) FROM sqlite_temp_master WHERE type = 'view'"
+        views_before = connection.execute(view_count_sql).fetchone()[0]
+
+        fw.select_data_by_column_names(data, [FeatureName("column1")])
+
+        assert connection.execute(view_count_sql).fetchone()[0] == views_before
+        assert len(data) == 3
+
+    def test_set_framework_connection_object_none_raises(self) -> None:
+        """Passing None when no connection is set should raise ValueError."""
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        with pytest.raises(ValueError):
+            fw.set_framework_connection_object(None)
+
+    def test_set_framework_connection_object_different_conn_raises(self, connection: sqlite3.Connection) -> None:
+        """Passing a different connection when one is already set should raise ValueError."""
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        fw.set_framework_connection_object(connection)
+        other_conn = sqlite3.connect(":memory:")
+        with pytest.raises(ValueError):
+            fw.set_framework_connection_object(other_conn)
+        other_conn.close()
+
+    def test_set_framework_connection_object_same_conn_is_safe(self, connection: sqlite3.Connection) -> None:
+        """Passing the same connection object again should not raise."""
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        fw.set_framework_connection_object(connection)
+        fw.set_framework_connection_object(connection)  # should not raise
+        assert fw.framework_connection_object is connection
+
+    def test_set_column_names(self, connection: sqlite3.Connection) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        arrow = pa.Table.from_pydict({"column1": [1, 2, 3], "column2": [4, 5, 6]})
+        fw.data = SqliteRelation.from_arrow(connection, arrow)
+        fw.set_column_names()
+        assert "column1" in fw.column_names
+        assert "column2" in fw.column_names
+
+    def test_transform_unsupported_type_raises(self) -> None:
+        """transform() with a plain int raises ValueError."""
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        with pytest.raises(ValueError):
+            fw.transform(data=42, feature_names=[])
+
+    def test_transform_dict_no_connection_raises(self) -> None:
+        """transform() with dict but no connection set raises ValueError.
+
+        A plain dict must use SqliteFramework's native ``from_dict`` ingestion, which
+        raises "connection object is not set" when no connection is configured. It must
+        NOT be rerouted through the pa.Table chain (whose sqlite step raises a different,
+        generic connection message).
+        """
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        with pytest.raises(ValueError, match="not set"):
+            fw.transform(data={"col": [1, 2]}, feature_names=[])
+
+    def test_transform_add_column_preserves_existing(self, connection: sqlite3.Connection) -> None:
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        fw.set_framework_connection_object(connection)
+        dict_data = {"col_a": [1, 2, 3], "col_b": [4, 5, 6]}
+        fw.data = fw.transform(dict_data, [])
+        result = fw.transform(data=[7, 8, 9], feature_names=["col_c"])
+        assert set(result.columns) == {"col_a", "col_b", "col_c"}
+        assert len(result) == 3
+        arrow = result.to_arrow_table()
+        assert arrow.column("col_a").to_pylist() == [1, 2, 3]
+        assert arrow.column("col_c").to_pylist() == [7, 8, 9]
+
+    def test_set_framework_connection_wrong_type_raises(self) -> None:
+        """set_framework_connection_object() with wrong type raises ValueError."""
+        fw = SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        with pytest.raises(ValueError):
+            fw.set_framework_connection_object(12345)
+
+    def test_from_dict_mismatched_column_lengths(self, connection: sqlite3.Connection) -> None:
+        """from_dict() should raise ValueError when columns have different lengths."""
+        with pytest.raises(ValueError, match="same length"):
+            SqliteRelation.from_dict(connection, {"a": [1, 2, 3], "b": [4, 5]})
+
+
+from mloda._testing.compute_framework.connection_suite import ConnectionPickSuite  # noqa: E402
+
+
+class TestSqliteTfsConnectionInit(ConnectionPickSuite):
+    adapter_class = SqliteAdapter
+    missing_connection_prefix = r"sqlite3\.Connection object is required"
+
+    def data_on_connection(self, adapter: FrameworkAdapter) -> Any:
+        return SqliteRelation.from_dict(adapter.connection, {"a": [1]})
+
+
+class TestSqliteDtypeExtractionSuite(DtypeExtractionSuite):
+    adapter_class = SqliteAdapter
+    switched_off = {
+        "test_extract_decimal_column_data_type": Cause.BACKEND,
+        "test_extract_duplicate_column_dtype_returns_first_occurrence": Cause.BACKEND,
+        "test_extract_duplicate_column_data_type_returns_first_occurrence": Cause.BACKEND,
+        "test_extract_duplicate_column_dtype_reversed_order_returns_first_occurrence": Cause.BACKEND,
+        "test_extract_duplicate_column_data_type_reversed_order_returns_first_occurrence": Cause.BACKEND,
+        "test_extract_column_dtype_consistent_with_output_schema": Cause.BACKEND,
+    }
+
+    @pytest.mark.skip(reason="SqliteRelation rejects duplicate column names, so no frame can carry them")
+    def test_extract_duplicate_column_dtype_returns_first_occurrence(
+        self, adapter: FrameworkAdapter, framework_instance: Any
+    ) -> None: ...
+
+    @pytest.mark.skip(reason="SqliteRelation rejects duplicate column names, so no frame can carry them")
+    def test_extract_duplicate_column_data_type_returns_first_occurrence(
+        self, adapter: FrameworkAdapter, framework_instance: Any
+    ) -> None: ...
+
+    @pytest.mark.skip(reason="SqliteRelation rejects duplicate column names, so no frame can carry them")
+    def test_extract_duplicate_column_dtype_reversed_order_returns_first_occurrence(
+        self, adapter: FrameworkAdapter, framework_instance: Any
+    ) -> None: ...
+
+    @pytest.mark.skip(reason="SqliteRelation rejects duplicate column names, so no frame can carry them")
+    def test_extract_duplicate_column_data_type_reversed_order_returns_first_occurrence(
+        self, adapter: FrameworkAdapter, framework_instance: Any
+    ) -> None: ...
+
+    @pytest.mark.skip(reason="SqliteRelation rejects duplicate column names, so no frame can carry them")
+    def test_extract_column_dtype_consistent_with_output_schema(
+        self, adapter: FrameworkAdapter, framework_instance: Any
+    ) -> None: ...
+
+    @pytest.mark.skip(reason="SQLite has no decimal storage type; a decimal column cannot be inserted")
+    def test_extract_decimal_column_data_type(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+
+class TestSqliteDtypeExtraction:
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        return SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+    def test_relation_from_decimal_column_raises(self, connection: sqlite3.Connection) -> None:
+        values = [Decimal("12.34"), Decimal("5.50"), Decimal("99.99"), None]
+
+        with pytest.raises((sqlite3.InterfaceError, sqlite3.ProgrammingError)):
+            SqliteRelation.from_arrow(connection, pa.table({"d": pa.array(values, type=pa.decimal128(10, 2))}))
+
+    def test_extract_raw_sql_expression_column_data_type_is_numeric(
+        self, connection: sqlite3.Connection, framework_instance: SqliteFramework
+    ) -> None:
+        rel = SqliteRelation.from_arrow(connection, pa.table({"id": pa.array([1, 2], type=pa.int32())}))
+        projected = rel.select(_raw_sql="*, id + 1 AS next_id")
+        materialized_type = projected.to_arrow_table().schema.field("next_id").type
+
+        assert pa.types.is_integer(materialized_type)
+        assert {
+            "dtype": framework_instance._extract_column_dtype(projected, "next_id"),
+            "data_type": framework_instance._extract_column_data_type(projected, "next_id"),
+        } == {
+            "dtype": str(materialized_type),
+            "data_type": DataType.INT64,
+        }
+
+
+_NO_LIST_STORAGE = (Cause.BACKEND, "SQLite has no list storage")
+_NO_NS_BIND = (Cause.BACKEND, "nanosecond timestamps convert to pandas Timestamp, which sqlite3 cannot bind")
+
+
+class TestSqliteDataTypeValidatorSuite(DataTypeValidatorSuite):
+    """SQLite uses type affinity: int widths, float widths and timestamps (TEXT) cannot be told apart from PRAGMA."""
+
+    adapter_class = SqliteAdapter
+    unsupported_cases = {
+        "list_str_col": _NO_LIST_STORAGE,
+        "list_struct_col": _NO_LIST_STORAGE,
+        "list_fixed_col": _NO_LIST_STORAGE,
+        "timestamp_ns_col": _NO_NS_BIND,
+        "timestamp_ns_tz_col": _NO_NS_BIND,
+    }
+    switched_off = {
+        "test_int32_column_strict_int32_passes": Cause.BACKEND,
+        "test_int64_column_strict_int32_raises": Cause.BACKEND,
+        "test_float32_column_strict_float_passes": Cause.BACKEND,
+        "test_float64_column_strict_float_raises": Cause.BACKEND,
+        "test_timestamp_ms_column_strict_ms_passes": Cause.BACKEND,
+        "test_timestamp_us_column_strict_ms_raises": Cause.BACKEND,
+    }
+
+    @pytest.mark.skip(reason="SQLite collapses INTEGER affinity; the int32 column reports INT64, not INT32")
+    def test_int32_column_strict_int32_passes(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+    @pytest.mark.skip(reason="SQLite collapses INTEGER affinity; INT32 vs INT64 cannot be distinguished from PRAGMA")
+    def test_int64_column_strict_int32_raises(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+    @pytest.mark.skip(reason="SQLite collapses REAL affinity; the float32 column reports DOUBLE, not FLOAT")
+    def test_float32_column_strict_float_passes(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+    @pytest.mark.skip(reason="SQLite collapses REAL affinity; FLOAT vs DOUBLE cannot be distinguished from PRAGMA")
+    def test_float64_column_strict_float_raises(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+    @pytest.mark.skip(reason="SQLite stores timestamps as TEXT; TIMESTAMP_MILLIS cannot be expressed in PRAGMA")
+    def test_timestamp_ms_column_strict_ms_passes(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+    @pytest.mark.skip(reason="SQLite stores timestamps as TEXT; TIMESTAMP precision cannot be distinguished")
+    def test_timestamp_us_column_strict_ms_raises(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+
+class TestSqliteEmptyResultSuite(EmptyResultSuite):
+    adapter_class = SqliteAdapter
+
+
+class TestSqliteAppendColumnsSuite(AppendColumnsSuite):
+    adapter_class = SqliteAdapter
+    case_folds_names = True
+
+    def single_column(self, values: list[Any]) -> Any | None:
+        return values
+
+    def joined_frame(self, adapter: FrameworkAdapter) -> Any:
+        left = adapter.from_arrow(pa.table({"a": [1, 2, 3]})).set_alias("l")
+        right = adapter.from_arrow(pa.table({"a": [3, 1, 2], "b": [30, 10, 20]})).set_alias("r")
+        return left.join(right, "a")
+
+
+class TestSqliteIsMissingColumnError:
+    def test_unknown_function_is_not_a_missing_column(self) -> None:
+        assert SqliteFramework.is_missing_column_error(sqlite3.OperationalError("no such function: f")) is False
+
+    def test_quoted_string_literal_hint_is_a_missing_column(self) -> None:
+        error = sqlite3.OperationalError('no such column: "x" - should this be a string literal in single-quotes?')
+        assert SqliteFramework.is_missing_column_error(error) is True

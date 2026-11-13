@@ -1,0 +1,433 @@
+# Feature Group Resolution Errors
+
+Resolution runs inside a full `mloda` request, but you do not need to build one
+to reproduce a resolution error. `resolve_feature` (from `mloda.provider`) runs
+the **same matcher over the same candidate universe** as a run and reports what a
+run would, without raising: the failure lands in `result.error` instead of an
+exception, so for the matching failures on this page the message below is the
+message you get back.
+
+```python
+from mloda.provider import resolve_feature
+
+result = resolve_feature("my_feature")  # or resolve_feature(Feature(...)) for a full request
+if result.error:
+    print(result.error)  # for a matching failure, the same message a run raises
+    print([fg.__name__ for fg in result.candidates])
+```
+
+One failure is reported rather than echoed: a plugin that raises while declaring
+its frameworks fails the environment build, which `resolve_feature` prefixes with
+`Failed to build the plugin environment:` where a run raises it bare. See
+[Broken framework declarations](../discover-plugins.md#broken-framework-declarations).
+
+Its candidate universe is a standalone default, not a replay of a specific run.
+Pass a `Feature`, `options`, `plugin_collector`, `links`,
+`data_access_collection`, or `compute_frameworks` (a run that restricts its
+frameworks needs this to mirror) to reproduce the run you are debugging. See
+[Discover Plugins](../discover-plugins.md) for the full signature.
+
+## Catching resolution failures
+
+Inside a run, a feature that does not resolve to exactly one FeatureGroup raises
+`FeatureResolutionError` during planning (the `mloda.run_all(...)` /
+`mloda.prepare(...)` call, before any compute runs). It is a `ValueError`
+subclass, so existing `except ValueError` handlers keep working, but you can now
+catch it specifically and inspect why it failed:
+
+```python
+from mloda.provider import FeatureResolutionError
+from mloda.user import mloda
+
+try:
+    mloda.run_all(["my_feature"])
+except FeatureResolutionError as err:
+    print(err.feature_name)   # the feature that failed to resolve
+    print(err)                # the human-readable message a run prints
+    for record in err.partial_records:
+        print(record.feature_name, record.requested)  # features resolved before the failure
+    # err.result carries the per-candidate elimination facts (an EvaluationResult)
+```
+
+When an INPUT_DATA_MATCH extender refused the candidate source groups, `err.refusals` holds its exceptions, so an access refusal can be told apart from a missing plugin (see [Extender](../../chapter1/extender.md)).
+
+This also covers refused dependencies of competing candidates: if every input chain fails, the error lists each chain and `err.refusals` holds the original refusal exceptions.
+
+To inspect a request without catching an exception, use the non-raising
+surfaces: `resolve_feature` for a single name (above), or `mlodaAPI.diagnose(...)`,
+which returns a `ResolutionDiagnosis` for the whole request. See
+[mlodaAPI](../mloda-api.md#diagnose-and-resolution_report) for both, plus the
+fields on `FeatureResolutionError`, `ResolutionDiagnosis`, and `ResolutionRecord`.
+
+## No Feature Groups Found Error
+
+### The Problem
+
+```
+FeatureResolutionError: No feature groups found for feature name: 'sales_revnue'. Requested domain: 'marketing'.
+Feature group(s) eliminated while matching 'sales_revnue':
+  - MarketingRevenueGroup (compute framework): none of its compute frameworks are enabled for this run
+  - SalesFeatureGroup (domain): declares domain 'sales', but the run requested 'marketing'
+Did you mean one of: ['sales_revenue']?
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+No enabled feature group both declared the requested name and survived every matching gate. It is raised as `FeatureResolutionError` during planning; see [Catching resolution failures](#catching-resolution-failures) to inspect it, or follow the message's closing pointer and rerun the request through `resolve_feature`. Pass the same `Feature` and run arguments, as the top of this page describes; the bare name alone would drop the domain and default to all frameworks, changing the outcome. When the failing feature is an input of the one you requested, the headline names the chain that needed it, e.g. `No feature groups found for feature name: 'invoice_date' (needed by net_spend_30d -> line_value).` When no accessible group matches a `feature_group=` scope and the run excluded the group it names, the message adds a line naming why, e.g. `MyGroup is not accessible in this run: disabled by the PluginCollector.`
+
+### The eliminated candidates block
+
+Each line names a candidate the matcher considered and dropped: the first gate that eliminated it (the parenthesized label) and that gate's reason. A line does not prove the candidate declared the requested name; a candidate whose match hook raised, whose input-data gate declined, or that refused the name itself is recorded regardless.
+
+| Label | What eliminated the candidate | Typical fix |
+| --- | --- | --- |
+| `option value` | The group declined an option value in the request. | Fix the value the reason names. |
+| `feature name` | The group refused the requested feature name itself, for example an unknown output part. | Request a name the group serves; the reason may list them. |
+| `input data` | An INPUT_DATA_MATCH extender or a source group declined the request. | Point the request at data the group can read ([Data Access Patterns](../data-access-patterns.md)). |
+| `match hook` | The group's match hook raised; the error is contained and quoted. | Fix the plugin bug it names. |
+| `domain` | The group declares a different domain than the request. | Align the requested domain ([domain solution below](#3-use-domains-to-separate-feature-groups)). |
+| `scope` | The group is outside the requested `feature_group` scope. | Widen or correct the scope ([scope solution below](#4-scope-a-feature-to-one-source-shared-keys-across-sources)). |
+| `compute framework` | None of the group's compute frameworks are usable: its capability hook rejected every enabled framework, or none of its frameworks is enabled for the run, or its `compute_framework_rule()` names a framework that never reached `ComputeFramework.__init_subclass__` (an `__init_subclass__` override must call `super().__init_subclass__()`), or an operation group has no loaded Implementation (import its implementation modules or call `PluginLoader.all()`) or all its implementations are disabled or denied, or no compute framework plugin is loaded at all (a run reports that case as a `SetupConfigurationError` instead; only `resolve_feature` shows it here). | Enable a framework the group supports; make an `__init_subclass__` override call `super().__init_subclass__()`; if none is loaded, import a compute framework plugin or call `PluginLoader.all()`; re-enable its implementations in the PluginCollector or plugin policy; install an unavailable framework when the reason names its install command. |
+| `compute framework pin` | The `Feature` pins `compute_frameworks` to one that is not among the group's supported set for this run. | Change or drop the pin, or install the framework when the reason says it is unavailable. |
+| `rule variant` | Every framework that fits the feature (after any framework or implementation pin) is served by an Implementation that follows a rule variant the feature does not allow. | Add the `allow_variants` option the reason prints to the feature's options, or pin an implementation that follows the default behavior. |
+| `links` | No index column of the group matches the run's links. | Align the run's links with the group's index. |
+| `declarations` | A consumer's input or a requested feature requires a declared attribute that the candidate does not declare, or declares with another value. | Provide a candidate that declares the attribute the reason names. |
+| `inputs` | A competing candidate matched, but one of its dependencies or a deeper input could not resolve in this run. The reason names the input chain and its failure. | Enable or supply the missing input, correct its options or scope, or address the recorded source refusal. |
+
+A group with a viable input chain can win where an unavailable competitor previously caused an ambiguity. `mloda.diagnose(...)` exposes the same `inputs` eliminations.
+
+A chained group that keeps the default `MIN_IN_FEATURES` but declares no `in_features` matches by options only when `in_features` is passed. The option path records no rejection reason (a non-matching candidate cannot be told apart from an unrelated one), so the failure report does not name this cause. The class-definition warning names the fix: set `MIN_IN_FEATURES = 0` or declare `in_features` in `PROPERTY_MAPPING`.
+
+### The Did you mean hint
+
+Suggestions are close matches drawn from the catalog of accessible groups: declared feature names, class names, and class-name prefixes. The hint drops what would only repeat or mislead: the requested name itself, names the eliminated-candidates block already covers, and names only unreachable groups declare (abstract, no enabled framework, or outside the requested domain, scope, or links). The hint is also dropped for an input feature whose reader declined at the input-data gate, because the reason line, not a name, is the fix. Otherwise a missing hint means no reachable group declares anything close. In the example above, 'sales_revenue' survives because a third, still-reachable group declares it; the two eliminated candidates could not have contributed it.
+
+### Only abstract feature group bases matched
+
+A sibling variant fires when an abstract base matched the name and no concrete group won:
+
+```
+No feature groups found for feature name: 'my_feature'. Only abstract feature group base(s) matched, which cannot be instantiated; no concrete implementation is available or enabled.
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+or, when concrete implementations exist but their compute frameworks do not:
+
+```
+No feature groups found for feature name: 'my_feature'. Its concrete implementations require compute framework(s) ['PandasDataFrame'], none of which are available or enabled for this run.
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+For the first shape, import or enable a concrete implementation. For the second, enable one of the named compute frameworks; the list comes from the base's accessible concrete implementations, so check that the one you enable actually serves the name. Eliminated candidates, if any, still render in their block, and the message closes with the same pointer lines as the ordinary form. Only the Did-you-mean suggestion is dropped, because the name already matched a base.
+
+### The skipped plugin modules block
+
+A "No Feature Groups Found" or "Only abstract feature group bases matched" message may end with a block like:
+
+```
+Plugin module(s) skipped for a missing optional dependency, so their feature groups are not loaded:
+  - mloda_plugins.some.module: some_dependency
+```
+
+Each line names a plugin module or entry point `PluginLoader` skipped at import time because one of its optional dependencies is not installed, so the feature group it would have defined never entered the candidate universe. Install the named dependency, or the `mloda` extra that bundles it, then rerun; `PluginLoader.skipped_plugins()` returns the same mapping for programmatic inspection.
+
+## Multiple Feature Groups Error
+
+### The Problem
+
+```
+FeatureResolutionError: Multiple feature groups found for feature '<feature_name>':
+  - FeatureGroupA (...) [domain: ...]
+  - FeatureGroupB (...) [domain: ...]
+A steward can keep one with PluginCollector or a PluginPolicy.
+For troubleshooting guide, see: ...
+```
+
+This error occurs when multiple distinct feature groups claim they can handle the same feature. Each feature must resolve to exactly one feature group to prevent conflicts. It is raised as `FeatureResolutionError` (a `ValueError` subclass) during planning; see [Catching resolution failures](#catching-resolution-failures) to inspect it.
+
+When a feature group and its subclass both match, the subclass wins whenever it can run, even if it supports fewer compute frameworks than its parent. A compute-framework pin the subclass cannot serve eliminates it first, so pinning one of the parent's other frameworks reaches the parent. See [A loaded subclass replaces its parent](#a-loaded-subclass-replaces-its-parent) for what else does and does not keep a subclass out.
+
+If you previously hit this in a notebook because of a redefined feature group (re-running a cell that defines `class MyFG(FeatureGroup): ...`), that case is now auto-deduplicated. If this error still appears, two distinct classes (different `(module, qualname)`) both claim the name. For source-backed features this usually means two source groups found the column, for example `CsvFG` in a file and `SqliteFG` in a database. Fix it with `feature_group=` (see below), a pointer such as `options={"CsvFG": path}`, or a `data_access_handle` that names one source.
+
+### Solutions
+
+#### 1. Use PluginCollector to enable or disable feature groups
+Control which feature groups are loaded to prevent conflicts:
+
+```py
+from mloda.user import PluginCollector
+
+# Disable specific conflicting feature groups
+collector = PluginCollector.disabled_feature_groups({ConflictingFeatureGroupA, ConflictingFeatureGroupB})
+
+# Or enable only specific feature groups you need
+collector = PluginCollector.enabled_feature_groups({RequiredFeatureGroupA, RequiredFeatureGroupB})
+```
+
+#### 2. Avoid loading all plugins
+You can load plugins by importing the module as a class.
+
+But you can also import just plugins from subfolders.
+
+```python
+from mloda.user import PluginLoader
+
+plugin_loader = PluginLoader()
+plugin_loader.load_group("feature_group") # load plugins only from mloda_plugins.feature_group
+```
+
+#### 3. Use Domains to Separate Feature Groups
+```python
+from mloda.user import Domain
+
+@classmethod
+def get_domain(cls):
+    return Domain("sales")  # Makes this FG only handle 'sales' domain features
+```
+
+#### 4. Scope a feature to one source (shared keys across sources)
+When two enabled sources declare the same column (for example a shared join key), requesting that column by bare name is ambiguous. Scope the request to one source. The scope is read by feature resolution and by filter matching, and does not affect feature identity.
+
+```py
+# class object, collision-proof
+Feature("subject_token", feature_group=ClaimsReader)
+
+# class-name string form, the only form a JSON config can carry
+Feature("subject_token", feature_group="ClaimsReader")
+```
+
+The same scope in a JSON config ([feature config](../feature-config.md)):
+
+```json
+[
+    {"name": "subject_token", "feature_group": "ClaimsReader"}
+]
+```
+
+The config form takes the class-name string only, because JSON cannot express a class object; the class-object form is Python-only.
+
+Both forms match the scoped class and its subclasses, preferring the most specific one. Naming an abstract family base therefore selects the concrete subclass, so a config can scope to the family without naming a compute-framework-specific class:
+
+```json
+[
+    {"name": "age__mean_aggr", "feature_group": "AggregatedFeatureGroup", "implementation": "PandasAggregation"}
+]
+```
+
+Caveats:
+
+- The scope narrows candidates; it does not break ties between them. If the run enables two compute frameworks whose concrete subclasses both match, the family base stays ambiguous and raises, exactly as the bare name does. Enable one framework for the run, or pin `compute_frameworks` on the `Feature` (Python only).
+- The class object is collision-proof; the string form is not. Two classes with the same name in different modules both match the string, so the request stays ambiguous and raises.
+- Neither form pins one exact class: a subclass of the named class is preferred over it. To resolve to a specific class, name that class. For an operation group such as `AggregatedFeatureGroup`, name the implementation instead with `implementation="PandasAggregation"`; a bad pin raises `ImplementationPinError`. An implementation pin does not exclude a subclass that inherits that implementation: a loaded `class MyAggr(AggregatedFeatureGroup)` still wins. See [A loaded subclass replaces its parent](#a-loaded-subclass-replaces-its-parent).
+- The root `FeatureGroup` base is rejected in either form: it names no family.
+- The scope is read by feature resolution and by filter matching, and stays excluded from Feature identity, so two requests for the same column name scoped to different sources compare equal. Requesting both in one features list raises `ValueError: Duplicate feature setup: <name>` rather than silently dropping one, so you are told, not surprised. Inside a single `input_features()` returning a set literal, a second same-name feature with a different scope is silently deduplicated by the Python set itself before the engine ever sees it, so never scope the same name twice within one feature group. To read the same column from two sources side by side, give them distinct derived feature names.
+
+### A loaded subclass replaces its parent
+
+Discovery walks the live subclasses of `FeatureGroup`, so a subclass defined in any imported module serves without registration or an entry point (a function-local subclass that nothing references drops out once it is garbage collected). When the subclass and its parent both match a feature, the subclass replaces the parent for that request. This is intended, and it holds for every way of naming the parent:
+
+- `feature_group=AggregatedFeatureGroup` (class or string) resolves to the subclass.
+- `implementation="PyArrowAggregation"` resolves to the subclass, which inherits that implementation.
+- `PluginCollector.disabled_feature_groups({AggregatedFeatureGroup})` checks exact classes, so it removes the parent and leaves the subclass serving.
+- Source groups behave the same: a `class MyCsv(CsvFG)` serves `options={"CsvFG": path}`.
+- Two sibling subclasses of one parent make the parent unreachable and the request raises `Multiple feature groups found`.
+
+What keeps a subclass out:
+
+- `PluginCollector.disabled_feature_groups({MySubclass})`, or an allow-list with `enabled_feature_groups` that omits it.
+- [Strict registry mode](../plugin_registry.md#strict-mode), when the subclass is not registered.
+- A compute-framework pin the subclass cannot serve.
+- A [plan lock](../plan-lock.md): a takeover changes the recorded class and fails `check_plan_lock` with `PlanLockMismatchError`.
+
+To test that a subclass takes over only for its own option, call `check_subclass_scope(Sub, Parent, selecting)` (or `assert_subclass_scope`) from `mloda._testing.subclass_scope`. A pattern-matching parent needs `requests=`. Pass `input_data=` (a `TypedTestData`, optional `adapter=`) to also compare the subclass's output columns with the parent's; a changed column, or a requested column only the subclass writes, passes only when a divergence record the subclass declares itself (on the group or its own Implementation, any kind but GAP) covers it; a column the subclass drops always fails, even with a record; on run-time named parts, a part only the subclass writes is an added column too; a VARIANT record counts only when the selecting options allow that variant through `allow_variants`; a request the planner would not route on the adapter's framework, a rule exclusion, a missing Implementation and an input fixture with no rows leave the comparison skipped: a `values:` note from `check_subclass_scope`, a failure from `assert_subclass_scope` unless `require_run=False`. It reports a subclass that steals plain requests or misses its own; it also probes each selecting key with another value, so a subclass gated on the key's presence fails as a steal. A key the subclass does not need to match belongs out of `selecting`; one it needs but whose value does not select it goes in `free=`, which keeps it set, skips its other-value probe, and checks that the free keys alone do not select the subclass.
+
+For a name-path group, pass `requests=` to `check_feature_group_shape` to probe and run the names you request; a `base_options` value that contradicts them is reported as a failure with the abort text.
+
+For an operation group, `check_operation_group_shape` (or `assert_operation_group_shape`) from `mloda._testing.operation_group_shape` checks that the group declares a `CONTRACT_VERSION` and that each Implementation declares valid `supported` subtypes and `divergences` records and declines the rest; pass `alias_pairs=` for aliased subtypes and `probe=` for groups that resolve subtypes without an option key.
+
+For a source group, inherit `SourceFeatureGroupTestMixin` from `mloda._testing.source.source_suite` (pytest required) to run the shared claim, decline and abort contract (switching off an inherited contract test, by a skip mark or an override, needs a declared `switched_off` cause); `NO_POINTER` marks a group that takes no pointer, and a pointed-only group (no searched route) runs the suite unchanged, claiming through `own_pointer()`; the handle tests run only when the group declares `data_access_handle` (`HANDLE_SPEC`) in `PROPERTY_MAPPING`. File, database and document groups use `read_file_suite`, `read_db_suite` and `read_document_suite` in the same package.
+
+`PlanStep.specialized_from` names the parents a step's feature group replaced, so `explain()` shows a takeover before anything runs. It stays empty when the parent was disabled, because the parent was never a candidate.
+
+## Source feature group errors
+
+A source group (`CsvFG`, `SqliteFG`, `TextFG`, ...) claims a feature when one of its sources has the column. Two errors come from inside one group, before any feature-group ambiguity.
+
+### Several sources in one group
+
+The group found the column in more than one source and will not guess:
+
+```text
+ValueError: CsvFG found feature 'id' in several sources: /data/application_train.csv, /data/bureau.csv; pin one source with a column_to_file entry, point CsvFG at one file with options={'CsvFG': <path>}, or select one with data_access_handle (file handles: 'application', 'bureau').
+```
+
+Fix it with one of:
+
+- `column_to_file` in the `DataAccessCollection`, pinning the column to one file handle.
+- A pointer: `options={"CsvFG": "/data/bureau.csv"}`.
+- `data_access_handle` naming one file or credential handle.
+- For a database group, a credential `table_name` (for example `Credential(sqlite="/x.db", table_name="bureau")`) or a handle that names one database. The message names the credential key of the group, and lists the sources (only the credential-handle hint is capped, summarizing the rest as "and N more"). Unpointed and without a `data_access_handle`, a database source is named by its identity only (several tables of one database appear as "(N sources)"), and the table fix uses a `<table>` placeholder.
+
+### Column missing from every source
+
+The group owns sources but none has the column. Unpointed, this is a decline recorded in the near-miss block; once the feature is pointed at the group (by a pointer or `feature_group=`), it aborts (a `feature_group=` scope naming only a concrete ancestor of the group does not make it abort; it declines). Every pointed decline (a missing column, a source refused at `INPUT_DATA_MATCH`, a pointed `query_text` without a query route) raises `FeatureResolutionError` with the group's reason, its `result.eliminations` holding the group under stage `input_data`:
+
+```text
+FeatureResolutionError: column 'idd' is in none of the sources of CsvFG: /data/application_train.csv has columns [id, name]; /data/bureau.csv has columns [bureau_id, id]; did you mean 'id'?; request a column a source has or point at another source.
+```
+
+Check the spelling, request a column a source has, or point at the source that has it. Columns and a close-match suggestion appear only when the group was pointed or a `data_access_handle` narrows the search; otherwise only the sources are named, and a database is named by its identity only, once, without its table names. At most five sources are described, then "and N more". A source whose columns cannot be read shows `<source>: <reason>`. If no source can list its columns, the message says so. A folder entry that links outside its folder is skipped; add it as a files handle or point at it.
+
+### query_text on a group without a query route
+
+`query_text is set, but <Group> lists no query route`: `query_text` is reserved for groups that list `ReadDBFG.QUERY_ROUTE`; any other source group declines when unpointed and aborts when pointed (a `feature_group=` scope naming only a concrete ancestor of the group does not make it abort; it declines). Point the feature at a group that lists the route, or keep `query_text` off the feature with `forward_group_exclude`.
+
+### Pointers on derived features
+
+A class-name pointer on a derived feature reaches its inputs, because group options forward to input features. A pointer in the context options counts wherever it is visible, including when pushed with `propagate_context_keys` or `cascade_context_keys`, so a pushed pointer at another group also makes the source groups there skip their search. A consumer whose inputs come from several sources must put each pointer on its input feature (or use the `DataAccessCollection`): a forwarded pointer to a source without the column aborts with the missing-column error above.
+
+```py
+# in the consumer's input_features: each input carries its own pointer, the consumer's own options carry none
+return {
+    Feature("amount", options={"CsvFG": "/data/orders.csv"}),
+    Feature("rate", options={"SqliteFG": Credential(sqlite="/data/rates.db")}),
+}
+```
+
+A pointer (or `query_text`) on a derived name such as `price__sum_aggr` does not make an open-route group claim it: the group that computes the feature wins, and the open group is eliminated at stage `input_data` with a reason naming the computing group. The open group steps aside even when the computing group is filtered out later (for example by a framework pin or links). To read the derived name straight from the source, pass `feature_group=<OpenGroup>`, which reads the name from the source.
+
+An unpointed searched route steps aside the same way, but only for a computing group that survives its own filters; point the request at the group to read the name from the source.
+
+### Global filters on a pointed-only group
+
+A group with an open, pointed-only route claims a leaf name once it is pointed at (a derived name goes to the group that computes it, see above). A global filter on such a group is dropped when the feature was pointed only by `feature_group=`: filter probes run unscoped, so the group does not see itself pointed. Point the group with a class-name pointer in the feature's options as well.
+
+## FeatureGroup Redefinition Errors
+
+### The Problem
+
+```
+ValueError: FeatureGroup redefined with different source code:
+  - MyFG (__main__) source hash 5a3f0c12
+  - MyFG (__main__) source hash b1e052a3
+Set PluginCollector(...).set_allow_redefinition() to keep only the most recently defined version of each class.
+If you are running this in a notebook, restart the kernel to clear stale class definitions.
+```
+
+This error occurs when the same feature group class name has been redefined with different source code in a long-lived Python namespace. Common triggers:
+
+- Re-running a Jupyter cell that defines `class MyFG(FeatureGroup): ...` after editing the class body. IPython's `Out[N]` history holds a strong reference to the old class object, so it stays alive in `FeatureGroup.__subclasses__()`.
+- Calling `importlib.reload` on a module that defines feature group classes.
+
+If both versions of the class have **identical** source code (e.g., re-running a cell without edits), mloda silently keeps one. The error fires only when the source actually differs.
+
+### Solutions
+
+#### 1. Take the most recent version (iterative development)
+
+For rapid iteration in notebooks, opt in to "newest wins" using the builder method on `PluginCollector`:
+
+**Option A**: set the override flag on a fresh collector:
+
+```python
+from mloda.provider import FeatureGroup
+from mloda.user import PluginCollector
+
+
+class SomeFG(FeatureGroup):
+    pass
+
+
+plugin_collector = PluginCollector().set_allow_redefinition()
+```
+
+**Option B**: compose with disable/enable filters:
+
+```python
+plugin_collector = (
+    PluginCollector.disabled_feature_groups({SomeFG})
+    .set_allow_redefinition()
+)
+```
+
+Pass this collector through to `mloda.run_all`, `resolve_feature`, or any other entry point that accepts a `plugin_collector` argument.
+
+#### 2. Restart the kernel
+
+Restarting the Jupyter kernel clears `Out[N]` history and unloads all stale class objects. Use this when you want a fully clean state and do not need to preserve other notebook state.
+
+## EmptyResultError
+
+### The Problem
+
+```
+EmptyResultError: Result carries no schema (no columns): MyFeatureGroup. ...
+```
+
+This error fires when a **final** requested feature group returns a result with
+*no schema* (zero columns). There is no opt-in or opt-out: the rule applies
+uniformly on every compute framework. Note that **zero rows is not an error**: a
+well-typed frame with the right columns and no rows is a valid result and
+passes through. Only a result that carries no columns at all is rejected.
+
+On the PythonDict framework, whose native representation is a columnar
+`dict[str, list]`, the schema is the set of keys: `{"col": []}` carries a
+schema, while `{}` (zero columns) is the only schema-less value and raises.
+Returning a row-oriented `[]` ("nothing to ingest": an empty source directory, a
+query with no hits) also carries no columns and therefore raises. Return
+`{"my_feature": []}` instead.
+
+If the schema-less result is genuine (a bug, missing data, wrong filter), this
+error is correct behavior: it protects callers from silently receiving output
+they cannot interpret.
+
+### When to fix it
+
+If an empty result is a legitimate answer for your domain, for example: graph
+traversals that may find no path, search queries that may match nothing,
+authorization filters that may deny all rows, or agent memory that may have no
+relevant entries, return a *schema-bearing* empty result: keep the columns and
+drop the rows. On PythonDict that is a dict with empty column lists; on the
+other frameworks it is an empty typed table or frame with the right columns.
+
+```py
+class MyFeatureGroup(FeatureGroup):
+    @classmethod
+    def calculate_feature(cls, data, features):
+        ...
+        return {"my_feature": []}  # schema-bearing, zero rows: valid
+```
+
+A schema-bearing empty result flows through to the caller without raising. The
+public import `from mloda.provider import EmptyResultError` (a `ValueError`
+subclass) supports a typed `except` when you invoke framework or plugin code
+directly. When calling `mloda.run_all`, worker errors are wrapped in a generic
+`Exception` whose message embeds the original traceback, so match on the
+`EmptyResultError` name in the raised exception's message instead.
+
+### Intermediates are exempt
+
+The check applies only to features that were explicitly requested by the caller.
+Intermediate feature groups, meaning those whose output feeds another feature
+group rather than the final result, are never subject to `EmptyResultError`.
+An intermediate step must still return a column for every feature it computes.
+
+For full details on how the guard works and the schema-presence gate, see
+[Empty Results](../compute-framework-integration.md#empty-results).
+
+## MissingInputFeatureError
+
+A feature group declared an input (`input_features`) that is not a column of the data handed to
+`calculate_feature`. Core raises it before `validate_input_features` and any extender, so an
+extender cannot skip it. The error carries `feature_group`, `feature`, `missing_inputs` and
+`available_columns`, and is importable from `mloda.user`, `mloda.provider` and `mloda.steward`.
+A missing `x` next to columns `x_x` and `x_y` usually means a join between two inputs that both
+carry `x` renamed it.
+
+## Related Documentation
+
+- [Feature Group Matching](../feature-group-matching.md)
+- [PROPERTY_MAPPING Configuration](../property-mapping.md)
+- [Feature Group Testing](../feature-group-testing.md)

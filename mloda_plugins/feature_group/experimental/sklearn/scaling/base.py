@@ -1,0 +1,340 @@
+"""
+Scikit-learn scaling feature group.
+"""
+
+from __future__ import annotations
+
+import datetime
+from collections.abc import Callable
+from typing import Any
+
+from mloda.core.optional_dependency import require
+from mloda.provider import OperationFeatureGroup
+from mloda.user import Feature
+from mloda.provider import FeatureSet
+from mloda.provider import (
+    FeatureChainParserMixin,
+)
+from mloda.provider import BaseArtifact
+from mloda.provider import DefaultOptionKeys
+from mloda.provider import PropertySpec
+from mloda_plugins.feature_group.experimental.sklearn.sklearn_artifact import SklearnArtifact
+
+
+class ScalingFeatureGroup(FeatureChainParserMixin, OperationFeatureGroup):
+    """
+    Scikit-learn scaling feature group, served per compute framework by an Implementation.
+
+    The ScalingFeatureGroup provides individual scaling transformations for granular control
+    over data preprocessing, demonstrating mloda's fine-grained transformation capabilities.
+
+    ## Feature Naming Convention
+
+    Scaling features follow this naming pattern:
+    `{in_features}__{scaler_type}_scaled`
+
+    The source feature comes first, followed by the scaling operation.
+    Note the double underscore separating the source feature from the scaler type.
+
+    Examples:
+    - `income__standard_scaled`: Apply StandardScaler to income feature
+    - `age__minmax_scaled`: Apply MinMaxScaler to age feature
+    - `outlier_prone_feature__robust_scaled`: Apply RobustScaler to outlier_prone_feature
+    - `feature_vector__normalizer_scaled`: Apply Normalizer to feature_vector
+
+    ## Supported Scalers
+
+    - **standard**: StandardScaler (mean=0, std=1)
+    - **minmax**: MinMaxScaler (scale to [0,1] range)
+    - **robust**: RobustScaler (uses median and IQR, robust to outliers)
+    - **normalizer**: Normalizer (scale individual samples to unit norm)
+
+    Fitting a new scaler on a column whose rows are all missing raises a ValueError.
+
+    ## Configuration-Based Creation
+
+    ScalingFeatureGroup supports configuration-based. This allows features to be created
+    from options rather than explicit feature names.
+
+    To create a scaling feature using configuration:
+
+    ```python
+    feature = Feature(
+        "PlaceHolder",  # Placeholder name, will be replaced
+        Options({
+            ScalingFeatureGroup.SCALER_TYPE: "standard",
+            DefaultOptionKeys.in_features: "income"
+        })
+    )
+
+    # The Engine will automatically parse this into a feature with name
+    # "income__standard_scaled"
+    ```
+    """
+
+    CONTRACT_VERSION = 1
+
+    # Option keys for scaling configuration
+    SCALER_TYPE = "scaler_type"
+
+    # Supported scaler types
+    SUPPORTED_SCALERS = {
+        "standard": "StandardScaler",
+        "minmax": "MinMaxScaler",
+        "robust": "RobustScaler",
+        "normalizer": "Normalizer",
+    }
+
+    PREFIX_PATTERN = r".*__(?P<scaler_type>standard|minmax|robust|normalizer)_scaled$"
+
+    # In-feature configuration for FeatureChainParserMixin
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+
+    # Property mapping for new configuration-based approach
+    PROPERTY_MAPPING = {
+        SCALER_TYPE: PropertySpec(
+            "Type of scaler to apply",
+            allowed_values=SUPPORTED_SCALERS,
+            context=True,
+            strict_validation=True,
+        ),
+        DefaultOptionKeys.in_features: PropertySpec(
+            "Source feature to scale",
+            context=True,
+            strict_validation=False,
+        ),
+        SklearnArtifact.ARTIFACT_STORAGE_PATH: SklearnArtifact.ARTIFACT_STORAGE_PATH_SPEC,
+    }
+
+    @staticmethod
+    def artifact() -> type[BaseArtifact] | None:
+        """Return the artifact class for sklearn scaler persistence."""
+        return SklearnArtifact
+
+    @classmethod
+    def get_scaler_type(cls, feature_name: str) -> str:
+        """Extract the scaler type from the feature name."""
+        scaler_type = cls.resolve_feature_name(feature_name).value_for(cls.SCALER_TYPE)
+        if scaler_type is None:
+            raise ValueError(f"Invalid scaling feature name format: {feature_name}")
+
+        if scaler_type not in cls.SUPPORTED_SCALERS:
+            raise ValueError(
+                f"Unsupported scaler type: {scaler_type}. Supported types: {', '.join(cls.SUPPORTED_SCALERS.keys())}"
+            )
+
+        return scaler_type
+
+    @classmethod
+    def scale(
+        cls,
+        data: Any,
+        features: FeatureSet,
+        *,
+        training_data: Callable[[Any, str], Any],
+        apply: Callable[[Any, str, Any], Any],
+        add_column: Callable[[Any, str, Any], Any],
+    ) -> Any:
+        """Shared loop: load or fit the scaler, apply it, add the result."""
+        for feature in features.get_sorted_features():
+            scaler_type, source_feature = cls._extract_scaler_type_and_source_feature(feature)
+
+            # Create unique artifact key for this scaler
+            artifact_key = f"{source_feature}__{scaler_type}_scaled"
+
+            # Try to load existing fitted scaler from artifact using helper method
+            fitted_scaler = None
+            artifact = SklearnArtifact.load_sklearn_artifact(features, artifact_key)
+            if artifact:
+                fitted_scaler = artifact["fitted_transformer"]
+                cls._scaler_matches_type(fitted_scaler, scaler_type)
+
+            if len(data) == 0:
+                # Reads the frame directly because pandas is the only Implementation.
+                if (
+                    features.artifact_to_save is not None
+                    and artifact is None
+                    and not isinstance(features.save_artifact, dict)
+                ):
+                    features.save_artifact = {}
+                numpy = require("numpy", "empty scaler result")
+                dtype = numpy.float32 if data[[source_feature]].values.dtype == numpy.float32 else numpy.float64
+                data = add_column(data, feature.name, numpy.empty((0, 1), dtype=dtype))
+                continue
+
+            # If no fitted scaler available, create and fit new one
+            if fitted_scaler is None:
+                fitted_scaler = cls._create_and_fit_scaler(data, source_feature, scaler_type, training_data)
+
+                # Save the fitted scaler as artifact using helper method
+                artifact_data = {
+                    "fitted_transformer": fitted_scaler,
+                    "feature_name": source_feature,
+                    "scaler_type": scaler_type,
+                    "training_timestamp": datetime.datetime.now().isoformat(),
+                }
+                SklearnArtifact.save_sklearn_artifact(features, artifact_key, artifact_data)
+
+            # Apply the fitted scaler to get results
+            result = apply(data, source_feature, fitted_scaler)
+
+            data = add_column(data, feature.name, result)
+
+        return data
+
+    @classmethod
+    def _extract_scaler_type_and_source_feature(cls, feature: Feature) -> tuple[str, str]:
+        """
+        Extract scaler type and source feature name from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based approach.
+
+        Args:
+            feature: The feature to extract parameters from
+
+        Returns:
+            Tuple of (scaler_type, source_feature_name)
+
+        Raises:
+            ValueError: If parameters cannot be extracted
+        """
+        return cls._extract_operation_and_source_feature(feature, cls._extract_scaler_type, "scaler type")
+
+    @classmethod
+    def _extract_scaler_type(cls, feature: Feature) -> str | None:
+        """
+        Extract scaler type from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based approach.
+
+        Args:
+            feature: The feature to extract scaler type from
+
+        Returns:
+            The scaler type string
+
+        Raises:
+            ValueError: If scaler type is unsupported
+        """
+        scaler_type = cls._resolve_operation(feature, cls.SCALER_TYPE)
+
+        if scaler_type is not None and scaler_type not in cls.SUPPORTED_SCALERS:
+            raise ValueError(
+                f"Unsupported scaler type: {scaler_type}. Supported types: {', '.join(cls.SUPPORTED_SCALERS.keys())}"
+            )
+
+        return scaler_type
+
+    @classmethod
+    def _import_sklearn_components(cls) -> dict[str, Any]:
+        """
+        Import sklearn components with fallback logic for different versions.
+
+        Returns:
+            Dictionary containing imported sklearn components
+
+        Raises:
+            ImportError: If sklearn is not available
+        """
+        components = {}
+
+        try:
+            from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, Normalizer
+
+            components.update(
+                {
+                    "StandardScaler": StandardScaler,
+                    "MinMaxScaler": MinMaxScaler,
+                    "RobustScaler": RobustScaler,
+                    "Normalizer": Normalizer,
+                }
+            )
+
+        except ImportError:
+            raise ImportError(
+                "scikit-learn is required for ScalingFeatureGroup. Install with: pip install scikit-learn"
+            )
+
+        return components
+
+    @classmethod
+    def _create_scaler_instance(cls, scaler_type: str) -> Any:
+        """
+        Create a scaler instance based on the scaler type.
+
+        Args:
+            scaler_type: The type of scaler to create
+
+        Returns:
+            Scaler instance
+
+        Raises:
+            ValueError: If scaler type is not supported
+            ImportError: If sklearn is not available
+        """
+        if scaler_type not in cls.SUPPORTED_SCALERS:
+            raise ValueError(
+                f"Unsupported scaler type: {scaler_type}. Supported types: {list(cls.SUPPORTED_SCALERS.keys())}"
+            )
+
+        sklearn_components = cls._import_sklearn_components()
+        scaler_class_name = cls.SUPPORTED_SCALERS[scaler_type]
+        scaler_class = sklearn_components[scaler_class_name]
+
+        return scaler_class()
+
+    @classmethod
+    def _scaler_matches_type(cls, fitted_scaler: Any, scaler_type: str) -> bool:
+        """
+        Check if a fitted scaler matches the expected type.
+
+        Args:
+            fitted_scaler: The fitted scaler
+            scaler_type: The expected scaler type
+
+        Returns:
+            True if the scaler matches the type
+
+        Raises:
+            ValueError: If scaler type mismatch is detected
+        """
+        expected_class_name = cls.SUPPORTED_SCALERS.get(scaler_type)
+        if expected_class_name is None:
+            raise ValueError(f"Unsupported scaler type: {scaler_type}")
+
+        actual_class_name: str = fitted_scaler.__class__.__name__
+        if actual_class_name != expected_class_name:
+            raise ValueError(
+                f"Artifact scaler type mismatch: expected {scaler_type} "
+                f"({expected_class_name}), but loaded artifact contains {actual_class_name}"
+            )
+        return True
+
+    @classmethod
+    def _create_and_fit_scaler(
+        cls, data: Any, source_feature: str, scaler_type: str, training_data: Callable[[Any, str], Any]
+    ) -> Any:
+        """
+        Create and fit a new scaler.
+
+        Args:
+            data: The input data
+            source_feature: Name of the source feature
+            scaler_type: Type of scaler to create
+
+        Returns:
+            Fitted scaler
+        """
+        # Create scaler instance
+        scaler = cls._create_scaler_instance(scaler_type)
+
+        # Extract training data
+        X_train = training_data(data, source_feature)
+        if len(X_train) == 0:
+            raise ValueError(f"Cannot fit a {scaler_type} scaler on '{source_feature}': every row is missing.")
+
+        # Fit the scaler
+        scaler.fit(X_train)
+
+        return scaler

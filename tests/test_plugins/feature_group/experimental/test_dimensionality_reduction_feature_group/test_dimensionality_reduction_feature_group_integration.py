@@ -1,0 +1,332 @@
+"""
+Integration tests for the DimensionalityReductionFeatureGroup.
+"""
+
+from typing import Any
+
+import numpy as np
+import pytest
+
+from mloda.user import mloda
+from mloda.user import Feature
+from mloda.user import Options
+from mloda.user import PluginCollector
+
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.feature_group.experimental.dimensionality_reduction.base import DimensionalityReductionFeatureGroup
+from mloda_plugins.feature_group.experimental.dimensionality_reduction.pandas import (
+    PandasDimensionalityReduction as PandasDimensionalityReduction,
+)
+from mloda.provider import DefaultOptionKeys
+
+from tests.test_plugins.integration_plugins.test_data_creator import ATestDataCreator
+
+
+class DimensionalityReductionFeatureTestDataCreator(ATestDataCreator):
+    """Base class for dimensionality reduction feature test data creators."""
+
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def get_raw_data(cls) -> dict[str, Any]:
+        """Return the raw data as a dictionary with features for dimensionality reduction."""
+        # Create data with some structure for dimensionality reduction
+        np.random.seed(42)
+        # Use minimal samples for unit tests - only need to verify functionality works
+        n_samples = 10
+        n_features = 10
+
+        # Create data with some structure
+        data = np.random.randn(n_samples, n_features)
+
+        # Add some structure (correlations between features)
+        data[:, 1] = data[:, 0] * 0.8 + np.random.randn(n_samples) * 0.2
+        data[:, 2] = data[:, 0] * 0.6 + np.random.randn(n_samples) * 0.4
+
+        # Create column names
+        columns = [f"feature{i}" for i in range(n_features)]
+
+        # Add a categorical column for LDA
+        categories = ["A", "B", "C"]
+        category_column = np.random.choice(categories, size=n_samples)
+
+        # Create a dictionary using the column names
+        result = {column: data[:, i] for i, column in enumerate(columns)}
+        result["category"] = category_column
+
+        return result
+
+
+def validate_dimensionality_reduction_results(result: list) -> None:  # type: ignore
+    """
+    Validate the results of the dimensionality reduction feature test.
+
+    Args:
+        result: List of DataFrames from the mloda.run_all call
+
+    Raises:
+        AssertionError: If validation fails
+    """
+    # Verify we have at least one result
+    assert len(result) >= 1, "Expected at least one result"
+
+    # Convert all results to pandas DataFrames for consistent validation
+    dfs = []
+    for res in result:
+        if hasattr(res, "to_pandas"):
+            dfs.append(res.to_pandas())
+        else:
+            dfs.append(res)
+
+    # Find the DataFrame with the dimensionality reduction features
+    pca_feature = "feature0,feature1,feature2__pca_2d"
+    tsne_feature = "feature0,feature1,feature2__tsne_2d"
+
+    # Check that all features exist in the results
+    result_df = None
+
+    for df in dfs:
+        # If the DataFrame contains any of our dimensionality reduction features, use it
+        if any(col.startswith(pca_feature) or col.startswith(tsne_feature) for col in df.columns):
+            result_df = df
+            break
+
+    # Verify that the result DataFrame was found
+    assert result_df is not None, "DataFrame with dimensionality reduction features not found"
+
+    # Verify the dimensionality reduction results
+    # With the multiple result columns pattern, we check for the dimension columns
+    assert f"{pca_feature}~dim1" in result_df.columns, f"{pca_feature}~dim1 not found"
+    assert f"{pca_feature}~dim2" in result_df.columns, f"{pca_feature}~dim2 not found"
+    assert f"{tsne_feature}~dim1" in result_df.columns, f"{tsne_feature}~dim1 not found"
+    assert f"{tsne_feature}~dim2" in result_df.columns, f"{tsne_feature}~dim2 not found"
+
+
+class TestDimensionalityReductionFeatureGroupIntegration:
+    """Integration tests for the DimensionalityReductionFeatureGroup."""
+
+    def test_integration_with_feature_names_dimension(self) -> None:
+        """Test integration with mloda using explicit feature names."""
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {DimensionalityReductionFeatureTestDataCreator, DimensionalityReductionFeatureGroup}
+        )
+
+        # Define the features
+        features: list[Feature | str] = [
+            "feature0",
+            "feature1",
+            "feature2",
+            "feature0,feature1,feature2__pca_2d",
+            "feature0,feature1,feature2__tsne_2d",
+        ]
+
+        # Run the mloda
+        result = mloda.run_all(features, compute_frameworks=[PandasDataFrame], plugin_collector=plugin_collector)
+
+        # Validate the results
+        validate_dimensionality_reduction_results(result)
+
+    def atest_integration_with_feature_parser(self) -> None:
+        """Test integration with mloda using the parser."""
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {DimensionalityReductionFeatureTestDataCreator, DimensionalityReductionFeatureGroup}
+        )
+
+        # Create features using the parser configuration
+        pca_feature = Feature(
+            "placeholder",
+            Options(
+                {
+                    DimensionalityReductionFeatureGroup.ALGORITHM: "pca",
+                    DimensionalityReductionFeatureGroup.DIMENSION: 2,
+                    DefaultOptionKeys.in_features: "feature0,feature1,feature2",
+                }
+            ),
+        )
+
+        tsne_feature = Feature(
+            "placeholder",
+            Options(
+                {
+                    DimensionalityReductionFeatureGroup.ALGORITHM: "tsne",
+                    DimensionalityReductionFeatureGroup.DIMENSION: 2,
+                    DefaultOptionKeys.in_features: "feature0,feature1,feature2",
+                }
+            ),
+        )
+
+        # Define the features
+        features: list[str | Feature] = ["feature0", "feature1", "feature2", pca_feature, tsne_feature]
+
+        # Run the mloda
+        result = mloda.run_all(features, compute_frameworks=[PandasDataFrame], plugin_collector=plugin_collector)
+
+        # Validate the results
+        validate_dimensionality_reduction_results(result)
+
+    def test_integration_with_different_algorithms(self) -> None:
+        """Test integration with mloda using different dimensionality reduction algorithms."""
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {DimensionalityReductionFeatureTestDataCreator, DimensionalityReductionFeatureGroup}
+        )
+
+        # Define the features
+        features: list[str | Feature] = [
+            "feature0",
+            "feature1",
+            "feature2",
+            "feature0,feature1,feature2__pca_2d",
+            "feature0,feature1,feature2__ica_2d",
+            "feature0,feature1,feature2__isomap_2d",
+        ]
+
+        # Run the mloda
+        result = mloda.run_all(features, compute_frameworks=[PandasDataFrame], plugin_collector=plugin_collector)
+
+        # Verify we have at least one result
+        assert len(result) >= 1, "Expected at least one result"
+
+        # Convert all results to pandas DataFrames for consistent validation
+        dfs = []
+        for res in result:
+            if hasattr(res, "to_pandas"):
+                dfs.append(res.to_pandas())
+            else:
+                dfs.append(res)
+
+        # Find the DataFrame with the dimensionality reduction features
+        pca_feature = "feature0,feature1,feature2__pca_2d"
+        ica_feature = "feature0,feature1,feature2__ica_2d"
+        isomap_feature = "feature0,feature1,feature2__isomap_2d"
+
+        # Check that all features exist in the results
+        result_df = None
+
+        for df in dfs:
+            # If the DataFrame contains any of our dimensionality reduction features, use it
+            if any(
+                col.startswith(pca_feature) or col.startswith(ica_feature) or col.startswith(isomap_feature)
+                for col in df.columns
+            ):
+                result_df = df
+                break
+
+        # Verify that the result DataFrame was found
+        assert result_df is not None, "DataFrame with dimensionality reduction features not found"
+
+        # Verify the dimensionality reduction results
+        # With the multiple result columns pattern, we check for the dimension columns
+        assert f"{pca_feature}~dim1" in result_df.columns, f"{pca_feature}~dim1 not found"
+        assert f"{pca_feature}~dim2" in result_df.columns, f"{pca_feature}~dim2 not found"
+        assert f"{ica_feature}~dim1" in result_df.columns, f"{ica_feature}~dim1 not found"
+        assert f"{ica_feature}~dim2" in result_df.columns, f"{ica_feature}~dim2 not found"
+        assert f"{isomap_feature}~dim1" in result_df.columns, f"{isomap_feature}~dim1 not found"
+        assert f"{isomap_feature}~dim2" in result_df.columns, f"{isomap_feature}~dim2 not found"
+
+    def test_integration_with_config_based_feature(self) -> None:
+        """Test integration with mloda using a config-based dimensionality reduction feature."""
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {DimensionalityReductionFeatureTestDataCreator, DimensionalityReductionFeatureGroup}
+        )
+
+        # Create a config-based feature (any name, with algorithm, dimension and in_features in options)
+        config_feature = Feature(
+            "my_red",
+            Options(
+                context={
+                    DimensionalityReductionFeatureGroup.ALGORITHM: "pca",
+                    DimensionalityReductionFeatureGroup.DIMENSION: 2,
+                    DefaultOptionKeys.in_features: frozenset({"feature0", "feature1", "feature2"}),
+                }
+            ),
+        )
+
+        # Define the features
+        features: list[str | Feature] = ["feature0", "feature1", "feature2", config_feature]
+
+        # Run the mloda
+        result = mloda.run_all(features, compute_frameworks=[PandasDataFrame], plugin_collector=plugin_collector)
+
+        # Verify we have at least one result
+        assert len(result) >= 1, "Expected at least one result"
+
+        # Convert all results to pandas DataFrames for consistent validation
+        dfs = []
+        for res in result:
+            if hasattr(res, "to_pandas"):
+                dfs.append(res.to_pandas())
+            else:
+                dfs.append(res)
+
+        # Find the DataFrame with the config-based feature result
+        result_df = None
+
+        for df in dfs:
+            if any(col.startswith("my_red") for col in df.columns):
+                result_df = df
+                break
+
+        # Verify that the result DataFrame was found
+        assert result_df is not None, "DataFrame with config-based dimensionality reduction features not found"
+
+        # Verify the result columns follow the multiple result columns pattern
+        assert "my_red~dim1" in result_df.columns, "my_red~dim1 not found"
+        assert "my_red~dim2" in result_df.columns, "my_red~dim2 not found"
+
+
+class TestDimensionalityReductionOutputParts:
+    """The group declares dim1..dimN; core resolves, selects and checks `<feature>~dimK`."""
+
+    SOURCE = "feature0,feature1,feature2"
+
+    def _run(self, *names: str) -> list[Any]:
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {DimensionalityReductionFeatureTestDataCreator, DimensionalityReductionFeatureGroup}
+        )
+        features: list[Feature | str] = list(names)
+        return mloda.run_all(features, compute_frameworks=[PandasDataFrame], plugin_collector=plugin_collector)
+
+    @staticmethod
+    def _columns(results: list[Any]) -> set[str]:
+        return {c for frame in results for c in frame.columns}
+
+    def test_name_declares_one_part_per_dimension(self) -> None:
+        group = DimensionalityReductionFeatureGroup
+        assert group.output_parts(f"{self.SOURCE}__pca_2d", Options()) == ("dim1", "dim2")
+        assert group.output_parts(f"{self.SOURCE}__pca_3d", Options()) == ("dim1", "dim2", "dim3")
+
+    def test_config_style_name_declares_no_parts(self) -> None:
+        options = Options(
+            context={
+                DimensionalityReductionFeatureGroup.ALGORITHM: "pca",
+                DimensionalityReductionFeatureGroup.DIMENSION: 3,
+                DefaultOptionKeys.in_features: self.SOURCE,
+            }
+        )
+
+        assert DimensionalityReductionFeatureGroup.output_parts("my_reduction", options) is None
+
+    def test_part_request_returns_only_that_column(self) -> None:
+        name = f"{self.SOURCE}__pca_2d"
+        full = self._run(name)[0]
+        results = self._run(f"{name}~dim1")
+
+        assert self._columns(results) == {f"{name}~dim1"}
+        np.testing.assert_allclose(results[0][f"{name}~dim1"].to_numpy(), full[f"{name}~dim1"].to_numpy())
+
+    def test_last_part_of_a_larger_reduction(self) -> None:
+        name = "feature0,feature1,feature2,feature3__pca_3d"
+
+        assert self._columns(self._run(f"{name}~dim3")) == {f"{name}~dim3"}
+
+    def test_undeclared_part_fails_at_resolution_and_lists_declared(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            self._run(f"{self.SOURCE}__pca_2d~dim3")
+
+        message = str(excinfo.value)
+        assert "dim3" in message
+        assert "dim1" in message and "dim2" in message

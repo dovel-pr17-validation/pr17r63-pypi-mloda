@@ -1,0 +1,284 @@
+"""The stock file source groups, and a deliberately failing group, the interface tests enable in their collectors."""
+
+import hashlib
+from typing import Any
+
+from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.abstract_plugins.components.validators.missing_input_validator import MissingInputFeatureError
+from mloda.provider import FeatureSet, credential_handle_spec, property_spec
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+from mloda_plugins.feature_group.input_data.file_formats.csv_fg import CsvFG
+from mloda_plugins.feature_group.input_data.file_formats.feather_fg import FeatherFG
+from mloda_plugins.feature_group.input_data.file_formats.json_fg import JsonFG
+from mloda_plugins.feature_group.input_data.file_formats.orc_fg import OrcFG
+from mloda_plugins.feature_group.input_data.file_formats.parquet_fg import ParquetFG
+
+FILE_SOURCE_GROUPS: frozenset[type[FeatureGroup]] = frozenset({CsvFG, FeatherFG, JsonFG, OrcFG, ParquetFG})
+
+PASTED = "sk-live-aaaaBBBBccccDDDD1234"  # nosec B105
+PASTED_UNDERSCORE = "ghp_aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bD1fH3jK5"  # nosec B105
+
+RAISE = "income__mcp5_raise"
+RAISE_SECRET = "SECRET_runner_boom_5c1d"  # nosec B105
+
+
+class RunnerRaiseMcp5(FeatureGroup):
+    """Fails while computing, with a message that holds data."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == RAISE
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("income")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        raise ValueError(RAISE_SECRET)
+
+
+PLAN_RAISE = "mcp5_plan_raise"
+PLAN_RAISE_SECRET = "SECRET_plan_raise_9e2b"  # nosec B105
+
+
+class PlanRaiseMcp5(FeatureGroup):
+    """Fails while planning, with a message that holds data."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == PLAN_RAISE
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        raise ValueError(PLAN_RAISE_SECRET)
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return data
+
+
+FAILED = "income__mcp5_failed"
+FAILED_MANY = "income__mcp5_failed_many"
+FAILED_CTRL = "income__mcp5_failed_ctrl"
+FAILED_LONG = "income__mcp5_failed_long"
+FAILED_ENTRIES = "income__mcp5_failed_entries"
+FAILED_COLUMN_CTRL = "bad\ncol"
+FAILED_COLUMN_LONG = "c" * 250
+FAILED_MANY_ROWS = 1500
+FAILED_ENTRY_COUNT = 120
+
+
+class RunnerFailedRowsMcp5(FeatureGroup):
+    """Derives income and reports rows that got no value."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) in {FAILED, FAILED_MANY, FAILED_CTRL, FAILED_LONG, FAILED_ENTRIES}
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("income")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        from mloda.provider import report_failed_rows
+
+        columns: dict[str, list[Any]] = {}
+        for feature_name in features.get_all_names():
+            name = str(feature_name)
+            columns[name] = [int(value) for value in data["income"]]
+            if name == FAILED:
+                report_failed_rows(name, [1, 3], "timeout")
+            elif name == FAILED_MANY:
+                report_failed_rows(name, list(range(FAILED_MANY_ROWS)), "bulk")
+            elif name == FAILED_LONG:
+                report_failed_rows(FAILED_COLUMN_LONG, [0], "long")
+            elif name == FAILED_ENTRIES:
+                for index in range(FAILED_ENTRY_COUNT):
+                    report_failed_rows(f"col{index}", [0], "many")
+            else:
+                report_failed_rows(FAILED_COLUMN_CTRL, [0], "ctrl")
+        return columns
+
+
+MISSING = "income__mcp5_missing"
+MISSING_INPUT = "mcp5_absent_input"
+
+
+class RunnerMissingInputMcp5(FeatureGroup):
+    """Fails while computing because a declared input is absent."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == MISSING
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("income")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        raise MissingInputFeatureError("RunnerMissingInputMcp5", MISSING, (MISSING_INPUT,), ("income",))
+
+
+CALLER_LOCKED_KEY = "mcp_secret_base_url"
+CALLER_LOCKED_FEATURE = "mcp_caller_locked_feature"
+
+
+class CallerLockedMcp6(FeatureGroup):
+    """Declares an option no MCP caller may set."""
+
+    PROPERTY_MAPPING = {
+        CALLER_LOCKED_KEY: property_spec("Operator-only base URL.", default=None, caller_settable=False),
+    }
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == CALLER_LOCKED_FEATURE
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("income")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {CALLER_LOCKED_FEATURE: list(data["income"])}
+
+
+CALLER_OPEN_FEATURE = "mcp_caller_open_feature"
+
+
+class CallerOpenMcp7(CallerLockedMcp6):
+    """Declares the same key with the default, settable spec; another group locks it."""
+
+    PROPERTY_MAPPING = {CALLER_LOCKED_KEY: property_spec("Same key, settable here.", default=None)}
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == CALLER_OPEN_FEATURE
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {CALLER_OPEN_FEATURE: list(data["income"])}
+
+
+CRED_KEY = "mcp_cred_handle"
+CRED_FIELD = "token"
+CRED_FEATURE = "mcp_cred_feature"
+CRED_DEFAULT_FEATURE = "mcp_cred_default_feature"
+CRED_DEFAULT_HANDLE = "mcp_default_handle_name"
+
+
+def credential_config(
+    base_config: str, anchor: str, *, handle: str | None = None, credentials: str = 'token = "TOK_VAR"'
+) -> str:
+    """Config text with CRED_FEATURE classified after `anchor`, an optional handle option and a `db` credential."""
+    text = base_config.replace(anchor, f'{anchor}\n{CRED_FEATURE} = "public"')
+    if handle is not None:
+        text += f'\n[mcp.options]\n{CRED_KEY} = "{handle}"\n'
+    return text + f"\n[mcp.credentials.db]\n{credentials}\n"
+
+
+def cred_digest(secret: str) -> str:
+    """The value CredentialReadMcp8 emits for a secret, so tests can check it without echoing the secret."""
+    return hashlib.sha256(secret.encode()).hexdigest()[:12]
+
+
+class CredentialReadMcp8(FeatureGroup):
+    """Reads the operator-registered credential named by its handle option."""
+
+    OUTPUT_FEATURE = CRED_FEATURE
+
+    PROPERTY_MAPPING = {CRED_KEY: credential_handle_spec("Operator-registered credential handle.")}
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == CRED_FEATURE
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("income")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        from mloda.provider import read_credential
+
+        secret = str(read_credential(features.get_options_key(CRED_KEY))[CRED_FIELD])
+        return {cls.OUTPUT_FEATURE: [cred_digest(secret) for _ in data["income"]]}
+
+
+class CredentialDefaultMcp8(CredentialReadMcp8):
+    """Declares the handle option with a default handle."""
+
+    OUTPUT_FEATURE = CRED_DEFAULT_FEATURE
+    PROPERTY_MAPPING = {
+        CRED_KEY: credential_handle_spec("Handle with a default.", default=CRED_DEFAULT_HANDLE),
+    }
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == CRED_DEFAULT_FEATURE

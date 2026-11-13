@@ -1,0 +1,258 @@
+# Data Type Enforcement
+
+mloda supports optional data type declarations on Features, enabling runtime validation that computed data matches declared types.
+
+## Declaring Feature Types
+
+Use typed constructors to declare the expected data type:
+
+```python
+from typing import Any
+from mloda.user import Feature
+
+# Typed features: Will be validated at runtime
+feature_int = Feature.int32_of("user_count")
+feature_double = Feature.double_of("price")
+feature_str = Feature.str_of("name")
+
+# Untyped feature: No validation
+feature_any = Feature.not_typed("legacy_column")
+```
+
+Available typed constructors:
+- `int32_of()`, `int64_of()`: Integer types
+- `float_of()`, `double_of()`: Floating point types
+- `str_of()`: String type
+- `boolean_of()`: Boolean type
+- `date_of()`, `timestamp_millis_of()`, `timestamp_micros_of()`: Date/time types
+- `decimal_of()`, `binary_of()`: Other types
+
+Members without a typed constructor are declared with `Feature(name, data_type=DataType.UINT8)`.
+
+## Declaring a Feature Group's Output Type
+
+The section above is the *data user* declaring a type on a `Feature`. A *feature group* can also
+declare the type it produces, via `return_data_type_rule`, the provider-side counterpart. mloda
+reconciles the two at planning time.
+
+```python
+from mloda.provider import FeatureGroup
+from mloda.user import DataType
+
+
+class UserCount(FeatureGroup):
+    @classmethod
+    def return_data_type_rule(cls, feature) -> DataType | None:
+        return DataType.INT64
+```
+
+The rule returns either:
+
+- a concrete `DataType`: the group always emits this type;
+- `None` (the default): no fixed type / polymorphic.
+
+Reconciliation with the user's declared type, at planning:
+
+- rule returns a concrete `DataType` that **differs** from the user's declared type → planning raises a mismatch (loud, early);
+- rule returns `None` → the user's declared type (if any) stands;
+- rule returns a concrete type and the user declared none → the rule's type is used.
+
+A feature that ends up with `data_type=None` is then skipped by the compute-time validator (below);
+a concrete declared type flows through to runtime checking against the actual column dtype.
+
+### Errors are not swallowed
+
+`return_data_type_rule` runs *after* the feature group has been selected for the feature, so a rule
+that raises is a failure of a committed component, not a non-applicable candidate. mloda does **not**
+catch it, the exception propagates and fails planning. If your rule does work that can legitimately
+fail to determine a type, return `None` for that case rather than letting it raise.
+
+## Validation Behavior
+
+### Default (Lenient) Mode
+
+By default, validation applies a family rule: any declared integer or float type accepts any integer or float type (DECIMAL is excluded), and any declared timestamp type accepts any timestamp type, naive or tz-aware. Everything else must match exactly.
+
+Cross-category mismatches (e.g., STRING declared but INT64 returned) raise `DataTypeMismatchError`.
+
+### Strict Mode
+
+Enable strict validation per-feature via options:
+
+```python
+feature = Feature.int32_of(
+    "exact_count",
+    options={"strict_type_enforcement": True}
+)
+```
+
+In strict mode, only exact type matches or widening conversions are allowed:
+
+| Declared Type | Compatible Actual Types |
+|---------------|------------------------|
+| INT32 | INT8, UINT8 |
+| INT64 | INT8, INT32, UINT8 |
+| UINT64 | UINT8 |
+| DOUBLE | FLOAT, INT8, INT32, INT64, UINT8, UINT64 |
+| TIMESTAMP_MICROS | TIMESTAMP_MILLIS |
+
+Naive and tz-aware timestamps never widen into each other.
+
+## Implementing the Hook in a Custom Compute Framework
+
+Enforcement is driven by a single override point on `ComputeFramework`:
+
+```python
+def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
+    ...
+```
+
+When a typed feature is produced, mloda calls this hook for the column and compares
+the returned `DataType` against the feature's declared type, raising
+`DataTypeMismatchError` on an incompatible pairing (per the lenient/strict rules above).
+
+The contract:
+
+- **Return a `DataType`** to have the column validated. Map the framework's native type
+  (e.g. `pa.DataType`, `pd.api.types`, `polars.DataType`, a pyspark/pyiceberg type) directly
+  to the unified `DataType` enum: no string round-trip.
+- **Return `None` to skip the column.** The validator treats `None` as a graceful no-op and
+  performs no check for that column.
+
+!!! warning "The base implementation is a silent no-op"
+    `ComputeFramework._extract_column_data_type` returns `None` by default. A custom framework
+    that does not override it ships with **type enforcement effectively disabled**: declared
+    feature types are silently never checked. Override the hook to opt your framework in.
+
+A custom framework imports `DataType` from the public API:
+
+```python
+from mloda.user import DataType
+from mloda.provider import ComputeFramework
+
+
+class MyFramework(ComputeFramework):
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
+        native = data.schema.field(column_name).type  # framework-specific access
+        if native == ...:
+            return DataType.INT64
+        # Unknown / unmappable type: skip rather than guess.
+        return None
+```
+
+See `PythonDictFramework._extract_column_data_type` for a complete reference override, and
+the table below for how each bundled framework handles precisions its backend cannot
+distinguish (it returns the widest type in the family rather than `None`, so lenient-mode
+validation still applies).
+
+A framework can also implement `_exact_column_data_type`, which returns the `DataType` the column's native type is exactly, or `None` otherwise. The mloda testing kit's type checks read it; without it they judge by value.
+
+## Per-Framework Precision Support
+
+Not every backend's native type system can distinguish every precision mloda declares. The table below shows which precisions each bundled framework can extract from data. For the rest, the framework's `_extract_column_data_type` returns the widest type in the family (still correct under lenient mode), and strict-mode tests for the affected precision are skipped with a clear reason.
+
+Integer widths without a member resolve to the next lossless one: int16 and uint16 to INT32, uint32 to INT64.
+
+Naive Arrow `s` and `ns` timestamps resolve to TIMESTAMP_MICROS. Polars has no second precision, so a naive `s` column reads back as TIMESTAMP_MILLIS.
+
+| Framework | INT32 / INT64 | INT8 / UINT8 / UINT64 | FLOAT / DOUBLE | TIMESTAMP_MILLIS / MICROS | TIMESTAMP_MICROS_TZ | LIST |
+|---|---|---|---|---|---|---|
+| Pandas | yes | yes | yes | yes | yes (numpy tz and Arrow-backed) | only Arrow-backed columns |
+| Polars (eager / lazy) | yes | yes | yes | yes | yes | yes |
+| PyArrow | yes | yes | yes | yes | yes | yes |
+| DuckDB | yes | yes | yes | yes | yes | yes |
+| Spark | yes | INT8 only (no unsigned) | yes | no (`TimestampType` and `TimestampNTZType` resolve to TIMESTAMP_MICROS) | no (strict mode cannot pass it on Spark data; lenient mode passes) | yes |
+| Iceberg | yes | no (no narrow or unsigned ints) | yes | no (only `TimestampType` exists) | yes | yes |
+| SQLite | no (INTEGER affinity) | yes (through Arrow type hints) | no (REAL affinity) | no (stored as TEXT) | yes (through Arrow type hints, for relations built from Arrow) | no (no list storage) |
+| PythonDict | no (`type.__name__` is "int") | no | no (Python float is 64-bit) | no (`datetime.datetime` is microsecond) | yes (aware `datetime`) | yes |
+
+A custom ComputeFramework should map tz-aware timestamp columns to `TIMESTAMP_MICROS_TZ`.
+
+## List Columns
+
+`DataType.LIST` matches a list of any element type; elements are not checked, and `to_arrow_type` raises for it. `list_view`, `large_list_view` and `date64` stay unresolved.
+
+## Decimal Columns
+
+`DataType.DECIMAL` means a decimal of any precision and scale: a `Feature` cannot declare precision or scale, and validation checks only the family. `to_arrow_type` maps `DECIMAL` to `decimal128(38, 18)` only when mloda must build an Arrow schema without data (the SQLite source group). `DECIMAL` never coerces to or from the float or integer family, in strict and lenient mode alike: exactness is the reason to declare it.
+
+| Framework | Extraction | Filter, mask, merge | PyArrow transformer |
+|---|---|---|---|
+| Pandas | `DECIMAL` for an Arrow-backed decimal dtype; an `object` column holding only strings is validated as `STRING`, other `object` columns (including `Decimal`) are not validated | exact | Arrow-backed decimals are kept in both directions; an `object` column of `Decimal` has its precision inferred from the values on the way out, and comes back Arrow-backed after a round trip through Arrow |
+| Polars (eager / lazy) | `DECIMAL` | exact (including `is_in`; values the column cannot represent never match) | exact |
+| PyArrow | `DECIMAL` | exact | native |
+| DuckDB | `DECIMAL` | exact (a `Decimal` value renders as an exact decimal literal) | exact |
+| SQLite | no decimal storage type: inserting `Decimal` values fails | a `Decimal` filter or mask value renders as a numeric literal, which SQLite compares as REAL against a TEXT column | fails |
+| PythonDict | `DECIMAL` | exact | precision inferred from the values (a dict carries no schema) |
+| Spark | `DECIMAL` | mask `is_in` exact; filter and merge not checked | not checked (no schema is passed on the way in) |
+| Iceberg | `DECIMAL` | decimal filters are not pushed into the scan; they run exactly in the PyArrow pass, for both an Iceberg `Table` and a `pa.Table` result; no mask or merge | pass-through |
+
+## Execution Plan Grouping
+
+Features with different explicit data types are separated into different execution groups at plan time. This allows type-specific processing paths.
+
+Untyped features (`data_type=None`) are "lenient" and can be grouped with any typed features, preserving compatibility with index columns and legacy code.
+
+```python
+# These will be in DIFFERENT execution groups
+Feature.int32_of("amount")
+Feature.int64_of("amount")
+
+# This can join ANY group (lenient)
+Feature.not_typed("id")
+```
+
+### Reusing a typed request as an input
+
+When a feature is requested with a type and also needed without a type as another feature's input,
+mloda can reuse the typed request. For example, a direct `Feature.int64_of("amount")` can satisfy an
+input declared as `Feature("amount")`. Otherwise-identical requests produce the column once, retain
+the declared type for runtime validation, and keep the consumer connected regardless of request order.
+Previously, this pair produced two planned features and could fail with duplicate columns in append-style groups.
+Reuse requires completed input resolution: a column injected for a filter or index does not suppress
+the dependency resolution of a later typed request.
+When several typed requests are already present when the untyped input is resolved, mloda reuses the one
+whose data type name sorts first (for example `INT32` before `INT64`), so the choice does not depend on set order.
+
+The other identity constraints still apply, including options, context, domain, compute frameworks,
+implementation and data source. Two different explicit types remain separate, as does a typed input
+paired with an untyped direct request. A typed request on a strictly narrower compute framework set,
+such as one pinned to a single framework, also serves an untyped input copy of the same feature on a
+wider set when it is the only narrowest such request, so the feature is computed once.
+Likewise, an untyped input copy on a strictly narrower set serves a typed request on a wider set and takes its
+type when it is the only narrowest such copy. When typed requests of different types compete for one input copy,
+the type whose name sorts first takes it and the other request stays separate.
+Ordinary `Feature` equality and hashing remain type-sensitive.
+
+## Database Type Awareness
+
+When reading from databases (e.g., SQLite), declared types are used to build the PyArrow schema:
+
+```python
+# Declared type is used for schema, not inferred from data
+feature = Feature.int64_of(
+    "user_id",
+    options={"sqlite": "/path/to/db.sqlite"}
+)
+```
+
+## Error Handling
+
+Type mismatches raise `DataTypeMismatchError`:
+
+```python
+from mloda.user import mloda
+from mloda.user import Feature
+from mloda.provider import DataTypeMismatchError
+
+try:
+    result = mloda.run_all(
+        [Feature.str_of("numeric_column")],
+        compute_frameworks=["PandasDataFrame"],
+        api_data={"SampleData": {"numeric_column": [1, 2, 3]}},
+    )
+except DataTypeMismatchError as e:
+    print(f"Feature '{e.feature_name}': declared {e.declared.name}, got {e.actual.name}")
+```
+
+The request needs a source for `numeric_column`; without one, resolution fails before any type is checked.

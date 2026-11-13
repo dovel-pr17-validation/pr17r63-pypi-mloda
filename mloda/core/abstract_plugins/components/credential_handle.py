@@ -1,0 +1,390 @@
+"""Credential handle option spec and its plan-time validation.
+
+A declared handle option names a credential registered in the DataAccessCollection. Core checks the
+handle at plan time.
+"""
+
+from __future__ import annotations
+
+import re
+from array import array
+from collections.abc import ItemsView, KeysView, Mapping, Sequence, ValuesView
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, fields, is_dataclass
+from difflib import get_close_matches
+from typing import TYPE_CHECKING, Any
+
+from mloda.core.abstract_plugins.components.credential_leaves import (
+    CredentialKeyPolicy,
+    _is_shaped,
+    credential_key_names,
+    iter_credential_leaves,
+    normalize_credential_key,
+    public_key_names,
+)
+from mloda.core.abstract_plugins.components.credential_scrub import _COUNT_NAME
+from mloda.core.abstract_plugins.components.property_spec import NO_DEFAULT, PropertySpec
+from mloda.core.abstract_plugins.components.utils import (
+    PREFIX_OPTION_KEY_FLAG,
+    escalate_match_abort,
+    is_nominal_subclass,
+    mark_credential_abort,
+)
+
+if TYPE_CHECKING:
+    from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+    from mloda.core.abstract_plugins.components.options import Options
+    from mloda.core.abstract_plugins.feature_group import FeatureGroup
+
+
+def _handle_element_validator(value: Any) -> bool:
+    """True for a non-empty str; any other value is a marked abort naming its type, never the value."""
+    if isinstance(value, str) and value:
+        return True
+    error = ValueError(
+        f"A credential handle must be a non-empty str naming a registered credential, got {type(value).__name__}."
+    )
+    error.__dict__[PREFIX_OPTION_KEY_FLAG] = True
+    raise escalate_match_abort(mark_credential_abort(error))
+
+
+def _field_names(spec: CredentialHandleSpec, name: str, value: Any) -> tuple[str, ...]:
+    prefix = f"CredentialHandleSpec({spec.explanation!r})"
+    if name == "public_fields":
+        return public_key_names(f"{prefix}: {name}", value)
+    return credential_key_names(f"{prefix}: {name}", value)
+
+
+@dataclass(frozen=True)
+class CredentialHandleSpec(PropertySpec):
+    """A PropertySpec whose value names a credential handle; the subclass type is the marker core reads."""
+
+    required_fields: tuple[str, ...] = ()
+    public_fields: tuple[str, ...] = ()
+    forward_to_inputs: bool = False
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        prefix = f"CredentialHandleSpec({self.explanation!r})"
+        if (
+            self.context is not False
+            or self.strict_validation is not True
+            or self.caller_settable is not False
+            or self.forward_to_inputs is not False
+            or self.deferred_binding is not False
+        ):
+            raise ValueError(
+                f"{prefix}: context=False, strict_validation=True, caller_settable=False, "
+                f"forward_to_inputs=False and deferred_binding=False are fixed."
+            )
+        if self.element_validator is not _handle_element_validator:
+            raise ValueError(f"{prefix}: the handle element validator is fixed.")
+        for name in ("match_guard", "allowed_values", "required_when", "name_converter"):
+            if getattr(self, name) is not None:
+                raise ValueError(f"{prefix}: {name} must stay None for a credential handle.")
+        object.__setattr__(self, "required_fields", _field_names(self, "required_fields", self.required_fields))
+        object.__setattr__(self, "public_fields", _field_names(self, "public_fields", self.public_fields))
+
+
+def credential_handle_spec(
+    explanation: str,
+    *,
+    default: Any = NO_DEFAULT,
+    required_fields: tuple[str, ...] = (),
+    public_fields: tuple[str, ...] = (),
+) -> CredentialHandleSpec:
+    """Build a spec for an option naming a credential handle registered in the DataAccessCollection."""
+    return CredentialHandleSpec(
+        explanation,
+        default=default,
+        context=False,
+        strict_validation=True,
+        element_validator=_handle_element_validator,
+        caller_settable=False,
+        forward_to_inputs=False,
+        required_fields=required_fields,
+        public_fields=public_fields,
+    )
+
+
+def credential_handle_keys(feature_group: type[FeatureGroup]) -> dict[str, CredentialHandleSpec]:
+    """The group's declared credential handle option keys."""
+    mapping = getattr(feature_group, "PROPERTY_MAPPING", None) or {}
+    return {key: spec for key, spec in mapping.items() if isinstance(spec, CredentialHandleSpec)}
+
+
+def public_credential_keys() -> frozenset[str]:
+    """Normalized keys every loaded feature group declares as public, by PUBLIC_CREDENTIAL_KEYS or public_fields."""
+    # Function-local: avoids an import cycle through the feature group module.
+    from mloda.core.abstract_plugins.feature_group import feature_group_subclasses
+
+    keys: set[str] = set()
+    for group in feature_group_subclasses():
+        keys.update(
+            normalize_credential_key(key) for key in credential_key_names(group.__name__, group.PUBLIC_CREDENTIAL_KEYS)
+        )
+        for spec in credential_handle_keys(group).values():
+            keys.update(normalize_credential_key(key) for key in spec.public_fields)
+    return frozenset(keys)
+
+
+def _declared(feature_group: type[FeatureGroup], options: Options) -> dict[str, Any]:
+    keys = credential_handle_keys(feature_group)
+    if not keys:
+        return {}
+    resolved = feature_group.options_with_defaults(options)
+    return {key: resolved.get(key) for key in keys}
+
+
+def declared_credential_handles(feature_group: type[FeatureGroup], options: Options) -> tuple[str, ...]:
+    """Sorted handle names a step declares; an unset optional handle declares nothing."""
+    return tuple(sorted({v for v in _declared(feature_group, options).values() if isinstance(v, str)}))
+
+
+def _bytes_path(entry: Any, policy: CredentialKeyPolicy | None) -> str | None:
+    for item in iter_credential_leaves(entry, policy):
+        if item.secret and isinstance(item.leaf, (bytes, bytearray, memoryview)):
+            return item.path
+    return None
+
+
+def _refuse(message: str) -> ValueError:
+    return escalate_match_abort(mark_credential_abort(ValueError(message)))
+
+
+def _check_one(
+    feature_group: type[FeatureGroup],
+    key: str,
+    spec: CredentialHandleSpec,
+    handle: Any,
+    dac: DataAccessCollection | None,
+) -> None:
+    group_name = feature_group.__name__
+    if not isinstance(handle, str) or not handle:
+        raise _refuse(
+            f"Option '{key}' of {group_name} must be a non-empty str naming a credential handle, "
+            f"got {type(handle).__name__}."
+        )
+    credentials: dict[str, Any] = {} if dac is None else dac.credentials
+    auto = frozenset() if dac is None else dac.auto_handles
+    if handle in auto:
+        raise _refuse(
+            f"Option '{key}' of {group_name} names an unnamed credential. Register the credential under a name "
+            f"in the DataAccessCollection and name it here."
+        )
+    if handle not in credentials:
+        actual_kind = None if dac is None else dac.handles().get(handle)
+        if actual_kind is not None:
+            raise _refuse(
+                f"Option '{key}' of {group_name} names handle '{handle}', which is registered under kind "
+                f"'{actual_kind}', but kind 'credentials' is required."
+            )
+        named = sorted(h for h in credentials if h not in auto)
+        unnamed = len(credentials) - len(named)
+        suffix = f" and {unnamed} unnamed" if unnamed else ""
+        raise _refuse(
+            f"Option '{key}' of {group_name} names handle '{handle}', which is not a registered credential. "
+            f"Available credential handles: {named}{suffix}."
+        )
+    entry = credentials[handle]
+    if spec.required_fields:
+        present = entry if isinstance(entry, Mapping) else {}
+        missing = [field for field in spec.required_fields if field not in present]
+        if missing:
+            raise _refuse(
+                f"Credential handle '{handle}' for option '{key}' of {group_name} is missing required "
+                f"fields: {missing}."
+            )
+    path = _bytes_path(entry, None if dac is None else dac.credential_key_policy())
+    if path is not None:
+        raise _refuse(
+            f"Credential handle '{handle}' for option '{key}' of {group_name} holds bytes at '{path}'. "
+            f"Store a hex or base64 str and decode it in the plugin."
+        )
+
+
+_OPAQUE_SEQUENCES = (str, bytes, bytearray, memoryview, range, array)
+
+
+def _children(value: Any) -> list[Any]:
+    if isinstance(value, Mapping):
+        return [*value.keys(), *value.values()]
+    if isinstance(value, (KeysView, ValuesView, ItemsView, AbstractSet)) or (
+        isinstance(value, Sequence) and not isinstance(value, _OPAQUE_SEQUENCES)
+    ):
+        return list(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return [getattr(value, f.name, None) for f in fields(value)]
+    return []
+
+
+def _credential_hit(value: Any, seen: dict[int, Any]) -> str | None:
+    """The credential type name found in value, descending containers, or None."""
+    from mloda.core.abstract_plugins.components.credential import Credential, RegisteredCredential
+    from mloda.core.abstract_plugins.components.credential_access import ResolvedCredential
+
+    if isinstance(value, (Credential, RegisteredCredential, ResolvedCredential)):
+        return type(value).__name__
+    if id(value) in seen:
+        return None
+    seen[id(value)] = value
+    for child in _children(value):
+        hit = _credential_hit(child, seen)
+        if hit is not None:
+            return hit
+    return None
+
+
+def refuse_credential_option_values(options: Options) -> None:
+    """Refuse a credential in any non-pointer option value, walking containers; names key and type only."""
+    # Function-local: avoids an import cycle through the source feature group module.
+    from mloda.core.abstract_plugins.components.input_data.source_feature_group import concrete_source_groups
+
+    from mloda.core.abstract_plugins.components.credential import Credential, RegisteredCredential
+    from mloda.core.abstract_plugins.components.credential_access import ResolvedCredential
+
+    pointer_keys: Any = None
+    for key, value in [*options.group.items(), *options.context.items()]:
+        hit = _credential_hit(value, {})
+        if hit is None:
+            continue
+        if pointer_keys is None:
+            pointer_keys = concrete_source_groups().keys()
+        if key in pointer_keys:
+            continue
+        direct = isinstance(value, (Credential, RegisteredCredential, ResolvedCredential))
+        where = "" if direct else " nested in its value"
+        raise _refuse(
+            f"Option '{key}' holds a {hit}{where}. A credential is never an option value: register it in the "
+            f"DataAccessCollection and name its handle in an option declared with credential_handle_spec, "
+            f"then read it with read_credential."
+        )
+
+
+_SHAPED_NAMES_SHOWN = 3
+_PATH_SEGMENT = re.compile(r"[^.\[\]]+")
+
+
+def _shaped_key_names(value: Any) -> list[str]:
+    """First secret-shaped, non-count-name key segment of each leaf path, deduplicated, in order."""
+    found: dict[str, None] = {}
+    for leaf in iter_credential_leaves(value):
+        if not leaf.shaped:
+            continue
+        names = _PATH_SEGMENT.findall(leaf.path)
+        hit = next((n for n in names if _is_shaped(n) and not _COUNT_NAME.fullmatch(n)), None)
+        if hit is not None:
+            found[hit] = None
+    return list(found)
+
+
+def refuse_unread_pointer_credentials(feature_group: type[FeatureGroup], options: Options) -> None:
+    """Refuse a self-set pointer-key credential on a group that is not that source; never names the value."""
+    # Function-local: avoids an import cycle through the source feature group module.
+    from mloda.core.abstract_plugins.components.input_data.source_feature_group import concrete_source_groups
+
+    sources = concrete_source_groups()
+    for key, value in [*options.group.items(), *options.context.items()]:
+        source = sources.get(key)
+        if source is None or not options.is_own(key):
+            continue
+        hit = _credential_hit(value, {})
+        if is_nominal_subclass(feature_group, source):
+            continue
+        if hit is None:
+            names = _shaped_key_names(value)
+            if names:
+                shown = ", ".join(names[:_SHAPED_NAMES_SHOWN])
+                extra = f" and {len(names) - _SHAPED_NAMES_SHOWN} more" if len(names) > _SHAPED_NAMES_SHOWN else ""
+                raise _refuse(
+                    f"Option '{key}' holds a mapping with secret-shaped keys ({shown}{extra}) but "
+                    f"{feature_group.__name__} is not the source group {key}, so the credential would reach a group "
+                    f"that never reads it. Register the credential in the DataAccessCollection and name its handle "
+                    f"in an option declared with credential_handle_spec."
+                )
+            continue
+        holder = hit if type(value).__name__ == hit else f"{type(value).__name__} holding a {hit}"
+        raise _refuse(
+            f"Option '{key}' holds a {holder} but {feature_group.__name__} is not the source group {key}, so the "
+            f"credential would reach a group that never reads it. Register the credential in the "
+            f"DataAccessCollection and name its handle in an option declared with credential_handle_spec."
+        )
+
+
+def _close_option_key(feature_group: type[FeatureGroup], key: str, options: Options) -> str | None:
+    mapping = feature_group.PROPERTY_MAPPING or {}
+    candidates = [name for name in [*options.group, *options.context] if name not in mapping]
+    close = get_close_matches(key, candidates, n=1, cutoff=0.8)
+    return close[0] if close else None
+
+
+def close_handle_option_keys(
+    feature_group: type[FeatureGroup], keys: tuple[str, ...], options: Options
+) -> tuple[str, ...]:
+    """The close undeclared option keys supplied in place of the given absent handle keys."""
+    close = (_close_option_key(feature_group, key, options) for key in keys)
+    return tuple(name for name in close if name)
+
+
+def _missing_sentence(feature_group: type[FeatureGroup], key: str, options: Options) -> str:
+    close = _close_option_key(feature_group, key, options)
+    hint = f" (did you mean '{close}'?)" if close else ""
+    return f"{feature_group.__name__} requires credential handle option '{key}', which is not set{hint}."
+
+
+def missing_credential_handle_keys(feature_group: type[FeatureGroup], options: Options) -> tuple[str, ...]:
+    """The group's declared handle keys that are required and absent from the options."""
+    # Function-local: avoids an import cycle through the feature chain parser.
+    from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import FeatureChainParser
+
+    keys = credential_handle_keys(feature_group)
+    if not keys:
+        return ()
+    mapping = feature_group.PROPERTY_MAPPING or {}
+    absent = FeatureChainParser._name_path_missing_required_keys(feature_group.options_with_defaults(options), mapping)
+    return tuple(key for key in absent if key in keys)
+
+
+def misspelled_handle_key_abort_keys(feature_group: type[FeatureGroup], options: Options) -> tuple[str, ...]:
+    """Absent handle keys with a close supplied key, when only handle keys are missing; else empty."""
+    # Function-local: avoids an import cycle through the feature chain parser.
+    from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import FeatureChainParser
+
+    missing = missing_credential_handle_keys(feature_group, options)
+    if not missing:
+        return ()
+    mapping = feature_group.PROPERTY_MAPPING or {}
+    absent = FeatureChainParser._name_path_missing_required_keys(feature_group.options_with_defaults(options), mapping)
+    if any(key not in missing for key in absent):
+        return ()
+    if not any(_close_option_key(feature_group, key, options) for key in missing):
+        return ()
+    return missing
+
+
+def missing_credential_handle_abort(
+    feature_group: type[FeatureGroup], options: Options, missing: tuple[str, ...]
+) -> ValueError:
+    """The marked abort for absent required handle keys, naming a close undeclared option key."""
+    return _refuse(" ".join(_missing_sentence(feature_group, key, options) for key in missing))
+
+
+def validate_credential_handles(
+    feature_group: type[FeatureGroup], options: Options, dac: DataAccessCollection | None
+) -> None:
+    """Refuse a bad declared credential handle with a marked abort; messages never hold a credential value."""
+    keys = credential_handle_keys(feature_group)
+    if not keys:
+        return
+    for key in keys:
+        if key in options.context:
+            raise _refuse(
+                f"Option '{key}' declares a credential handle for {feature_group.__name__} and must be a "
+                f"group option, not a context option."
+            )
+    for key, handle in _declared(feature_group, options).items():
+        if handle is None:
+            if keys[key].default is NO_DEFAULT:
+                raise _refuse(_missing_sentence(feature_group, key, options))
+            continue
+        _check_one(feature_group, key, keys[key], handle, dac)

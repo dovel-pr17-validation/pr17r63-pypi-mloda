@@ -1,0 +1,140 @@
+"""Tests that pyproject.toml declares the correct optional-dependency extras.
+
+These tests parse pyproject.toml directly (no subprocess needed).
+"""
+
+from __future__ import annotations
+
+import re
+import tomllib
+from pathlib import Path
+from typing import Any
+
+import pytest
+from mloda.provider import ComputeFramework
+from packaging.requirements import Requirement
+from packaging.version import Version
+
+from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_framework import DuckDBFramework
+from mloda_plugins.compute_framework.base_implementations.iceberg.iceberg_framework import IcebergFramework
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.polars.dataframe import PolarsDataFrame
+from mloda_plugins.compute_framework.base_implementations.polars.lazy_dataframe import PolarsLazyDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+from mloda_plugins.compute_framework.base_implementations.spark.spark_framework import SparkFramework
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_framework import SqliteFramework
+
+_PYPROJECT = Path(__file__).parent.parent.parent.parent / "pyproject.toml"
+
+
+def _load_project() -> dict[str, Any]:
+    with open(_PYPROJECT, "rb") as fh:
+        data = tomllib.load(fh)
+    result: dict[str, Any] = data["project"]
+    return result
+
+
+def _load_optional_deps() -> dict[str, list[str]]:
+    result: dict[str, list[str]] = _load_project()["optional-dependencies"]
+    return result
+
+
+def test_duckdb_extra_contains_pyarrow() -> None:
+    """The duckdb optional-dependency extra must list pyarrow as a dependency."""
+    optional = _load_optional_deps()
+    assert "duckdb" in optional, "No duckdb extra found in pyproject.toml"
+    duckdb_deps = optional["duckdb"]
+    assert any("pyarrow" in dep for dep in duckdb_deps), f"Expected pyarrow in duckdb extra. Got: {duckdb_deps}"
+
+
+def test_sqlite_extra_exists_and_contains_pyarrow() -> None:
+    """A sqlite optional-dependency extra must exist and include pyarrow."""
+    optional = _load_optional_deps()
+    assert "sqlite" in optional, f"No sqlite extra found in pyproject.toml. Available extras: {list(optional.keys())}"
+    sqlite_deps = optional["sqlite"]
+    assert any("pyarrow" in dep for dep in sqlite_deps), f"Expected pyarrow in sqlite extra. Got: {sqlite_deps}"
+
+
+@pytest.mark.parametrize("referenced_extra", ["sqlite", "yaml"])
+def test_all_extra_references(referenced_extra: str) -> None:
+    """The all extra must reference the sqlite and yaml extras."""
+    optional = _load_optional_deps()
+    assert "all" in optional, "No all extra found in pyproject.toml"
+    all_deps = optional["all"]
+    assert any(f"mloda[{referenced_extra}]" in dep for dep in all_deps), (
+        f"Expected mloda[{referenced_extra}] in all extra. Got: {all_deps}"
+    )
+
+
+_BUILTIN_FRAMEWORKS = [
+    PandasDataFrame,
+    PolarsDataFrame,
+    PolarsLazyDataFrame,
+    PyArrowTable,
+    DuckDBFramework,
+    IcebergFramework,
+    SparkFramework,
+    SqliteFramework,
+]
+
+
+@pytest.mark.parametrize("framework", _BUILTIN_FRAMEWORKS, ids=lambda fw: fw.__name__)
+def test_builtin_framework_install_hint_names_an_existing_extra(framework: type[ComputeFramework]) -> None:
+    hint = framework.INSTALL_HINT
+    assert hint is not None, f"{framework.__name__} has no INSTALL_HINT"
+    match = re.fullmatch(r'pip install "mloda\[(\w+)\]"', hint)
+    assert match, f"Unexpected INSTALL_HINT shape: {hint}"
+    assert match.group(1) in _load_optional_deps()
+
+
+def test_python_dict_framework_has_no_install_hint() -> None:
+    assert PythonDictFramework.INSTALL_HINT is None
+
+
+def test_core_dependencies_stay_empty() -> None:
+    """Core installs without pyarrow, so project.dependencies must stay empty."""
+    assert _load_project()["dependencies"] == []
+
+
+def test_every_pyarrow_requirement_has_floor() -> None:
+    """Every pyarrow requirement in any extra must carry a >= floor of at least 14.0.1."""
+    bare: dict[str, str] = {}
+    found = 0
+    for group, deps in _load_optional_deps().items():
+        for dep in deps:
+            if dep.startswith("mloda["):
+                continue
+            req = Requirement(dep)
+            if req.name != "pyarrow":
+                continue
+            found += 1
+            floors = [Version(spec.version) for spec in req.specifier if spec.operator == ">="]
+            if not floors or max(floors) < Version("14.0.1"):
+                bare[group] = dep
+    assert found > 0, "No pyarrow requirement found in any extra"
+    assert not bare, f"pyarrow requirements missing a >=14.0.1 (or higher) floor: {bare}"
+
+
+@pytest.mark.parametrize(
+    ("extra", "dependency"),
+    [
+        ("numpy", "numpy"),
+        ("yaml", "pyyaml"),
+        ("test", "pyyaml"),
+        ("test", "pyarrow>=14.0.1"),
+        ("test", "sqlalchemy"),
+        ("pyarrow", "pyarrow>=14.0.1"),
+        ("duckdb", "pyarrow>=14.0.1"),
+        ("sqlite", "pyarrow>=14.0.1"),
+        ("iceberg", "pyarrow>=14.0.1"),
+        ("spark", "pyarrow>=15.0.0"),
+        ("spark", "pyspark>=4.0"),
+    ],
+)
+def test_extra_exists_and_contains_dependency(extra: str, dependency: str) -> None:
+    """The extras that install hints and tests rely on must exist and list their distribution."""
+    optional = _load_optional_deps()
+    assert extra in optional, f"No {extra} extra found in pyproject.toml. Available extras: {list(optional.keys())}"
+    deps = optional[extra]
+    assert any(dependency in dep for dep in deps), f"Expected {dependency} in {extra} extra. Got: {deps}"

@@ -1,0 +1,282 @@
+# Data Provider: Base classes for building features
+#
+# Building a feature group plugin
+# --------------------------------
+# Feature groups that chain (derive from other features) should inherit from
+# both FeatureChainParserMixin and FeatureGroup. The mixin handles feature
+# name parsing, PROPERTY_MAPPING validation, and input_features resolution.
+# See FeatureGroup's docstring and docs/in_depth/property-mapping.md.
+#
+#     from mloda.provider import FeatureChainParserMixin, FeatureGroup, DefaultOptionKeys
+#
+#     class MyPlugin(FeatureChainParserMixin, FeatureGroup):
+#         PREFIX_PATTERN = r".*__(?P<operation_type>[\w]+)_my_op$"
+#         PROPERTY_MAPPING = { ... }
+#         def calculate_feature(cls, data, features): ...
+#
+# Primary-source feature groups (no input features) read files, documents and
+# databases by subclassing a source group base: ReadFileFG, ReadDocumentFG,
+# ReadDBFG, or SourceFeatureGroup for any other source.
+#
+# This module is core-only. Concrete compute frameworks come from mloda.user.<backend>.
+#
+from mloda.core.abstract_plugins.feature_group import FeatureGroup as FeatureGroup
+from mloda.core.abstract_plugins.components.credential_handle import credential_handle_spec as credential_handle_spec
+
+# Versioning
+from mloda.core.abstract_plugins.components.base_feature_group_version import (
+    BaseFeatureGroupVersion,
+    ThirdPartyVersionMode,
+)
+from mloda.core.version import get_mloda_version
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework as ComputeFramework
+from mloda.core.abstract_plugins.implementation import Implementation
+from mloda.core.abstract_plugins.implementation_pin_error import ImplementationPinError
+from mloda.core.abstract_plugins.operation_feature_group import OperationFeatureGroup
+from mloda.core.abstract_plugins.data_creator_feature_group import DataCreatorFeatureGroup
+from mloda.core.abstract_plugins.hook_context import OutputSchema as OutputSchema
+from mloda.core.abstract_plugins.hook_context import HookContext as HookContext
+from mloda.core.abstract_plugins.hook_context import instrument as instrument
+from mloda.core.abstract_plugins.components.connection_requirement import ConnectionRequirement as ConnectionRequirement
+from mloda.core.abstract_plugins.compute_framework import EmptyResultError as EmptyResultError
+
+# Utilities
+from mloda.core.abstract_plugins.components.hashable_dict import HashableDict
+from mloda.core.abstract_plugins.components.utils import get_all_subclasses
+from mloda.core.abstract_plugins.components.plan_freeze import FrozenPlanError
+from mloda.core.abstract_plugins.components.credential_access import (
+    CredentialFieldMissing,
+    CredentialReadRefused,
+    ResolvedCredential,
+    credentials_scope,
+    read_credential,
+)
+from mloda.core.abstract_plugins.components.credential_scrub import scrub_credentials
+
+# Feature set (internal computation container)
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+
+# Input data classes
+from mloda.core.abstract_plugins.components.input_data.file_source import FileSource
+from mloda.core.abstract_plugins.components.input_data.claim_route import ClaimRoute, NamePolicy, SourceMatch
+from mloda.core.abstract_plugins.components.input_data.reader_probe import SourceProbeOutcome
+from mloda.core.abstract_plugins.components.input_data.source_feature_group import (
+    HANDLE_OPTION,
+    HANDLE_SPEC,
+    QUERY_OPTION,
+    SourceFeatureGroup,
+)
+from mloda.core.abstract_plugins.components.input_data.read_db_fg import DBQuery, DBTable, ReadDBFG
+from mloda.core.abstract_plugins.components.input_data.read_document_fg import ReadDocumentFG
+from mloda.core.abstract_plugins.components.input_data.read_file_fg import ReadFileFG
+from mloda.core.abstract_plugins.components.input_data.input_data_descriptor import InputDataDescriptor
+from mloda.core.abstract_plugins.components.input_data.api_data_fg import ApiDataFG
+
+# Artifact
+from mloda.core.abstract_plugins.components.base_artifact import BaseArtifact
+
+# Validators
+from mloda.core.abstract_plugins.components.base_validator import BaseValidator
+from mloda.core.abstract_plugins.components.validators.feature_validator import FeatureValidator
+from mloda.core.abstract_plugins.components.validators.feature_set_validator import FeatureSetValidator
+from mloda.core.abstract_plugins.components.validators.options_validator import OptionsValidator
+from mloda.core.abstract_plugins.components.validators.link_validator import LinkValidator
+from mloda.core.abstract_plugins.components.validators.datatype_validator import (
+    DataTypeValidator,
+    DataTypeMismatchError,
+)
+
+# Option keys
+from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
+
+# Feature chaining
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import FeatureChainParser
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import (
+    ANY_OUTPUT_PART,
+    CHAIN_SEPARATOR,
+    COLUMN_SEPARATOR,
+    INPUT_SEPARATOR,
+)
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import FeatureChainParserMixin
+from mloda.core.abstract_plugins.components.feature_chainer.parsed_feature_name import NameResolution, ParsedFeatureName
+
+# Property specs
+from mloda.core.abstract_plugins.components.property_spec import (
+    NO_DEFAULT,
+    PropertySpec,
+    is_no_default,
+    is_positive_int,
+    property_spec,
+)
+from mloda.core.abstract_plugins.components.property_values_validation import (
+    PropertyValidationError,
+    validate_property_values,
+)
+
+# Match rejection recording
+from mloda.core.abstract_plugins.components.match_rejection import (
+    INPUT_DATA_STAGE,
+    NAME_STAGE,
+    CoreDeclineCode,
+    DeclineCode,
+    MatchRejection,
+    collect_match_rejections,
+    record_match_rejection,
+)
+
+# Match-time misconfiguration escalation
+from mloda.core.abstract_plugins.components.utils import escalate_match_abort as escalate_match_abort
+from mloda.core.abstract_plugins.components.utils import is_match_abort as is_match_abort
+
+# Subtype declaration
+from mloda.core.abstract_plugins.components.subtype_declaration import SubtypeDeclaration
+
+# Divergence record
+from mloda.core.abstract_plugins.components.divergence import Cause, Divergence, DivergenceKind, DivergenceSource
+
+# Transformers
+from mloda.core.abstract_plugins.components.framework_transformer.base_transformer import BaseTransformer
+from mloda.core.abstract_plugins.components.framework_transformer.cfw_transformer import ComputeFrameworkTransformer
+
+# Plugin registry
+from mloda.core.abstract_plugins.plugin_registry.plugin_registry import (
+    PluginRegistryCollisionError,
+    register_plugin,
+)
+
+# Optional-dependency import guards
+from mloda.core.abstract_plugins.plugin_loader.plugin_loader import traceback_blames_root
+
+# Engines
+from mloda.core.filter.filter_engine import BaseFilterEngine
+from mloda.core.abstract_plugins.components.mask.base_mask_engine import BaseMaskEngine
+from mloda.core.abstract_plugins.components.merge.base_merge_engine import BaseMergeEngine
+
+# Feature resolution debugging
+from mloda.core.api.plugin_docs import resolve_feature
+from mloda.core.abstract_plugins.components.validators.missing_input_validator import MissingInputFeatureError
+from mloda.core.prepare.identify_feature_group import FeatureResolutionError
+from mloda.core.abstract_plugins.components.failed_rows import FailedRows, report_failed_rows
+from mloda.core.prepare.resolution_types import (
+    ResolutionDiagnosis,
+    ResolutionRecord,
+)
+
+__version__ = get_mloda_version()
+
+__all__ = [
+    # Version
+    "__version__",
+    # Base classes
+    "FeatureGroup",
+    # Versioning
+    "BaseFeatureGroupVersion",
+    "ThirdPartyVersionMode",
+    "ComputeFramework",
+    "OutputSchema",
+    "HookContext",
+    "instrument",
+    "ConnectionRequirement",
+    "EmptyResultError",
+    # Utilities
+    "HashableDict",
+    "get_all_subclasses",
+    "scrub_credentials",
+    # Feature set
+    "FeatureSet",
+    # Input data
+    "FileSource",
+    "ClaimRoute",
+    "NamePolicy",
+    "SourceMatch",
+    "SourceProbeOutcome",
+    "SourceFeatureGroup",
+    "DataCreatorFeatureGroup",
+    "Implementation",
+    "ImplementationPinError",
+    "OperationFeatureGroup",
+    "HANDLE_OPTION",
+    "HANDLE_SPEC",
+    "QUERY_OPTION",
+    "DBQuery",
+    "DBTable",
+    "ReadDBFG",
+    "ReadDocumentFG",
+    "ReadFileFG",
+    "InputDataDescriptor",
+    "ApiDataFG",
+    # Artifact
+    "BaseArtifact",
+    # Validators
+    "BaseValidator",
+    "FeatureValidator",
+    "FeatureSetValidator",
+    "OptionsValidator",
+    "LinkValidator",
+    "DataTypeValidator",
+    "DataTypeMismatchError",
+    # Option keys
+    "DefaultOptionKeys",
+    # Feature chaining
+    "FeatureChainParser",
+    "ANY_OUTPUT_PART",
+    "CHAIN_SEPARATOR",
+    "COLUMN_SEPARATOR",
+    "INPUT_SEPARATOR",
+    "FeatureChainParserMixin",
+    "ParsedFeatureName",
+    "NameResolution",
+    # Property specs
+    "PropertySpec",
+    "is_no_default",
+    "is_positive_int",
+    "property_spec",
+    "credential_handle_spec",
+    "read_credential",
+    "credentials_scope",
+    "ResolvedCredential",
+    "CredentialReadRefused",
+    "CredentialFieldMissing",
+    "FrozenPlanError",
+    "NO_DEFAULT",
+    "PropertyValidationError",
+    "validate_property_values",
+    # Match rejection recording
+    "INPUT_DATA_STAGE",
+    "NAME_STAGE",
+    "CoreDeclineCode",
+    "DeclineCode",
+    "MatchRejection",
+    "collect_match_rejections",
+    "record_match_rejection",
+    # Match-time misconfiguration escalation
+    "escalate_match_abort",
+    "is_match_abort",
+    # Subtype declaration
+    "SubtypeDeclaration",
+    # Divergence record
+    "Cause",
+    "Divergence",
+    "DivergenceKind",
+    "DivergenceSource",
+    # Transformers
+    "BaseTransformer",
+    "ComputeFrameworkTransformer",
+    # Plugin registry
+    "PluginRegistryCollisionError",
+    "register_plugin",
+    # Optional-dependency import guards
+    "traceback_blames_root",
+    # Engines
+    "BaseFilterEngine",
+    "BaseMaskEngine",
+    "BaseMergeEngine",
+    # Feature resolution debugging
+    "resolve_feature",
+    "FeatureResolutionError",
+    "MissingInputFeatureError",
+    "ResolutionRecord",
+    "FailedRows",
+    "report_failed_rows",
+    "ResolutionDiagnosis",
+]

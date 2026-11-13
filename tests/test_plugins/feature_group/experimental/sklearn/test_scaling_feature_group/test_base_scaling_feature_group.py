@@ -1,0 +1,339 @@
+"""
+Tests for the base ScalingFeatureGroup class.
+"""
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from mloda.provider import FeatureSet
+from mloda_plugins.feature_group.experimental.sklearn.sklearn_artifact import SklearnArtifact
+
+from tests.test_plugins.feature_group.experimental.core_input_check import assert_core_rejects_missing_input
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.user import Options
+from mloda_plugins.feature_group.experimental.sklearn.scaling.base import ScalingFeatureGroup
+from mloda_plugins.feature_group.experimental.sklearn.scaling.pandas import PandasScaling
+
+
+class TestScalingFeatureGroup:
+    """Tests for the ScalingFeatureGroup class."""
+
+    def test_match_feature_group_criteria(self) -> None:
+        """Test the match_feature_group_criteria method."""
+        # Valid feature names
+        assert ScalingFeatureGroup.match_feature_group_criteria("income__standard_scaled", Options())
+        assert ScalingFeatureGroup.match_feature_group_criteria("age__minmax_scaled", Options())
+        assert ScalingFeatureGroup.match_feature_group_criteria("outlier_prone_feature__robust_scaled", Options())
+        assert ScalingFeatureGroup.match_feature_group_criteria("feature_vector__normalizer_scaled", Options())
+
+        # Invalid feature names
+        assert not ScalingFeatureGroup.match_feature_group_criteria("income__scaled_standard", Options())
+        assert not ScalingFeatureGroup.match_feature_group_criteria("income__invalid_scaled", Options())
+        assert not ScalingFeatureGroup.match_feature_group_criteria("income__standard_scale", Options())
+        assert not ScalingFeatureGroup.match_feature_group_criteria("income_standard_scaled", Options())
+
+    def test_declared_scaler_type_contradicting_the_name_aborts(self) -> None:
+        options = Options(context={ScalingFeatureGroup.SCALER_TYPE: "minmax"})
+
+        with pytest.raises(ValueError) as exc_info:
+            ScalingFeatureGroup.match_feature_group_criteria("x__standard_scaled", options)
+
+        message = str(exc_info.value)
+        assert ScalingFeatureGroup.SCALER_TYPE in message
+        assert "minmax" in message
+        assert "standard" in message
+
+    @pytest.mark.parametrize("declared", ["standard", ["standard"]])
+    def test_declared_scaler_type_agreeing_with_the_name_matches(self, declared: str | list[str]) -> None:
+        options = Options(context={ScalingFeatureGroup.SCALER_TYPE: declared})
+
+        assert ScalingFeatureGroup.match_feature_group_criteria("x__standard_scaled", options) is True
+
+    def test_get_scaler_type(self) -> None:
+        """Test the get_scaler_type method."""
+        # Valid feature names
+        assert ScalingFeatureGroup.get_scaler_type("income__standard_scaled") == "standard"
+        assert ScalingFeatureGroup.get_scaler_type("age__minmax_scaled") == "minmax"
+        assert ScalingFeatureGroup.get_scaler_type("outlier_prone_feature__robust_scaled") == "robust"
+        assert ScalingFeatureGroup.get_scaler_type("feature_vector__normalizer_scaled") == "normalizer"
+
+        # Invalid feature names
+        with pytest.raises(ValueError):
+            ScalingFeatureGroup.get_scaler_type("income__scaled_standard")
+
+        with pytest.raises(ValueError):
+            ScalingFeatureGroup.get_scaler_type("income__invalid_scaled")
+
+        with pytest.raises(ValueError):
+            ScalingFeatureGroup.get_scaler_type("income__standard_scale")
+
+        with pytest.raises(ValueError):
+            ScalingFeatureGroup.get_scaler_type("income_standard_scaled")
+
+    def test_resolve_operation_reads_the_name_capture(self) -> None:
+        assert (
+            ScalingFeatureGroup._resolve_operation(Feature("x__minmax_scaled"), ScalingFeatureGroup.SCALER_TYPE)
+            == "minmax"
+        )
+
+    def test_input_features(self) -> None:
+        """Test the input_features method."""
+        feature_group = ScalingFeatureGroup()
+
+        # Single source feature
+        input_features = feature_group.input_features(Options(), FeatureName("income__standard_scaled"))
+        assert input_features is not None
+        assert len(input_features) == 1
+        assert Feature("income") in input_features
+
+        # Different scaler types
+        input_features = feature_group.input_features(Options(), FeatureName("age__minmax_scaled"))
+        assert input_features is not None
+        assert len(input_features) == 1
+        assert Feature("age") in input_features
+
+        input_features = feature_group.input_features(Options(), FeatureName("outlier_prone_feature__robust_scaled"))
+        assert input_features is not None
+        assert len(input_features) == 1
+        assert Feature("outlier_prone_feature") in input_features
+
+    def test_supported_scalers(self) -> None:
+        """Test that all supported scalers are properly defined."""
+        expected_scalers = {
+            "standard": "StandardScaler",
+            "minmax": "MinMaxScaler",
+            "robust": "RobustScaler",
+            "normalizer": "Normalizer",
+        }
+        assert ScalingFeatureGroup.SUPPORTED_SCALERS == expected_scalers
+
+    def test_create_scaler_instance(self) -> None:
+        """Test the _create_scaler_instance method."""
+        # Skip test if sklearn not available
+        try:
+            ScalingFeatureGroup._import_sklearn_components()
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        # Test creating different scaler types
+        standard_scaler = ScalingFeatureGroup._create_scaler_instance("standard")
+        assert standard_scaler.__class__.__name__ == "StandardScaler"
+
+        minmax_scaler = ScalingFeatureGroup._create_scaler_instance("minmax")
+        assert minmax_scaler.__class__.__name__ == "MinMaxScaler"
+
+        robust_scaler = ScalingFeatureGroup._create_scaler_instance("robust")
+        assert robust_scaler.__class__.__name__ == "RobustScaler"
+
+        normalizer_scaler = ScalingFeatureGroup._create_scaler_instance("normalizer")
+        assert normalizer_scaler.__class__.__name__ == "Normalizer"
+
+        # Test invalid scaler type
+        with pytest.raises(ValueError):
+            ScalingFeatureGroup._create_scaler_instance("invalid_scaler")
+
+    def test_scaler_matches_type(self) -> None:
+        """Test the _scaler_matches_type method."""
+        # Skip test if sklearn not available
+        try:
+            ScalingFeatureGroup._import_sklearn_components()
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        # Create scaler instances
+        standard_scaler = ScalingFeatureGroup._create_scaler_instance("standard")
+        minmax_scaler = ScalingFeatureGroup._create_scaler_instance("minmax")
+
+        # Test matching - should return True for correct matches
+        assert ScalingFeatureGroup._scaler_matches_type(standard_scaler, "standard")
+        assert ScalingFeatureGroup._scaler_matches_type(minmax_scaler, "minmax")
+
+        # Test mismatching - should raise ValueError
+        with pytest.raises(ValueError, match="Artifact scaler type mismatch"):
+            ScalingFeatureGroup._scaler_matches_type(standard_scaler, "minmax")
+
+        with pytest.raises(ValueError, match="Artifact scaler type mismatch"):
+            ScalingFeatureGroup._scaler_matches_type(minmax_scaler, "standard")
+
+        # Test unsupported scaler type
+        with pytest.raises(ValueError, match="Unsupported scaler type"):
+            ScalingFeatureGroup._scaler_matches_type(standard_scaler, "invalid_type")
+
+    def test_import_sklearn_components(self) -> None:
+        """Test the _import_sklearn_components method."""
+        # Skip test if sklearn not available
+        try:
+            components = ScalingFeatureGroup._import_sklearn_components()
+
+            # Check that all expected components are imported
+            expected_components = ["StandardScaler", "MinMaxScaler", "RobustScaler", "Normalizer"]
+            for component_name in expected_components:
+                assert component_name in components
+                assert callable(components[component_name])
+
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+    def test_import_sklearn_components_missing_sklearn(self) -> None:
+        """Test that ImportError is raised when sklearn is not available."""
+        # This test would require mocking sys.modules, but for now we'll just
+        # verify that the method exists and can be called
+        try:
+            ScalingFeatureGroup._import_sklearn_components()
+        except ImportError:
+            # This is expected when sklearn is not available
+            pass
+
+
+class TestPandasScaling:
+    """Tests for PandasScaling."""
+
+    @pytest.mark.parametrize(
+        ("name", "missing", "available"),
+        [
+            ("zz__standard_scaled", ("zz",), ("age", "income")),
+            ("zz__minmax_scaled", ("zz",), ("age", "income")),
+        ],
+        ids=["standard", "minmax"],
+    )
+    def test_core_rejects_missing_input_and_lists_sorted_columns(
+        self, name: str, missing: tuple[str, ...], available: tuple[str, ...]
+    ) -> None:
+        df = pd.DataFrame({"income": [1.0, 2.0, 3.0], "age": [4.0, 5.0, 6.0]})
+
+        assert_core_rejects_missing_input(PandasScaling, df, name, missing, available)
+
+    def test_add_result_to_data_1d_array(self) -> None:
+        df = pd.DataFrame({"a": [1, 2, 3]})
+
+        updated = PandasScaling._add_result_to_data(df, "new_feature", np.array([10, 20, 30]))
+
+        assert list(updated["new_feature"]) == [10, 20, 30]
+
+    def test_add_result_to_data_2d_single_column(self) -> None:
+        df = pd.DataFrame({"a": [1, 2, 3]})
+
+        updated = PandasScaling._add_result_to_data(df, "new_feature", np.array([[10], [20], [30]]))
+
+        assert list(updated["new_feature"]) == [10, 20, 30]
+
+    def test_add_result_to_data_2d_multiple_columns(self) -> None:
+        df = pd.DataFrame({"a": [1, 2, 3]})
+
+        updated = PandasScaling._add_result_to_data(df, "new_feature", np.array([[1, 2], [3, 4], [5, 6]]))
+
+        assert list(updated["new_feature~0"]) == [1, 3, 5]
+        assert list(updated["new_feature~1"]) == [2, 4, 6]
+
+
+SCALER_KINDS = ["standard", "minmax", "robust", "normalizer"]
+
+
+class TestScalingOnZeroInputRows:
+    """Zero input rows give an empty column of the non-empty dtype and never fit or save."""
+
+    @staticmethod
+    def _scale(kind: str, source_dtype: str, rows: int, *, artifact_to_save: bool = True) -> tuple[Any, FeatureSet]:
+        pytest.importorskip("sklearn")
+        data = pd.DataFrame({"c": pd.Series(np.arange(rows)).astype(source_dtype)})
+        features = FeatureSet()
+        features.add(Feature(f"c__{kind}_scaled"))
+        if artifact_to_save:
+            features.artifact_to_save = "requested"
+        return PandasScaling.calculate(ScalingFeatureGroup, data, features, None), features
+
+    @pytest.mark.parametrize("kind", SCALER_KINDS)
+    @pytest.mark.parametrize(
+        ("source_dtype", "expected"),
+        [
+            ("float32", "float32"),
+            ("float64", "float64"),
+            ("int64", "float64"),
+            ("Float32", "float32"),
+            ("float32[pyarrow]", "float32"),
+        ],
+    )
+    def test_zero_rows_give_an_empty_column_of_the_non_empty_dtype(
+        self, kind: str, source_dtype: str, expected: str
+    ) -> None:
+        non_empty, _ = self._scale(kind, source_dtype, 3)
+        result, features = self._scale(kind, source_dtype, 0)
+
+        assert features.save_artifact == {}
+        column = result[f"c__{kind}_scaled"]
+        assert len(result) == 0
+        assert str(column.dtype) == expected
+        assert column.dtype == non_empty[f"c__{kind}_scaled"].dtype
+
+    @pytest.mark.parametrize("kind", SCALER_KINDS)
+    def test_zero_rows_without_artifact_to_save_leave_save_artifact_none(self, kind: str) -> None:
+        _, features = self._scale(kind, "float64", 0, artifact_to_save=False)
+
+        assert features.save_artifact is None
+
+    @pytest.mark.parametrize("kind", SCALER_KINDS)
+    def test_zero_rows_keep_another_features_save_artifact_key(self, kind: str) -> None:
+        pytest.importorskip("sklearn")
+        features = FeatureSet()
+        features.add(Feature(f"c__{kind}_scaled"))
+        features.artifact_to_save = "requested"
+        features.save_artifact = {"other": 1}
+        data = pd.DataFrame({"c": np.array([], dtype="float64")})
+
+        PandasScaling.calculate(ScalingFeatureGroup, data, features, None)
+
+        assert features.save_artifact == {"other": 1}
+
+    @pytest.mark.parametrize("kind", SCALER_KINDS)
+    def test_zero_rows_with_a_loaded_artifact_apply_nothing_and_keep_the_dtype(self, kind: str, tmp_path: Any) -> None:
+        pytest.importorskip("sklearn")
+        options = Options({SklearnArtifact.ARTIFACT_STORAGE_PATH: str(tmp_path)})
+        fit_set = FeatureSet()
+        fit_set.add(Feature(f"c__{kind}_scaled", options))
+        fit_set.artifact_to_save = "requested"
+        PandasScaling.calculate(ScalingFeatureGroup, pd.DataFrame({"c": [1.0, 2.0, 3.0]}), fit_set, None)
+        SklearnArtifact.custom_saver(fit_set, fit_set.save_artifact)
+
+        load_set = FeatureSet()
+        load_set.add(Feature(f"c__{kind}_scaled", options))
+        load_set.artifact_to_load = "requested"
+        empty = pd.DataFrame({"c": np.array([], dtype="float64")})
+        result = PandasScaling.calculate(ScalingFeatureGroup, empty, load_set, None)
+
+        assert len(result) == 0
+        assert str(result[f"c__{kind}_scaled"].dtype) == "float64"
+
+    @pytest.mark.parametrize("kind", SCALER_KINDS)
+    def test_all_nan_source_without_an_artifact_raises_a_clear_error(self, kind: str) -> None:
+        pytest.importorskip("sklearn")
+        features = FeatureSet()
+        features.add(Feature(f"c__{kind}_scaled"))
+        data = pd.DataFrame({"c": [np.nan, np.nan, np.nan]})
+
+        with pytest.raises(ValueError, match="every row is missing") as excinfo:
+            PandasScaling.calculate(ScalingFeatureGroup, data, features, None)
+
+        assert "'c'" in str(excinfo.value)
+
+    @pytest.mark.parametrize("kind", SCALER_KINDS)
+    def test_all_nan_source_with_a_loaded_artifact_still_transforms(self, kind: str, tmp_path: Any) -> None:
+        pytest.importorskip("sklearn")
+        options = Options({SklearnArtifact.ARTIFACT_STORAGE_PATH: str(tmp_path)})
+        fit_set = FeatureSet()
+        fit_set.add(Feature(f"c__{kind}_scaled", options))
+        fit_set.artifact_to_save = "requested"
+        PandasScaling.calculate(ScalingFeatureGroup, pd.DataFrame({"c": [1.0, 2.0, 3.0]}), fit_set, None)
+        SklearnArtifact.custom_saver(fit_set, fit_set.save_artifact)
+
+        load_set = FeatureSet()
+        load_set.add(Feature(f"c__{kind}_scaled", options))
+        load_set.artifact_to_load = "requested"
+        result = PandasScaling.calculate(
+            ScalingFeatureGroup, pd.DataFrame({"c": [np.nan, np.nan, np.nan]}), load_set, None
+        )
+
+        assert len(result) == 3

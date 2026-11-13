@@ -1,0 +1,2902 @@
+"""Planner.explain: request checks, policy, row limits, and a path-free plan with lineage, estimate and egress."""
+
+import base64
+import dataclasses
+import importlib
+import json
+import logging
+import sqlite3
+import threading
+from abc import abstractmethod
+from collections.abc import Iterator, Mapping
+from datetime import datetime
+from pathlib import Path
+from typing import Any, ClassVar
+from uuid import uuid4
+
+import pytest
+
+from mloda.core.abstract_plugins.components.credential import Credential
+from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+from mloda.core.abstract_plugins.components.divergence import (
+    Cause,
+    Divergence,
+    DivergenceKind,
+    DivergenceSource,
+    stamped,
+)
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.options import RESERVED_READER_OPTION_KEY
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.api.plan_info import PlanStep
+from mloda.core.prepare.resolution_types import Elimination, EvaluationResult, ResolutionRecord
+from mloda.interfaces.service.catalog import Catalog
+from mloda.interfaces.service.config import ConfigError, Settings, SourceConfig, load_settings
+from mloda.interfaces.service.errors import ERROR_CODES, is_error
+from mloda.interfaces.service.lock import MLODA_LOCK
+from mloda.interfaces.service.runner import Runner
+from mloda.interfaces.service import sources as service_sources
+from mloda.interfaces.service.planner import (
+    MAX_PLAN_ID_LENGTH,
+    PLAN_TOKEN_PREFIX,
+    PlannedRequest,
+    Planner,
+    _inline_alias,
+    _step_record,
+)
+from mloda.provider import (
+    ApiDataFG,
+    DataCreatorFeatureGroup,
+    FeatureChainParserMixin,
+    FeatureSet,
+    MissingInputFeatureError,
+    ResolutionDiagnosis,
+    SourceMatch,
+    property_spec,
+)
+from mloda.user import PluginCollector, mloda
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+from mloda_plugins.feature_group.input_data.file_formats.csv_fg import CsvFG
+from mloda_plugins.feature_group.input_data.db_sources.sqlite_fg import SqliteFG
+from mloda_plugins.feature_group.input_data.file_formats.json_fg import JsonFG
+from tests.helpers.plugin_stubs import StubFeatureGroup
+from tests.test_interfaces.source_groups import (
+    PASTED_UNDERSCORE,
+    CALLER_LOCKED_FEATURE,
+    CALLER_LOCKED_KEY,
+    CRED_DEFAULT_FEATURE,
+    CRED_DEFAULT_HANDLE,
+    CRED_FEATURE,
+    CRED_KEY,
+    FILE_SOURCE_GROUPS,
+    PLAN_RAISE,
+    PLAN_RAISE_SECRET,
+    CallerLockedMcp6,
+    CredentialDefaultMcp8,
+    CredentialReadMcp8,
+    PlanRaiseMcp5,
+    cred_digest,
+    credential_config,
+)
+
+
+SECRET = "s3://user:pw@host/x"  # nosec B105
+DENIED = "PlannerDeniedMcp4"
+DOUBLE_SUFFIX = "__mcp4_double"
+DERIVED = "income" + DOUBLE_SUFFIX
+IN_SUFFIX = "_mcp4_in"
+OPTS = "income__mcp4_opts"
+DEFAULT_VALUE = "DEFAULT_VALUE_mcp4_3f9a"
+SEEN_OPTIONS: list[tuple[dict[str, Any], dict[str, Any]]] = []
+CLOCK_START = 1_800_000_000.0
+KEY = b"k" * 32
+STEP_KEYS = {
+    "step",
+    "kind",
+    "features",
+    "feature_group",
+    "compute_framework",
+    "compute_framework_reason",
+    "specialized_from",
+    "source",
+    "inputs",
+    "source_feature_group",
+    "join_type",
+    "contract_version",
+    "divergences",
+    "allowed_variants",
+}
+SUCCESS_KEYS = {"plan_id", "expires_at", "normalized_request", "steps", "lineage", "estimate", "egress", "policy"}
+DENIED_CALLS: list[str] = []
+LOCK_PROBES: list[bool] = []
+
+
+def _lock_free_elsewhere() -> bool:
+    outcome: list[bool] = []
+
+    def attempt() -> None:
+        acquired = MLODA_LOCK.acquire(blocking=False)
+        if acquired:
+            MLODA_LOCK.release()
+        outcome.append(acquired)
+
+    thread = threading.Thread(target=attempt)
+    thread.start()
+    thread.join(5)
+    return outcome == [True]
+
+
+class PlannerDoubleMcp4(FeatureGroup):
+    """Doubles a numeric input feature named by the prefix before the suffix."""
+
+    PROBE_LOCK: ClassVar[bool] = False
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        name = str(feature_name)
+        return name.endswith(DOUBLE_SUFFIX) and len(name) > len(DOUBLE_SUFFIX)
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        if type(self).PROBE_LOCK:
+            LOCK_PROBES.append(_lock_free_elsewhere())
+        return {Feature(str(feature_name)[: -len(DOUBLE_SUFFIX)])}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        name = str(features.get_name_of_one_feature())
+        source = name[: -len(DOUBLE_SUFFIX)]
+        return {name: [value * 2 for value in data[source]]}
+
+
+class PlannerRivalMcp4(FeatureGroup):
+    """Not a PlannerDoubleMcp4 subclass; matches the same names and reads INPUT."""
+
+    INPUT: ClassVar[str] = "mcp4_nowhere_column"
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        name = str(feature_name)
+        return name.endswith(DOUBLE_SUFFIX) and len(name) > len(DOUBLE_SUFFIX)
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature(type(self).INPUT)}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {str(features.get_name_of_one_feature()): [value * 2 for value in data[cls.INPUT]]}
+
+
+class PlannerAbstractDoubleMcp4(FeatureGroup):
+    """Abstract group matching the same names as PlannerDoubleMcp4."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name).endswith(DOUBLE_SUFFIX)
+
+    @abstractmethod
+    def hook(self) -> None: ...
+
+
+class PlannerRivalMissingMcp4(PlannerRivalMcp4):
+    """Rival reading a column no source has."""
+
+
+class PlannerRivalIncomeMcp4(PlannerRivalMcp4):
+    """Rival reading a resolving column."""
+
+    INPUT = "income"
+
+
+class PlannerRivalCustomerMcp4(PlannerRivalMcp4):
+    """Rival reading another resolving column."""
+
+    INPUT = "customer_id"
+
+
+class PlannerDeniedMcp4(StubFeatureGroup):
+    """Restricted payroll data."""
+
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"mcp4_salary"})
+    SUPPORTED_NAMES: ClassVar[frozenset[str]] = MATCHED_NAMES
+    FRAMEWORK_RULE: ClassVar[set[type[ComputeFramework]] | None] = {PythonDictFramework}
+    ARMED: ClassVar[bool] = False
+
+    @classmethod
+    def _record(cls, hook: str) -> None:
+        if cls.ARMED:
+            DENIED_CALLS.append(hook)
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        cls._record("match_feature_group_criteria")
+        return str(feature_name) in cls.MATCHED_NAMES
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        cls._record("compute_framework_rule")
+        return cls.FRAMEWORK_RULE
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        type(self)._record("input_features")
+        return None
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        cls._record("calculate_feature")
+        return {"mcp4_salary": [1]}
+
+
+class PlannerInFeaturesMcp4(FeatureGroup):
+    """Consumes the in_features declared on a feature whose name ends with the suffix."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name).endswith(IN_SUFFIX)
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return set(options.get_in_features())
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {str(features.get_name_of_one_feature()): [1]}
+
+
+class PlannerOptionsProbeMcp4(FeatureGroup):
+    """Derives ``income`` and records the group and context options it was planned with."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == OPTS
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        SEEN_OPTIONS.append((dict(options.group), dict(options.context)))
+        return {Feature("income")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {OPTS: list(data["income"])}
+
+
+PIN_ROOT = "mcp4_pin_root"
+
+
+class PlannerPinRootMcp4(FeatureGroup):
+    """Root that pins a variant input to Pandas beside a denied column input."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == PIN_ROOT
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PandasDataFrame}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature("optoyvar_open_consumer", implementation="OpToyVariantPandas"), Feature("mcp4_salary")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return data
+
+
+BIND_PREFIX = "income__mcp4_bind_"
+LOCKED_NAME = BIND_PREFIX + "a_url_zq7x"
+
+
+class PlannerNameBoundMcp4(FeatureChainParserMixin, FeatureGroup):
+    """Binds a settable key and a caller-locked key from the requested name."""
+
+    PREFIX_PATTERN = rf"income__mcp4_bind_(?P<mcp4_mode>[a-z0-9]+)(?:_url_(?P<{CALLER_LOCKED_KEY}>[a-z0-9]+))?"
+    NAME_ONLY_MATCH = True
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+    PROPERTY_MAPPING = {
+        "mcp4_mode": property_spec("Settable mode.", default=None),
+        CALLER_LOCKED_KEY: property_spec("Operator-only base URL.", default=None, caller_settable=False),
+    }
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {str(feature.name): list(data["income"]) for feature in features.features}
+
+
+PLAN_MISSING = "mcp_plan_missing_input"
+
+
+class PlannerMissingInputMcp9(FeatureGroup):
+    """Fails while planning because a declared input is absent."""
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: DataAccessCollection | None = None,
+    ) -> bool:
+        return str(feature_name) == PLAN_MISSING
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        raise MissingInputFeatureError("PlannerMissingInputMcp9", PLAN_MISSING, ("absent",), ("income",))
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return data
+
+
+def _base(*extra: type[FeatureGroup]) -> PluginCollector:
+    return PluginCollector.enabled_feature_groups(
+        {
+            *extra,
+            *FILE_SOURCE_GROUPS,
+            PlannerNameBoundMcp4,
+            PlannerDoubleMcp4,
+            PlannerDeniedMcp4,
+            PlannerInFeaturesMcp4,
+            PlannerOptionsProbeMcp4,
+            PlanRaiseMcp5,
+            CallerLockedMcp6,
+            ApiDataFG,
+        }
+    )
+
+
+def _in_features_cases(column: str) -> list[tuple[dict[str, Any], str]]:
+    name = "out" + IN_SUFFIX
+    mid = "mid" + IN_SUFFIX
+    return [
+        ({"name": name, "in_features": ["income", column]}, "/features/0/in_features/1"),
+        ({"name": name, "options": {"in_features": column}}, "/features/0/options/in_features"),
+        ({"name": name, "group_options": {"in_features": [column]}}, "/features/0/group_options/in_features/0"),
+        ({"name": name, "context_options": {"in_features": [column]}}, "/features/0/context_options/in_features/0"),
+        ({"name": name, "options": {"in_features": {"name": column}}}, "/features/0/options/in_features/name"),
+        (
+            {"name": name, "options": {"in_features": {"name": mid, "in_features": column}}},
+            "/features/0/options/in_features/in_features",
+        ),
+        (
+            {"name": name, "options": {"in_features": {"name": mid, "options": {"in_features": [column]}}}},
+            "/features/0/options/in_features/options/in_features/0",
+        ),
+    ]
+
+
+def _write_sales(tmp_path: Path, with_denied_column: bool = False) -> Path:
+    path = tmp_path / "sales.csv"
+    if with_denied_column:
+        path.write_text("customer_id,income,mcp4_salary\n1,10,5\n2,20,6\n")
+    else:
+        path.write_text("customer_id,income,segment\n1,10,a\n2,20,b\n3,30,a\n4,40,b\n5,50,a\n")
+    return path
+
+
+def _write_orders(tmp_path: Path) -> Path:
+    path = tmp_path / "orders.csv"
+    path.write_text("order_id,amount\n1,3\n2,4\n")
+    return path
+
+
+def _write_events(tmp_path: Path) -> Path:
+    path = tmp_path / "events.json"
+    path.write_text('{"event_id": 1, "kind": "x"}\n{"event_id": 2, "kind": "y"}\n{"event_id": 3, "kind": "x"}\n')
+    return path
+
+
+def _source(alias: str, path: Path) -> SourceConfig:
+    return SourceConfig(alias=alias, files=(str(path),))
+
+
+def _settings(tmp_path: Path, sources: Mapping[str, SourceConfig] | None = None, **kwargs: Any) -> Settings:
+    if sources is None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path))}
+    return Settings(deny_feature_groups=(DENIED,), sources=sources, **kwargs)
+
+
+def _planner(settings: Settings, *, base: PluginCollector | None = None) -> Planner:
+    base = base if base is not None else _base()
+    catalog = Catalog.build(settings, base)
+    return Planner(
+        settings, catalog, signing_key=KEY, principal="alice", plugin_collector=base, clock=lambda: CLOCK_START
+    )
+
+
+def _explain(tmp_path: Path, request: Any, base: PluginCollector | None = None, **kwargs: Any) -> dict[str, Any]:
+    result: dict[str, Any] = _planner(_settings(tmp_path, **kwargs), base=base).explain(request)
+    return result
+
+
+def _error(result: dict[str, Any], code: str) -> dict[str, Any]:
+    assert is_error(result), result
+    error: dict[str, Any] = result["error"]
+    assert error["code"] == code, error
+    return error
+
+
+def _success(result: dict[str, Any]) -> dict[str, Any]:
+    assert not is_error(result), result
+    return result
+
+
+def _without_audit(error: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in error.items() if k != "audit_id"}
+
+
+def _has_detail(error: Mapping[str, Any], **expected: Any) -> bool:
+    return any(all(detail.get(key) == value for key, value in expected.items()) for detail in error["details"])
+
+
+def _assert_no_paths(result: Mapping[str, Any], tmp_path: Path, *file_names: str) -> None:
+    dumped = json.dumps(result)
+    assert str(tmp_path) not in dumped
+    assert tmp_path.name not in dumped
+    for name in file_names:
+        assert name not in dumped
+
+
+@pytest.fixture
+def denied_calls() -> Iterator[list[str]]:
+    DENIED_CALLS.clear()
+    PlannerDeniedMcp4.ARMED = True
+    yield DENIED_CALLS
+    PlannerDeniedMcp4.ARMED = False
+    DENIED_CALLS.clear()
+
+
+@pytest.fixture
+def lock_probes() -> Iterator[list[bool]]:
+    LOCK_PROBES.clear()
+    PlannerDoubleMcp4.PROBE_LOCK = True
+    yield LOCK_PROBES
+    PlannerDoubleMcp4.PROBE_LOCK = False
+    LOCK_PROBES.clear()
+
+
+class TestPlanningFailure:
+    def test_planning_exception_is_an_internal_error_without_its_text(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": [PLAN_RAISE]})
+
+        error = _error(result, "internal")
+        assert "ValueError" in error["message"]
+        assert "planning" in error["message"].lower()
+        assert PLAN_RAISE_SECRET not in json.dumps(result)
+
+    def test_planning_failure_is_logged_once_without_the_message(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.ERROR, logger="mloda.interfaces.service"):
+            result = _explain(tmp_path, {"features": [PLAN_RAISE]})
+
+        audit_id = _error(result, "internal")["audit_id"]
+        records = [r for r in caplog.records if r.name == "mloda.interfaces.service" and r.levelno == logging.ERROR]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert audit_id in message
+        assert PLAN_RAISE_SECRET not in message
+        assert records[0].exc_info is None
+
+
+class TestRequestChecks:
+    def test_unknown_top_level_key_is_validation_failed(self, tmp_path: Path) -> None:
+        error = _error(_explain(tmp_path, {"features": ["income"], "optons": {}}), "validation_failed")
+        assert _has_detail(error, path="/optons")
+
+    @pytest.mark.parametrize("request_value", [None, "income", ["income"], 3])
+    def test_non_object_request_is_validation_failed(self, tmp_path: Path, request_value: Any) -> None:
+        error = _error(_explain(tmp_path, request_value), "validation_failed")
+        assert _has_detail(error, path="")
+
+    def test_unknown_restricted_source_is_validation_failed(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": ["income"], "restrict_sources": ["sals"]})
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/restrict_sources/0", problem="unknown_source", suggestion="sales")
+
+    @pytest.mark.parametrize("key", ["CsvFG", "JsonFG", "ParquetFG", RESERVED_READER_OPTION_KEY])
+    def test_data_access_option_is_policy_denied(self, tmp_path: Path, key: str) -> None:
+        request = {"features": ["customer_id", {"name": "income", "options": {key: SECRET}}]}
+
+        result = _explain(tmp_path, request)
+
+        error = _error(result, "policy_denied")
+        assert [detail["path"] for detail in error["details"]] == [f"/features/1/options/{key}"]
+        assert SECRET not in json.dumps(result)
+
+    def test_csv_pointer_at_unconfigured_file_is_policy_denied(self, tmp_path: Path) -> None:
+        _write_sales(tmp_path)
+        other = tmp_path / "other_mcp4.csv"
+        other.write_text("income\n987654321\n")
+        request = {"features": [{"name": "income", "options": {"CsvFG": str(other)}}]}
+
+        result = _planner(_settings(tmp_path)).explain(request)
+
+        error = _error(result, "policy_denied")
+        assert [detail["path"] for detail in error["details"]] == ["/features/0/options/CsvFG"]
+        assert "987654321" not in json.dumps(result)
+        _assert_no_paths(result, tmp_path, "other_mcp4.csv")
+
+    def test_semantic_feature_config_error_is_validation_failed(self, tmp_path: Path) -> None:
+        request = {"features": [{"name": "income", "options": {"x": 1}, "group_options": {"y": 1}}]}
+
+        error = _error(_explain(tmp_path, request, allow_options=("x", "y")), "validation_failed")
+
+        assert _has_detail(error, path="/features/0", problem="invalid_feature_config")
+
+
+NESTED_OPTION_CASES: list[tuple[dict[str, Any], str]] = [
+    ({"name": "income", "options": {"k": SECRET}}, "/features/0/options/k"),
+    ({"name": "income", "group_options": {"k": SECRET}}, "/features/0/group_options/k"),
+    ({"name": "income", "context_options": {"k": SECRET}}, "/features/0/context_options/k"),
+    (
+        {"name": "income", "options": {"in_features": {"name": "raw", "options": {"k": SECRET}}}},
+        "/features/0/options/in_features/options/k",
+    ),
+    (
+        {"name": "income", "group_options": {"in_features": {"name": "raw", "context_options": {"k": SECRET}}}},
+        "/features/0/group_options/in_features/context_options/k",
+    ),
+    (
+        {
+            "name": "income",
+            "options": {
+                "in_features": {
+                    "name": "a",
+                    "options": {
+                        "in_features": {
+                            "name": "b",
+                            "group_options": {"in_features": {"name": "c", "options": {"k": SECRET}}},
+                        }
+                    },
+                }
+            },
+        },
+        "/features/0/options/in_features/options/in_features/group_options/in_features/options/k",
+    ),
+]
+
+
+class TestOptionAllowlist:
+    @pytest.mark.parametrize(("feature", "path"), NESTED_OPTION_CASES)
+    def test_unlisted_key_is_policy_denied_by_pointer_without_value(
+        self, tmp_path: Path, feature: dict[str, Any], path: str
+    ) -> None:
+        result = _explain(tmp_path, {"features": [feature]})
+
+        error = _error(result, "policy_denied")
+        assert [detail["path"] for detail in error["details"]] == [path]
+        assert _has_detail(error, problem="option_not_allowed")
+        assert SECRET not in json.dumps(result)
+
+    @pytest.mark.parametrize(("feature", "path"), NESTED_OPTION_CASES)
+    def test_listed_key_passes(self, tmp_path: Path, feature: dict[str, Any], path: str) -> None:
+        result = _explain(tmp_path, {"features": [feature]}, allow_options=("k",))
+
+        if is_error(result):
+            assert not _has_detail(result["error"], problem="option_not_allowed")
+
+    @pytest.mark.parametrize(("feature", "path"), NESTED_OPTION_CASES)
+    def test_trusted_caller_may_set_unlisted_keys(self, tmp_path: Path, feature: dict[str, Any], path: str) -> None:
+        result = _explain(tmp_path, {"features": [feature]}, trusted_caller=True)
+
+        if is_error(result):
+            assert not _has_detail(result["error"], problem="option_not_allowed")
+
+    def test_every_unlisted_key_is_reported_and_listed_ones_are_not(self, tmp_path: Path) -> None:
+        feature = {"name": "income", "options": {"a": 1, "b": 2, "ok": 3}, "context_options": {"c": 4}}
+
+        error = _error(_explain(tmp_path, {"features": [feature]}, allow_options=("ok",)), "policy_denied")
+
+        assert sorted(detail["path"] for detail in error["details"]) == [
+            "/features/0/context_options/c",
+            "/features/0/options/a",
+            "/features/0/options/b",
+        ]
+
+    def test_in_features_key_itself_is_not_refused(self, tmp_path: Path) -> None:
+        feature = {"name": "income", "options": {"in_features": "customer_id"}}
+
+        result = _explain(tmp_path, {"features": [feature]})
+
+        if is_error(result):
+            assert not _has_detail(result["error"], problem="option_not_allowed")
+
+    @pytest.mark.parametrize("key", ["CsvFG", RESERVED_READER_OPTION_KEY])
+    def test_listed_data_access_key_stays_a_data_access_problem(self, tmp_path: Path, key: str) -> None:
+        request = {"features": [{"name": "income", "options": {key: SECRET}}]}
+
+        result = _explain(tmp_path, request, allow_options=(key,))
+
+        error = _error(result, "policy_denied")
+        assert [detail["path"] for detail in error["details"]] == [f"/features/0/options/{key}"]
+        assert _has_detail(error, problem="data_access_option")
+        assert SECRET not in json.dumps(result)
+
+
+def _rename_key(value: Any, old: str, new: str) -> Any:
+    if isinstance(value, dict):
+        return {(new if key == old else key): _rename_key(item, old, new) for key, item in value.items()}
+    return value
+
+
+LOCKED_CASES = [
+    (_rename_key(feature, "k", CALLER_LOCKED_KEY), path.replace("/k", "/" + CALLER_LOCKED_KEY))
+    for feature, path in NESTED_OPTION_CASES
+]
+
+
+class TestCallerSettable:
+    @pytest.mark.parametrize(("feature", "path"), LOCKED_CASES)
+    @pytest.mark.parametrize("listed", [False, True])
+    def test_flagged_key_is_refused_even_when_listed(
+        self, tmp_path: Path, feature: dict[str, Any], path: str, listed: bool
+    ) -> None:
+        allow = (CALLER_LOCKED_KEY,) if listed else ()
+
+        result = _explain(tmp_path, {"features": [feature]}, allow_options=allow)
+
+        error = _error(result, "policy_denied")
+        assert [detail["path"] for detail in error["details"]] == [path]
+        assert _has_detail(error, problem="option_not_caller_settable")
+        assert not _has_detail(error, problem="option_not_allowed")
+        assert SECRET not in json.dumps(result)
+
+    @pytest.mark.parametrize("listed", [False, True])
+    @pytest.mark.parametrize("shape", ["options", "group_options"])
+    def test_a_declared_credential_handle_key_is_refused_even_when_listed(
+        self, tmp_path: Path, shape: str, listed: bool
+    ) -> None:
+        from tests.helpers.credential_handle_stubs import (
+            HANDLE_KEY,
+            ChsVaultFG,
+        )
+
+        assert ChsVaultFG.PROPERTY_MAPPING is not None
+        allow = (HANDLE_KEY,) if listed else ()
+        feature = {"name": "income", shape: {HANDLE_KEY: "vault-main"}}
+
+        result = _explain(tmp_path, {"features": [feature]}, allow_options=allow)
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, path=f"/features/0/{shape}/{HANDLE_KEY}", problem="option_not_caller_settable")
+        assert not _has_detail(error, problem="option_not_allowed")
+        assert "vault-main" not in json.dumps(result)
+
+    @pytest.mark.parametrize(("feature", "path"), LOCKED_CASES)
+    def test_trusted_caller_may_set_flagged_key(self, tmp_path: Path, feature: dict[str, Any], path: str) -> None:
+        result = _explain(tmp_path, {"features": [feature]}, trusted_caller=True)
+
+        if "group_options/in_features" in path:
+            # nested group_options in_features is an invalid feature config, unrelated to the policy
+            error = _error(result, "validation_failed")
+            assert _has_detail(error, problem="invalid_feature_config")
+            assert not _has_detail(error, problem="option_not_caller_settable")
+        else:
+            _success(result)
+
+    def test_operator_default_for_flagged_key_is_not_refused(self, tmp_path: Path) -> None:
+        result = _explain(
+            tmp_path,
+            {"features": ["customer_id", CALLER_LOCKED_FEATURE]},
+            options={CALLER_LOCKED_KEY: "https://operator.example"},
+        )
+
+        _success(result)
+        assert "operator.example" not in json.dumps(result)
+
+    def test_operator_context_default_for_flagged_key_is_not_refused(self, tmp_path: Path) -> None:
+        result = _explain(
+            tmp_path,
+            {"features": ["customer_id", CALLER_LOCKED_FEATURE]},
+            context_options={CALLER_LOCKED_KEY: "https://operator.example"},
+        )
+
+        _success(result)
+
+    def test_listed_data_access_key_still_reports_data_access_first(self, tmp_path: Path) -> None:
+        feature = {"name": "income", "options": {"CsvFG": SECRET, CALLER_LOCKED_KEY: SECRET}}
+
+        error = _error(
+            _explain(tmp_path, {"features": [feature]}, allow_options=("CsvFG", CALLER_LOCKED_KEY)), "policy_denied"
+        )
+
+        assert _has_detail(error, problem="data_access_option")
+        assert not _has_detail(error, problem="option_not_caller_settable")
+
+    @pytest.mark.parametrize(
+        ("feature", "paths"),
+        [
+            (LOCKED_NAME, ["/features/0"]),
+            (LOCKED_NAME + DOUBLE_SUFFIX, ["/features"]),
+            ({"name": LOCKED_NAME}, ["/features/0"]),
+        ],
+    )
+    @pytest.mark.parametrize("listed", [False, True])
+    def test_name_bound_flagged_key_is_refused(
+        self, tmp_path: Path, feature: str | dict[str, Any], paths: list[str], listed: bool
+    ) -> None:
+        allow = (CALLER_LOCKED_KEY,) if listed else ()
+        name = feature if isinstance(feature, str) else feature["name"]
+
+        result = _explain(tmp_path, {"features": [feature]}, allow_options=allow)
+
+        error = _error(result, "policy_denied")
+        assert [detail["path"] for detail in error["details"]] == paths
+        assert _has_detail(error, problem="option_not_caller_settable")
+        dumped = json.dumps(result)
+        assert "zq7x" not in dumped
+        assert name not in dumped
+
+    def test_name_binding_only_a_settable_key_is_not_refused(self, tmp_path: Path) -> None:
+        _success(_explain(tmp_path, {"features": [BIND_PREFIX + "a"]}))
+
+    def test_trusted_caller_may_bind_flagged_key_by_name(self, tmp_path: Path) -> None:
+        _success(_explain(tmp_path, {"features": [LOCKED_NAME]}, trusted_caller=True))
+
+    def test_operator_default_does_not_excuse_a_flagged_name(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": [LOCKED_NAME]}, options={CALLER_LOCKED_KEY: "zq7x"})
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, problem="option_not_caller_settable")
+
+    def test_other_unlisted_key_is_still_option_not_allowed(self, tmp_path: Path) -> None:
+        feature = {"name": "income", "options": {CALLER_LOCKED_KEY: SECRET, "other": 1}}
+
+        error = _error(_explain(tmp_path, {"features": [feature]}), "policy_denied")
+
+        assert _has_detail(error, path="/features/0/options/other", problem="option_not_allowed")
+
+
+class TestUnresolved:
+    def test_unresolved_name_has_path_and_suggestion_from_source_columns(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": ["customer_id", "incme"]})
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/features/1", problem="unresolved", suggestion="income")
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_unresolved_name_without_close_match_has_no_suggestion(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": ["qqqzzzwww_mcp4"]})
+
+        error = _error(result, "validation_failed")
+        details = [detail for detail in error["details"] if detail.get("path") == "/features/0"]
+        assert len(details) == 1
+        assert details[0]["problem"] == "unresolved"
+        assert "suggestion" not in details[0]
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_unrequested_input_gets_no_suggestion_and_is_not_named(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": ["incme" + DOUBLE_SUFFIX]})
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/features/0", problem="unresolved")
+        assert all("suggestion" not in detail for detail in error["details"])
+        assert "'incme'" not in json.dumps(result)
+        assert "incme" not in json.dumps(result).replace("incme" + DOUBLE_SUFFIX, "")
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_requested_input_keeps_its_own_pointer_and_suggestion(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": ["incme" + DOUBLE_SUFFIX, "incme"]})
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/features/1", problem="unresolved", suggestion="income")
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_in_features_name_keeps_its_pointer_and_suggestion(self, tmp_path: Path) -> None:
+        request = {"features": [{"name": "out" + IN_SUFFIX, "in_features": ["incme"]}]}
+
+        result = _explain(tmp_path, request)
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/features/0/in_features/0", problem="unresolved", suggestion="income")
+
+    @pytest.mark.parametrize(
+        "failed, problem",
+        [
+            (EvaluationResult(identified={}), "unresolved"),
+            (
+                EvaluationResult(
+                    identified={},
+                    eliminations={
+                        SqliteFG: Elimination(stage="variant", reason="x", variants=("v",), allow_variants=("v",))
+                    },
+                ),
+                "variant_not_allowed",
+            ),
+        ],
+    )
+    def test_unrequested_root_is_never_named(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed: EvaluationResult, problem: str
+    ) -> None:
+        diagnosis = ResolutionDiagnosis(
+            records=[],
+            complete=False,
+            feature_name="hidden_input_zq",
+            failed_result=failed,
+            resolving_path=("hidden_root_zq",),
+        )
+        monkeypatch.setattr(mloda, "diagnose", lambda *args, **kwargs: diagnosis)
+
+        result = _planner(_settings(tmp_path)).explain({"features": ["income"]})
+
+        error = _error(result, "validation_failed")
+        detail = next(d for d in error["details"] if d.get("problem") == problem)
+        assert detail["path"] == "/features"
+        assert "a requested feature" in detail["message"]
+        dumped = json.dumps(result)
+        assert "hidden_root_zq" not in dumped
+        assert "hidden_input_zq" not in dumped
+
+
+class TestVariantNotAllowed:
+    @staticmethod
+    def _blocked(tmp_path: Path, group_name: str, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], Any]:
+        result, details, toy = TestVariantNotAllowed._blocked_details(tmp_path, group_name, **kwargs)
+        assert len(details) == 1
+        return result, details[0], toy
+
+    @staticmethod
+    def _blocked_details(
+        tmp_path: Path,
+        group_name: str,
+        *,
+        feature_const: str | None = None,
+        config: dict[str, Any] | None = None,
+        extra_groups: tuple[str, ...] = (),
+        compute_frameworks: tuple[str, ...] = ("PandasDataFrame",),
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], Any]:
+        toy = importlib.import_module(
+            "tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_operation_group"
+        )
+        group = getattr(toy, group_name)
+        name = getattr(toy, feature_const) if feature_const else group.FEATURE
+        request = {"features": [{"name": name, "options": {toy.OPTOY_KEY: "sum"}, **(config or {})}]}
+        settings = _settings(tmp_path, compute_frameworks=compute_frameworks, **kwargs)
+        groups = {group, *(getattr(toy, extra) for extra in extra_groups)}
+        base = PluginCollector.enabled_feature_groups({*FILE_SOURCE_GROUPS, *groups})
+        result = _planner(settings, base=base).explain(request)
+        details = [
+            d for d in _error(result, "validation_failed")["details"] if d.get("problem") == "variant_not_allowed"
+        ]
+        return result, details, toy
+
+    @pytest.mark.parametrize(
+        "group_name, kwargs, fix, message_part",
+        [
+            ("OpToyVariantFG", {"allow_options": ("optoy_kind", "allow_variants")}, True, "add the fix"),
+            ("OpToyVariantFG", {"allow_options": ("optoy_kind",)}, False, "service policy"),
+            ("OpToyVariantFG", {"trusted_caller": True}, True, "add the fix"),
+            ("OpToyVariantEmptyFG", {"allow_options": ("optoy_kind", "allow_variants")}, False, "cannot be allowed"),
+            (
+                "OpToyVariantFG",
+                {"allow_options": ("optoy_kind", "allow_variants"), "config": {"implementation": "OpToyVariantPandas"}},
+                True,
+                "add the fix",
+            ),
+        ],
+    )
+    def test_blocked_variant_is_named(
+        self, tmp_path: Path, group_name: str, kwargs: dict[str, Any], fix: bool, message_part: str
+    ) -> None:
+        result, detail, toy = self._blocked(tmp_path, group_name, **kwargs)
+
+        assert detail["path"] == "/features/0"
+        assert detail["feature_group"] == group_name
+        assert detail["variants"] == [toy.OPTOY_VARIANT]
+        assert message_part in detail["message"]
+        assert "suggestion" not in detail
+        if fix:
+            assert detail["fix"] == {"allow_variants": [toy.OPTOY_VARIANT]}
+        else:
+            assert "fix" not in detail
+        dumped = json.dumps(result)
+        assert "does not allow" not in dumped
+        assert "OpToyVariantPandas" not in dumped
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    @pytest.mark.parametrize(
+        "blocked, const, input_name, extra, fix, message_part",
+        [
+            (
+                "OpToyVariantFG",
+                "OPTOY_VARIANT_CONSUMER",
+                "optoyvar_value",
+                ("OpToyVariantConsumerFG",),
+                True,
+                "add the fix",
+            ),
+            (
+                "OpToyVariantEmptyFG",
+                "OPTOY_VARIANT_EMPTY_CONSUMER",
+                "optoyvar_empty",
+                ("OpToyVariantEmptyConsumerFG",),
+                False,
+                "cannot be allowed",
+            ),
+        ],
+    )
+    def test_blocked_input_is_reported_at_the_requested_feature(
+        self,
+        tmp_path: Path,
+        blocked: str,
+        const: str,
+        input_name: str,
+        extra: tuple[str, ...],
+        fix: bool,
+        message_part: str,
+    ) -> None:
+        result, detail, toy = self._blocked(
+            tmp_path,
+            blocked,
+            feature_const=const,
+            extra_groups=extra,
+            allow_options=("optoy_kind", "allow_variants"),
+        )
+
+        assert detail["path"] == "/features/0"
+        assert getattr(toy, const) in detail["message"]
+        assert input_name not in detail["message"].replace(getattr(toy, const), "")
+        assert message_part in detail["message"]
+        if fix:
+            assert detail["fix"] == {"allow_variants": [toy.OPTOY_VARIANT]}
+        else:
+            assert "fix" not in detail
+        assert input_name not in json.dumps(result).replace(getattr(toy, const), "")
+
+    def test_consumer_and_its_blocked_input_both_requested_reports_at_the_consumer(self, tmp_path: Path) -> None:
+        toy = importlib.import_module(
+            "tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_operation_group"
+        )
+        options = {toy.OPTOY_KEY: "sum"}
+        features = [
+            {"name": toy.OPTOY_VARIANT_CONSUMER, "options": options},
+            {"name": "optoyvar_value", "options": options},
+        ]
+        settings = _settings(
+            tmp_path, compute_frameworks=("PandasDataFrame",), allow_options=("optoy_kind", "allow_variants")
+        )
+        base = PluginCollector.enabled_feature_groups(
+            {*FILE_SOURCE_GROUPS, toy.OpToyVariantFG, toy.OpToyVariantConsumerFG}
+        )
+
+        result = _planner(settings, base=base).explain({"features": features})
+
+        error = _error(result, "validation_failed")
+        details = [d for d in error["details"] if d.get("problem") == "variant_not_allowed"]
+        assert [d["path"] for d in details] == ["/features/0"]
+        assert "One of the inputs of" in details[0]["message"]
+
+    @pytest.mark.parametrize(
+        ("feature_const", "config", "extra_groups"),
+        [
+            ("OPTOY_VARIANT_OPEN_CONSUMER", {"implementation": "OpToyVariantPandas"}, ("OpToyVariantOpenConsumerFG",)),
+            ("OPTOY_VARIANT_PIN_ROOT", None, ("OpToyVariantOpenConsumerFG", "OpToyVariantPinRootFG")),
+        ],
+        ids=["root_pin", "input_pin"],
+    )
+    def test_chained_implementation_pin_is_validation_failed_not_internal(
+        self, tmp_path: Path, feature_const: str, config: dict[str, Any] | None, extra_groups: tuple[str, ...]
+    ) -> None:
+        result, detail, toy = self._blocked(
+            tmp_path,
+            "OpToyVariantFG",
+            feature_const=feature_const,
+            config=config,
+            extra_groups=extra_groups,
+            compute_frameworks=("PandasDataFrame", "PyArrowTable"),
+            allow_options=("optoy_kind", "allow_variants"),
+        )
+
+        assert detail["path"] == "/features/0"
+        assert getattr(toy, feature_const) in detail["message"]
+        assert detail["fix"] == {"allow_variants": [toy.OPTOY_VARIANT]}
+        assert detail["feature_group"] == "OpToyVariantFG"
+        assert detail["variants"] == [toy.OPTOY_VARIANT]
+        if config is None:
+            assert toy.OPTOY_VARIANT_OPEN_CONSUMER not in json.dumps(result)
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_competing_consumers_give_one_variant_detail_each(self, tmp_path: Path) -> None:
+        result, details, toy = self._blocked_details(
+            tmp_path,
+            "OpToyVariantFG",
+            feature_const="OPTOY_VARIANT_RIVAL_CONSUMER",
+            extra_groups=(
+                "OpToyVariantRivalFixableConsumerFG",
+                "OpToyVariantRivalUnlistedConsumerFG",
+                "OpToyVariantEmptyFG",
+            ),
+            allow_options=("optoy_kind", "allow_variants"),
+        )
+
+        assert [d["path"] for d in details] == ["/features/0", "/features/0"]
+        by_group = {d["feature_group"]: d for d in details}
+        assert set(by_group) == {"OpToyVariantRivalFixableConsumerFG", "OpToyVariantRivalUnlistedConsumerFG"}
+        fixable = by_group["OpToyVariantRivalFixableConsumerFG"]
+        unlisted = by_group["OpToyVariantRivalUnlistedConsumerFG"]
+        assert fixable["fix"] == {"allow_variants": [toy.OPTOY_VARIANT]}
+        assert "fix" not in unlisted
+        assert "cannot be allowed" in unlisted["message"]
+        assert "add the fix" in fixable["message"]
+        error = _error(result, "validation_failed")
+        assert error["message"] == fixable["message"]
+        dumped = json.dumps(result)
+        assert "optoyvar_value" not in dumped
+        assert "optoyvar_empty" not in dumped
+
+    def test_unresolvable_input_is_reported_at_the_requested_feature_without_its_name(self, tmp_path: Path) -> None:
+        toy = importlib.import_module(
+            "tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_operation_group"
+        )
+        request = {"features": [{"name": toy.OPTOY_VARIANT_CONSUMER, "options": {toy.OPTOY_KEY: "sum"}}]}
+        settings = _settings(tmp_path, compute_frameworks=("PandasDataFrame",), allow_options=("optoy_kind",))
+        base = PluginCollector.enabled_feature_groups({*FILE_SOURCE_GROUPS, toy.OpToyVariantConsumerFG})
+
+        result = _planner(settings, base=base).explain(request)
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/features/0", problem="unresolved")
+        assert not _has_detail(error, problem="variant_not_allowed")
+        detail = next(d for d in error["details"] if d.get("problem") == "unresolved")
+        assert toy.OPTOY_VARIANT_CONSUMER in detail["message"]
+        assert "suggestion" not in detail
+        assert toy.OPTOY_VARIANT_FEATURE not in json.dumps(result)
+
+    def test_refused_allow_variants_key_gets_no_fix(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "mloda.interfaces.service.planner.caller_refused_option_keys", lambda *a, **k: frozenset({"allow_variants"})
+        )
+
+        result, detail, _ = self._blocked(tmp_path, "OpToyVariantFG", allow_options=("optoy_kind", "allow_variants"))
+
+        assert "fix" not in detail
+        assert "service policy" in detail["message"]
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_multiple_identified_keeps_the_generic_detail(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        elimination = Elimination(stage="variant", reason="x", variants=("v",), allow_variants=("v",))
+        failed = EvaluationResult(identified={CsvFG: set(), JsonFG: set()}, eliminations={SqliteFG: elimination})
+        diagnosis = ResolutionDiagnosis(records=[], complete=False, feature_name="income", failed_result=failed)
+        monkeypatch.setattr(mloda, "diagnose", lambda *args, **kwargs: diagnosis)
+
+        result = _planner(_settings(tmp_path)).explain({"features": ["income"]})
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/features/0", problem="unresolved")
+        assert not _has_detail(error, problem="variant_not_allowed")
+
+
+class TestDiagnosisWithoutFeatureName:
+    def test_scope_at_inaccessible_source_group_is_validation_failed(self, tmp_path: Path) -> None:
+        request = {"features": [{"name": "income", "feature_group": "SqliteFG"}]}
+
+        result = _explain(tmp_path, request)
+
+        error = _error(result, "validation_failed")
+        assert isinstance(error["message"], str)
+        assert error["message"]
+        assert "not accessible in this run" not in json.dumps(result)
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_unnamed_diagnosis_is_validation_failed_with_generic_message(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(tmp_path)
+        leaked = str(tmp_path / "sales.csv")
+        core_message = f"options point at CsvFG, but CsvFG is not accessible in this run: {leaked}."
+        diagnosis = ResolutionDiagnosis(records=[], complete=False, message=core_message)
+        monkeypatch.setattr(mloda, "diagnose", lambda *args, **kwargs: diagnosis)
+
+        result = _planner(settings).explain({"features": ["income"]})
+
+        error = _error(result, "validation_failed")
+        assert isinstance(error["message"], str)
+        assert error["message"]
+        assert core_message not in json.dumps(result)
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+
+class TestPolicy:
+    def test_filter_on_denied_column_is_refused_before_planning(self, tmp_path: Path, denied_calls: list[str]) -> None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))}
+        request = {"features": ["income"], "filters": [{"feature": "mcp4_salary", "op": "eq", "value": 5}]}
+
+        result = _explain(
+            tmp_path,
+            request,
+            sources=sources,
+            classification={"mcp4_salary": "public", "income": "public"},
+            preview_allows=("public",),
+        )
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, path="/filters/0/feature")
+        assert denied_calls == []
+
+    @pytest.mark.parametrize(
+        ("feature", "pointer"),
+        [("mcp4_salary~0", "/features/0"), ("mcp4_salary~0" + DOUBLE_SUFFIX, None)],
+    )
+    def test_column_index_suffix_does_not_bypass_policy(
+        self, tmp_path: Path, denied_calls: list[str], feature: str, pointer: str | None
+    ) -> None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))}
+
+        result = _explain(tmp_path, {"features": [feature]}, sources=sources)
+
+        error = _error(result, "policy_denied")
+        if pointer is not None:
+            assert _has_detail(error, path=pointer)
+        assert denied_calls == []
+
+    def test_unresolved_name_never_suggests_denied_column(self, tmp_path: Path) -> None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))}
+
+        result = _explain(tmp_path, {"features": ["mcp4_salarx"]}, sources=sources)
+
+        error = _error(result, "validation_failed")
+        assert all(detail.get("suggestion") != "mcp4_salary" for detail in error["details"])
+        assert "mcp4_salary" not in json.dumps(result)
+
+    def test_denied_feature_is_policy_denied_without_running_its_code(
+        self, tmp_path: Path, denied_calls: list[str]
+    ) -> None:
+        result = _explain(tmp_path, {"features": ["mcp4_salary"]})
+
+        error = _error(result, "policy_denied")
+        assert "alternatives" not in error
+        assert "deny_feature_groups" not in json.dumps(result)
+        assert denied_calls == []
+
+    def test_denied_feature_carries_alternatives(self, tmp_path: Path, denied_calls: list[str]) -> None:
+        result = _explain(tmp_path, {"features": ["mcp4_salary"]}, alternatives={"mcp4_salary": ("income",)})
+
+        error = _error(result, "policy_denied")
+        assert error["alternatives"] == ["income"]
+        assert denied_calls == []
+
+    @pytest.mark.parametrize(("feature", "pointer"), _in_features_cases("mcp4_salary"))
+    def test_denied_in_features_source_is_policy_denied(
+        self, tmp_path: Path, denied_calls: list[str], feature: dict[str, Any], pointer: str
+    ) -> None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))}
+
+        result = _explain(tmp_path, {"features": [feature]}, sources=sources)
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, path=pointer)
+        assert denied_calls == []
+
+    @pytest.mark.parametrize("feature", [feature for feature, _ in _in_features_cases("income")])
+    def test_allowed_in_features_source_plans(self, tmp_path: Path, feature: dict[str, Any]) -> None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))}
+
+        _success(_explain(tmp_path, {"features": [feature]}, sources=sources))
+
+    def test_derived_name_over_denied_column_is_policy_denied(self, tmp_path: Path, denied_calls: list[str]) -> None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))}
+
+        result = _explain(tmp_path, {"features": ["mcp4_salary" + DOUBLE_SUFFIX]}, sources=sources)
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, path="/features", problem="policy_denied")
+        assert denied_calls == []
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    @pytest.mark.parametrize(
+        ("rivals", "hops", "abstract", "suffix"),
+        [
+            ((), 1, False, ""),
+            ((PlannerRivalMissingMcp4,), 1, False, ""),
+            ((PlannerRivalMissingMcp4,), 2, False, ""),
+            ((), 1, True, ""),
+            ((PlannerRivalMissingMcp4,), 1, True, ""),
+            ((PlannerRivalIncomeMcp4,), 1, False, ""),
+            ((PlannerRivalIncomeMcp4, PlannerRivalCustomerMcp4), 1, False, ""),
+            ((), 1, False, "~0"),
+        ],
+        ids=[
+            "no_rival",
+            "rival",
+            "rival_two_hops",
+            "abstract_only",
+            "abstract_and_rival",
+            "one_resolving_rival",
+            "two_resolving_rivals",
+            "suffix",
+        ],
+    )
+    def test_derived_name_over_a_denied_name_answers_alike_with_or_without_the_column(
+        self,
+        tmp_path: Path,
+        denied_calls: list[str],
+        rivals: tuple[type[FeatureGroup], ...],
+        hops: int,
+        abstract: bool,
+        suffix: str,
+    ) -> None:
+        extra: list[type[FeatureGroup]] = [*rivals, *([PlannerAbstractDoubleMcp4] if abstract else [])]
+        base = _base(*extra) if extra else None
+        name = "mcp4_salary" + suffix + DOUBLE_SUFFIX * hops
+        answers = []
+        for with_denied_column in (False, True):
+            sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=with_denied_column))}
+            result = _explain(tmp_path, {"features": [name]}, base=base, sources=sources)
+            dumped = json.dumps(result).replace(name, "")
+            assert "mcp4_salary" not in dumped
+            assert "mcp4_nowhere_column" not in dumped
+            if is_error(result):
+                answers.append(_without_audit(result["error"]))
+            else:
+                answers.append({k: result[k] for k in ("steps", "lineage", "egress")})
+            assert denied_calls == []
+        assert answers[0] == answers[1]
+        if not rivals and not abstract and not suffix:
+            assert answers[0]["code"] == "policy_denied"
+            assert any(
+                d.get("path") == "/features" and d.get("problem") == "policy_denied" for d in answers[0]["details"]
+            )
+            assert all("suggestion" not in detail for detail in answers[0]["details"])
+
+    def test_derived_name_over_a_denied_inline_name_answers_alike_with_or_without_the_column(
+        self, tmp_path: Path, denied_calls: list[str]
+    ) -> None:
+        name = "mcp4_salary" + DOUBLE_SUFFIX
+        answers = []
+        for column in ("segment", "mcp4_salary"):
+            request = {"features": [name], "data": {"Tbl": {column: [1, 2], "income": [10, 20]}}}
+            result = _explain(tmp_path, request, base=_base(PlannerRivalIncomeMcp4), inline_data=True)
+            assert "mcp4_salary" not in json.dumps(result).replace(name, "")
+            if is_error(result):
+                answers.append(_without_audit(result["error"]))
+            else:
+                answers.append({k: result[k] for k in ("steps", "lineage", "egress")})
+            assert denied_calls == []
+        assert answers[0] == answers[1]
+
+    def test_run_over_a_denied_name_with_one_resolving_rival_answers_alike(self, tmp_path: Path) -> None:
+        base = _base(PlannerRivalIncomeMcp4)
+        name = "mcp4_salary" + DOUBLE_SUFFIX
+        answers = []
+        for with_denied_column in (False, True):
+            sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=with_denied_column))}
+            planner = _planner(_settings(tmp_path, sources=sources, mode="execute"), base=base)
+            explained = _success(planner.explain({"features": [name]}))
+            outcome = _success(Runner(planner, clock=lambda: CLOCK_START).run(explained["plan_id"]))
+            assert outcome["status"] == "completed"
+            answers.append([[c["name"] for c in table["columns"]] for table in outcome["tables"]])
+        assert answers[0] and answers[0] == answers[1]
+
+    def test_strict_mode_keeps_the_gate_registered(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MLODA_PLUGIN_REGISTRY_STRICT", "strict")
+        _success(_explain(tmp_path, {"features": ["income"]}))
+
+    def test_gated_planning_logs_no_denied_name(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        name = "mcp4_salary" + DOUBLE_SUFFIX
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))}
+        with caplog.at_level(logging.DEBUG):
+            _explain(tmp_path, {"features": [name]}, base=_base(PlannerRivalMissingMcp4), sources=sources)
+        messages = "\n".join(r.getMessage() for r in caplog.records)
+        assert "denied by policy" in messages
+        assert "DeniedNameGate" in messages
+        assert "mcp4_salary" not in messages.replace(name, "")
+
+    def test_variant_pin_beside_a_denied_input_is_policy_denied_either_way(self, tmp_path: Path) -> None:
+        toy = importlib.import_module(
+            "tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_operation_group"
+        )
+        base = PluginCollector.enabled_feature_groups(
+            {
+                *FILE_SOURCE_GROUPS,
+                PlannerDeniedMcp4,
+                PlannerDoubleMcp4,
+                PlannerPinRootMcp4,
+                toy.OpToyVariantFG,
+                toy.OpToyVariantOpenConsumerFG,
+            }
+        )
+        request = {"features": [{"name": PIN_ROOT, "options": {toy.OPTOY_KEY: "sum"}}]}
+        errors = []
+        for with_denied_column in (True, False):
+            sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=with_denied_column))}
+            settings = _settings(
+                tmp_path,
+                sources=sources,
+                compute_frameworks=("PandasDataFrame", "PyArrowTable"),
+                allow_options=("optoy_kind", "allow_variants"),
+            )
+            result = _planner(settings, base=base).explain(request)
+            error = _error(result, "policy_denied")
+            assert _has_detail(error, path="/features", problem="policy_denied")
+            dumped = json.dumps(result)
+            assert "mcp4_salary" not in dumped
+            assert toy.OPTOY_VARIANT_OPEN_CONSUMER not in dumped
+            errors.append(_without_audit(error))
+        assert errors[0] == errors[1]
+
+    @pytest.mark.parametrize("with_denied_column", [True, False])
+    def test_denied_input_beside_a_real_failing_sibling_is_policy_denied(
+        self, tmp_path: Path, with_denied_column: bool
+    ) -> None:
+        sources = {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=with_denied_column))}
+
+        result = _explain(tmp_path, {"features": ["mcp4_salary" + DOUBLE_SUFFIX, "nope_x"]}, sources=sources)
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, path="/features", problem="policy_denied")
+        dumped = json.dumps(result).replace("mcp4_salary" + DOUBLE_SUFFIX, "")
+        assert "nope_x" not in dumped
+        assert "mcp4_salary" not in dumped
+
+    @pytest.mark.parametrize("with_denied_column", [True, False])
+    def test_derived_name_over_denied_column_carries_alternatives(
+        self, tmp_path: Path, with_denied_column: bool
+    ) -> None:
+        sources = (
+            {"sales": _source("sales", _write_sales(tmp_path, with_denied_column=True))} if with_denied_column else None
+        )
+
+        result = _explain(
+            tmp_path,
+            {"features": ["mcp4_salary" + DOUBLE_SUFFIX]},
+            sources=sources,
+            alternatives={"mcp4_salary": ("income",)},
+        )
+
+        assert _error(result, "policy_denied")["alternatives"] == ["income"]
+
+    @pytest.mark.parametrize("failing_name", ["sibling_x", None])
+    def test_denied_input_resolved_beside_a_failing_sibling_is_policy_denied(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_name: str | None
+    ) -> None:
+        failed = EvaluationResult(identified={}, eliminations={})
+        records = [ResolutionRecord("mcp4_salary", False, failed)]
+        diagnosis = ResolutionDiagnosis(
+            records=records, complete=False, feature_name=failing_name, failed_result=failed
+        )
+        monkeypatch.setattr(mloda, "diagnose", lambda *args, **kwargs: diagnosis)
+
+        result = _explain(tmp_path, {"features": ["income"]})
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, path="/features", problem="policy_denied")
+        assert "sibling_x" not in json.dumps(result)
+
+    def test_allowed_request_never_calls_into_denied(self, tmp_path: Path, denied_calls: list[str]) -> None:
+        _success(_explain(tmp_path, {"features": ["customer_id", DERIVED]}))
+        assert denied_calls == []
+
+
+class TestFilters:
+    def test_unmatched_filter_is_validation_failed(self, tmp_path: Path) -> None:
+        request = {
+            "features": ["customer_id"],
+            "filters": [
+                {"feature": "segment", "op": "eq", "value": "a"},
+                {"feature": "nope_mcp4", "op": "eq", "value": 1},
+            ],
+        }
+
+        result = _explain(tmp_path, request)
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/filters/1", problem="unmatched_filter")
+        assert not _has_detail(error, path="/filters/0")
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_matched_filter_on_unrequested_column_is_allowed(self, tmp_path: Path) -> None:
+        request = {"features": ["customer_id"], "filters": [{"feature": "segment", "op": "in", "values": ["a"]}]}
+
+        # A filter column must be previewable; an unclassified one is refused (filter_on_withheld_column).
+        result = _success(_explain(tmp_path, request, classification={"segment": "public"}))
+
+        assert result["policy"] == {"verdict": "allowed"}
+        assert result["normalized_request"] == request
+
+
+class TestTrustedCaller:
+    REQUEST = {"features": ["customer_id"], "filters": [{"feature": "segment", "op": "in", "values": ["a"]}]}
+
+    def test_untrusted_caller_is_refused_a_filter_on_a_withheld_column(self, tmp_path: Path) -> None:
+        error = _error(_explain(tmp_path, self.REQUEST), "policy_denied")
+
+        assert _has_detail(error, path="/filters/0", problem="filter_on_withheld_column")
+
+    def test_trusted_caller_may_filter_on_a_withheld_column(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, self.REQUEST, trusted_caller=True))
+
+        assert result["policy"] == {"verdict": "allowed"}
+        assert result["normalized_request"] == self.REQUEST
+
+    def test_trusted_caller_keeps_the_egress_report(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, self.REQUEST, trusted_caller=True))
+
+        assert result["egress"]["withheld"] == [{"column": "customer_id", "reason": "classification: unclassified"}]
+
+
+class TestSuccess:
+    def test_result_keys(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}))
+        assert set(result) == SUCCESS_KEYS
+
+    def test_plan_id_and_expiry(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+
+        result = _success(_planner(settings).explain({"features": ["customer_id", "income"]}))
+
+        assert isinstance(result["plan_id"], str)
+        assert result["plan_id"].startswith(PLAN_TOKEN_PREFIX + ".")
+        expires_at = result["expires_at"]
+        assert isinstance(expires_at, str)
+        assert expires_at.endswith("Z")
+        parsed = datetime.fromisoformat(expires_at)
+        assert parsed.timestamp() == CLOCK_START + settings.plan_ttl_seconds
+
+    def test_normalized_request_and_policy(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}))
+
+        assert result["normalized_request"] == {"features": ["customer_id", "income"]}
+        assert result["policy"] == {"verdict": "allowed"}
+
+    def test_read_step(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}))
+
+        (step,) = result["steps"]
+        assert set(step) == STEP_KEYS
+        assert step["step"] == 1
+        assert step["kind"] == "compute"
+        assert sorted(step["features"]) == ["customer_id", "income"]
+        assert step["feature_group"] == "CsvFG"
+        assert step["compute_framework"] == "PythonDictFramework"
+        assert step["compute_framework_reason"] == "only allowed framework"
+        assert step["specialized_from"] == []
+        assert step["source"] == "sales"
+        assert step["inputs"] == []
+        assert step["source_feature_group"] is None
+        assert step["join_type"] is None
+        assert step["contract_version"] is None
+        assert step["divergences"] == []
+
+    def test_join_step_record_names_both_sides_and_join_type(self) -> None:
+        step = PlanStep(
+            step_kind="join",
+            feature_names=(),
+            feature_group=CsvFG,
+            compute_framework=None,
+            source_feature_group=JsonFG,
+            source_compute_framework=None,
+            join_type="inner",
+        )
+
+        record = _step_record(1, step, None)
+
+        assert record["feature_group"] == "CsvFG"
+        assert record["source_feature_group"] == "JsonFG"
+        assert record["join_type"] == "inner"
+        assert record["contract_version"] is None
+        assert record["divergences"] == []
+
+    def test_step_record_carries_the_contract_version_and_bounded_divergences(self) -> None:
+        implementation = stamped(
+            Divergence(
+                kind=DivergenceKind.VALUE,
+                cause=Cause.BACKEND,
+                outputs=frozenset({"b", " c", "a"}),
+                reason="  skips   NaN  ",
+            ),
+            DivergenceSource.IMPLEMENTATION,
+            "PandasDataFrame",
+        )
+        group = stamped(
+            Divergence(
+                kind=DivergenceKind.VARIANT,
+                cause=Cause.OTHER,
+                subtypes=frozenset({"y", "x"}),
+                reason="variant reason",
+                variant="fast",
+                docs="https://example.org/x",
+            ),
+            DivergenceSource.FEATURE_GROUP,
+            None,
+        )
+        step = PlanStep(
+            step_kind="compute",
+            feature_names=("a",),
+            feature_group=CsvFG,
+            compute_framework=None,
+            source_feature_group=None,
+            source_compute_framework=None,
+            contract_version=3,
+            divergences=(implementation, group),
+            allowed_variants=("fast", "skip_nan"),
+        )
+
+        record = _step_record(1, step, None)
+
+        assert record["contract_version"] == 3
+        assert record["allowed_variants"] == ["fast", "skip_nan"]
+        assert record["divergences"] == [
+            {
+                "source": "feature_group",
+                "framework": None,
+                "kind": "variant",
+                "cause": "other",
+                "subtypes": ["x", "y"],
+                "outputs": [],
+                "reason": "variant reason",
+                "variant": "fast",
+                "docs": "https://example.org/x",
+            },
+            {
+                "source": "implementation",
+                "framework": "PandasDataFrame",
+                "kind": "value",
+                "cause": "backend",
+                "subtypes": [],
+                "outputs": ["a", "b", "c"],
+                "reason": "skips NaN",
+                "variant": None,
+                "docs": None,
+            },
+        ]
+
+    def test_step_record_omits_the_credential_handles(self) -> None:
+        step = PlanStep(
+            step_kind="compute",
+            feature_names=("a",),
+            feature_group=CsvFG,
+            compute_framework=None,
+            source_feature_group=None,
+            source_compute_framework=None,
+            credential_handles=("vault-a", "vault-b"),
+            bound_credential_handle="vault-a",
+        )
+
+        record = _step_record(1, step, None)
+
+        assert "credential_handles" not in record
+        assert "bound_credential_handle" not in record
+        assert set(record) == STEP_KEYS
+        assert "vault-a" not in json.dumps(record)
+
+    def test_lineage_of_source_columns(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}))
+        assert result["lineage"] == {"customer_id": ["sales.customer_id"], "income": ["sales.income"]}
+
+    def test_estimate_of_countable_source(self, tmp_path: Path) -> None:
+        estimate = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}))["estimate"]
+
+        assert set(estimate) == {"sources", "rows_read", "rows_returned", "rows_returned_note"}
+        assert estimate["sources"] == [{"alias": "sales", "rows": 5, "rows_exact": True}]
+        assert estimate["rows_read"] == 5
+        assert estimate["rows_returned"] is None
+        assert isinstance(estimate["rows_returned_note"], str)
+        assert estimate["rows_returned_note"]
+
+    def test_no_paths_anywhere(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}))
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_only_sources_the_plan_reads_are_estimated(self, tmp_path: Path) -> None:
+        sources = {
+            "sales": _source("sales", _write_sales(tmp_path)),
+            "other": _source("other", _write_orders(tmp_path)),
+        }
+
+        result = _success(_explain(tmp_path, {"features": ["customer_id"]}, sources=sources))
+
+        assert [entry["alias"] for entry in result["estimate"]["sources"]] == ["sales"]
+        _assert_no_paths(result, tmp_path, "sales.csv", "orders.csv")
+
+
+class TestDerived:
+    def test_steps_in_dependency_order(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", DERIVED]}))
+
+        steps = result["steps"]
+        assert [step["step"] for step in steps] == [1, 2]
+        assert all(set(step) == STEP_KEYS for step in steps)
+        read, derived = steps
+        assert read["feature_group"] == "CsvFG"
+        assert read["source"] == "sales"
+        assert sorted(read["features"]) == ["customer_id", "income"]
+        assert derived["kind"] == "compute"
+        assert derived["feature_group"] == "PlannerDoubleMcp4"
+        assert derived["features"] == [DERIVED]
+        assert derived["compute_framework"] == "PythonDictFramework"
+        assert derived["source"] is None
+        assert derived["inputs"] == ["income"]
+
+    def test_lineage_traces_derived_feature_to_source_column(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", DERIVED]}))
+        assert result["lineage"] == {"customer_id": ["sales.customer_id"], DERIVED: ["sales.income"]}
+
+    def test_estimate_counts_source_of_derived_feature(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": [DERIVED]}))
+        assert result["estimate"]["sources"] == [{"alias": "sales", "rows": 5, "rows_exact": True}]
+
+
+class TestEgress:
+    def test_classified_columns(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "personal", "income": "internal"}
+
+        result = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}, classification=classification))
+
+        assert result["egress"] == {
+            "preview_columns": ["income"],
+            "withheld": [{"column": "customer_id", "reason": "classification: personal"}],
+        }
+
+    def test_unclassified_column_is_withheld(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "personal", "income": "internal"}
+        request = {"features": ["customer_id", "income", "segment"]}
+
+        egress = _success(_explain(tmp_path, request, classification=classification))["egress"]
+
+        assert egress["preview_columns"] == ["income"]
+        assert egress["withheld"] == [
+            {"column": "customer_id", "reason": "classification: personal"},
+            {"column": "segment", "reason": "classification: unclassified"},
+        ]
+
+    def test_preview_allows_is_honoured(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "public", "income": "internal"}
+
+        result = _explain(
+            tmp_path, {"features": ["customer_id", "income"]}, classification=classification, preview_allows=("public",)
+        )
+
+        assert _success(result)["egress"] == {
+            "preview_columns": ["customer_id"],
+            "withheld": [{"column": "income", "reason": "classification: internal"}],
+        }
+
+    def test_derived_feature_inherits_input_classification(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "internal", "income": "personal"}
+
+        result = _explain(tmp_path, {"features": ["customer_id", DERIVED]}, classification=classification)
+
+        assert _success(result)["egress"] == {
+            "preview_columns": ["customer_id"],
+            "withheld": [{"column": DERIVED, "reason": "classification: personal"}],
+        }
+
+    def test_explicit_classification_of_derived_feature_wins(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "internal", "income": "personal", DERIVED: "internal"}
+
+        result = _explain(tmp_path, {"features": ["customer_id", DERIVED]}, classification=classification)
+
+        assert _success(result)["egress"] == {"preview_columns": ["customer_id", DERIVED], "withheld": []}
+
+    def test_default_classification_labels_unlisted_leaf_columns(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "personal"}
+        request = {"features": ["customer_id", "income", "segment"]}
+
+        egress = _success(
+            _explain(tmp_path, request, classification=classification, default_classification="internal")
+        )["egress"]
+
+        assert egress["preview_columns"] == ["income", "segment"]
+        assert egress["withheld"] == [{"column": "customer_id", "reason": "classification: personal"}]
+
+    def test_default_classification_does_not_override_an_explicit_label(self, tmp_path: Path) -> None:
+        classification = {"income": "internal"}
+
+        egress = _success(
+            _explain(
+                tmp_path,
+                {"features": ["income", "segment"]},
+                classification=classification,
+                default_classification="personal",
+            )
+        )["egress"]
+
+        assert egress["preview_columns"] == ["income"]
+        assert egress["withheld"] == [{"column": "segment", "reason": "classification: personal"}]
+
+    def test_derived_feature_takes_the_strictest_input_with_a_default_classification(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "internal"}
+
+        egress = _success(
+            _explain(
+                tmp_path,
+                {"features": ["customer_id", DERIVED]},
+                classification=classification,
+                default_classification="personal",
+            )
+        )["egress"]
+
+        assert egress["preview_columns"] == ["customer_id"]
+        assert egress["withheld"] == [{"column": DERIVED, "reason": "classification: personal"}]
+
+    def test_derived_feature_is_not_labelled_by_the_default(self, tmp_path: Path) -> None:
+        classification = {"income": "personal"}
+
+        egress = _success(
+            _explain(tmp_path, {"features": [DERIVED]}, classification=classification, default_classification="public")
+        )["egress"]
+
+        assert egress["preview_columns"] == []
+        assert egress["withheld"] == [{"column": DERIVED, "reason": "classification: personal"}]
+
+    def test_keep_index_index_column_is_listed_and_withheld_by_classification(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "personal", "income": "internal"}
+        request = {"features": [{"name": "income", "keep_index": True, "index": ["customer_id"]}]}
+
+        egress = _success(_explain(tmp_path, request, classification=classification))["egress"]
+
+        assert egress["preview_columns"] == ["income"]
+        assert egress["withheld"] == [{"column": "customer_id", "reason": "classification: personal"}]
+
+    def test_keep_index_index_column_is_previewed_when_allowed(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "internal", "income": "internal"}
+        request = {"features": [{"name": "income", "keep_index": True, "index": ["customer_id"]}]}
+
+        egress = _success(_explain(tmp_path, request, classification=classification))["egress"]
+
+        assert sorted(egress["preview_columns"]) == ["customer_id", "income"]
+        assert egress["withheld"] == []
+
+    def test_keep_index_lineage_traces_the_kept_column(self, tmp_path: Path) -> None:
+        request = {"features": [{"name": "income", "keep_index": True, "index": ["customer_id"]}]}
+
+        lineage = _success(_explain(tmp_path, request))["lineage"]
+
+        assert lineage["customer_id"] == ["sales.customer_id"]
+
+    def test_index_without_keep_index_is_not_in_egress(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "internal", "income": "internal"}
+        request = {"features": [{"name": "income", "keep_index": False, "index": ["customer_id"]}]}
+
+        egress = _success(_explain(tmp_path, request, classification=classification))["egress"]
+
+        assert egress == {"preview_columns": ["income"], "withheld": []}
+
+    def test_index_without_keep_index_is_still_deny_checked(self, tmp_path: Path) -> None:
+        request = {"features": [{"name": "income", "index": ["mcp4_salary"]}]}
+
+        error = _error(_explain(tmp_path, request), "policy_denied")
+
+        assert _has_detail(error, path="/features/0/index/0")
+
+    def test_key_column_also_requested_appears_once_in_egress(self, tmp_path: Path) -> None:
+        classification = {"customer_id": "internal", "income": "internal"}
+        request = {"features": ["customer_id", {"name": "income", "keep_index": True, "index": ["customer_id"]}]}
+
+        egress = _success(_explain(tmp_path, request, classification=classification))["egress"]
+
+        assert egress == {"preview_columns": ["customer_id", "income"], "withheld": []}
+
+
+class TestRowLimits:
+    def test_source_over_max_rows_is_limit_exceeded(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, {"features": ["customer_id", "income"]}, max_rows=3)
+
+        error = _error(result, "limit_exceeded")
+        assert "sales" in error["message"]
+        assert _has_detail(error, source="sales", rows=5, max_rows=3)
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+    def test_source_at_max_rows_is_allowed(self, tmp_path: Path) -> None:
+        _success(_explain(tmp_path, {"features": ["customer_id", "income"]}, max_rows=5))
+
+    def test_uncountable_source_with_max_rows_is_limit_exceeded(self, tmp_path: Path) -> None:
+        sources = {"events": _source("events", _write_events(tmp_path))}
+
+        result = _explain(tmp_path, {"features": ["event_id"]}, sources=sources, max_rows=1000)
+
+        error = _error(result, "limit_exceeded")
+        assert _has_detail(error, source="events", reason="uncountable")
+        _assert_no_paths(result, tmp_path, "events.json")
+
+    def test_uncountable_source_without_max_rows_is_estimated_as_unknown(self, tmp_path: Path) -> None:
+        sources = {"events": _source("events", _write_events(tmp_path))}
+
+        result = _success(_explain(tmp_path, {"features": ["event_id"]}, sources=sources))
+
+        assert result["estimate"]["sources"] == [{"alias": "events", "rows": None, "rows_exact": False}]
+        assert result["estimate"]["rows_read"] is None
+        assert result["steps"][0]["source"] == "events"
+        assert result["steps"][0]["feature_group"] == "JsonFG"
+        assert result["lineage"] == {"event_id": ["events.event_id"]}
+        _assert_no_paths(result, tmp_path, "events.json")
+
+    def test_json_reader_does_not_count_rows(self, tmp_path: Path) -> None:
+        path = str(_write_events(tmp_path))
+        assert JsonFG.count_rows(SourceMatch(source=path, access=path), PythonDictFramework) is None
+
+    def test_csv_reader_counts_rows_exactly_on_python_dict(self, tmp_path: Path) -> None:
+        path = str(_write_sales(tmp_path))
+        assert CsvFG.count_rows(SourceMatch(source=path, access=path), PythonDictFramework) == 5
+
+
+class PlannerApiSourceMcp4(DataCreatorFeatureGroup):
+    """A data creator root: its compute step has no source."""
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"mcp4_api_value"}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {"mcp4_api_value": [1, 2]}
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PythonDictFramework}
+
+
+def _prepare_csv(path: Path) -> Any:
+    return mloda.prepare(
+        [Feature("customer_id")],
+        compute_frameworks=[PythonDictFramework],
+        plugin_collector=PluginCollector.enabled_feature_groups({CsvFG}),
+        data_access_collection=DataAccessCollection(files={"sales_handle": str(path)}),
+    )
+
+
+def _csv_step(session: Any) -> Any:
+    return next(s for s in session.resolved_plan() if s.step_kind == "compute" and s.feature_group is CsvFG)
+
+
+class TestSessionSourceRoutes:
+    def test_session_routes_equal_the_group_calls_for_a_csv_step(self, tmp_path: Path) -> None:
+        path = str(_write_sales(tmp_path))
+        session = _prepare_csv(Path(path))
+        step = _csv_step(session)
+        match = SourceMatch(source=path, access=path)
+
+        assert session.count_rows(step) == 5
+        assert session.count_rows(step) == CsvFG.count_rows(match, step.compute_framework)
+        assert session.describe_columns(step) == CsvFG.describe_columns(match)
+
+    @pytest.mark.parametrize("route", ["describe_columns", "count_rows"])
+    def test_a_step_without_a_step_uuid_raises(self, tmp_path: Path, route: str) -> None:
+        session = _prepare_csv(_write_sales(tmp_path))
+        joinlike = dataclasses.replace(_csv_step(session), step_kind="join", step_uuid=None)
+
+        with pytest.raises(ValueError):
+            getattr(session, route)(joinlike)
+
+    @pytest.mark.parametrize("route", ["describe_columns", "count_rows"])
+    def test_a_step_from_another_session_raises(self, tmp_path: Path, route: str) -> None:
+        path = _write_sales(tmp_path)
+        step = _csv_step(_prepare_csv(path))
+        other = _prepare_csv(path)
+
+        with pytest.raises(ValueError):
+            getattr(other, route)(step)
+
+    @pytest.mark.parametrize("route", ["describe_columns", "count_rows"])
+    def test_a_step_with_an_unknown_uuid_raises(self, tmp_path: Path, route: str) -> None:
+        session = _prepare_csv(_write_sales(tmp_path))
+        stranger = dataclasses.replace(_csv_step(session), step_uuid=uuid4())
+
+        with pytest.raises(ValueError):
+            getattr(session, route)(stranger)
+
+    @pytest.mark.parametrize("route", ["describe_columns", "count_rows"])
+    def test_a_data_creator_step_raises_naming_the_group(self, route: str) -> None:
+        session = mloda.prepare(
+            [Feature("mcp4_api_value")],
+            compute_frameworks=[PythonDictFramework],
+            plugin_collector=PluginCollector.enabled_feature_groups({PlannerApiSourceMcp4}),
+        )
+        step = next(s for s in session.resolved_plan() if s.feature_group is PlannerApiSourceMcp4)
+
+        with pytest.raises(ValueError, match="PlannerApiSourceMcp4"):
+            getattr(session, route)(step)
+
+
+class TestRestrictSources:
+    def _sources(self, tmp_path: Path) -> dict[str, SourceConfig]:
+        return {
+            "sales": _source("sales", _write_sales(tmp_path)),
+            "other": _source("other", _write_orders(tmp_path)),
+        }
+
+    def test_feature_outside_restricted_sources_is_unresolved(self, tmp_path: Path) -> None:
+        request = {"features": ["income"], "restrict_sources": ["other"]}
+
+        result = _explain(tmp_path, request, sources=self._sources(tmp_path))
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/features/0", problem="unresolved")
+        _assert_no_paths(result, tmp_path, "sales.csv", "orders.csv")
+
+    def test_feature_inside_restricted_sources_resolves(self, tmp_path: Path) -> None:
+        request = {"features": ["order_id"], "restrict_sources": ["other"]}
+
+        result = _success(_explain(tmp_path, request, sources=self._sources(tmp_path)))
+
+        assert result["steps"][0]["source"] == "other"
+        assert result["lineage"] == {"order_id": ["other.order_id"]}
+        assert result["estimate"]["sources"] == [{"alias": "other", "rows": 2, "rows_exact": True}]
+
+
+class TestDeterminismAndShape:
+    def test_same_request_gives_same_plan(self, tmp_path: Path) -> None:
+        planner = _planner(_settings(tmp_path, classification={"income": "personal"}))
+        request = {"features": ["customer_id", DERIVED]}
+
+        first = _success(planner.explain(request))
+        second = _success(planner.explain(request))
+
+        for key in ("steps", "lineage", "estimate", "egress", "normalized_request", "expires_at"):
+            assert first[key] == second[key], key
+
+    @pytest.mark.parametrize(
+        "request_value",
+        [
+            {"features": ["customer_id", "income"]},
+            {"features": ["customer_id", DERIVED]},
+            {"features": ["incme"]},
+            {"features": ["mcp4_salary"]},
+            {"features": [{"name": "income", "options": {RESERVED_READER_OPTION_KEY: SECRET}}]},
+            {"features": ["customer_id"], "filters": [{"feature": "nope_mcp4", "op": "eq", "value": 1}]},
+            {"features": []},
+            None,
+        ],
+    )
+    def test_every_result_is_json_and_errors_are_well_formed(self, tmp_path: Path, request_value: Any) -> None:
+        result = _explain(tmp_path, request_value)
+
+        assert isinstance(result, dict)
+        json.dumps(result)
+        if is_error(result):
+            assert result["error"]["code"] in ERROR_CODES
+            assert result["error"]["audit_id"].startswith("aud_")
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+
+INLINE_REQUEST: dict[str, Any] = {"features": ["token"], "data": {"Tokens": {"token": ["007", "", None]}}}
+
+
+class TestInlineData:
+    def test_data_without_opt_in_is_policy_denied(self, tmp_path: Path) -> None:
+        error = _error(_explain(tmp_path, INLINE_REQUEST), "policy_denied")
+        assert _has_detail(error, path="/data")
+        assert '"007"' not in json.dumps(error)
+
+    def test_inline_request_is_planned(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, INLINE_REQUEST, inline_data=True))
+
+        assert result["lineage"] == {"token": ["Tokens.token"]}
+        assert result["estimate"]["sources"] == [{"alias": "Tokens", "rows": 3, "rows_exact": True}]
+        assert result["estimate"]["rows_read"] == 3
+        assert result["normalized_request"]["data"] == INLINE_REQUEST["data"]
+
+    def test_only_api_data_fg_steps_are_inline_sets(self, tmp_path: Path) -> None:
+        planned = _planner(_settings(tmp_path, inline_data=True)).plan(INLINE_REQUEST)
+        assert isinstance(planned, PlannedRequest)
+        step = next(s for s in planned.steps if s.feature_group is not None and issubclass(s.feature_group, ApiDataFG))
+        foreign = dataclasses.replace(step, feature_group=CsvFG)
+        assert (foreign.data_access_identity or "").startswith("api_data:")
+
+        assert _inline_alias(step, planned.parsed.inline_data) == "Tokens"
+        assert _inline_alias(foreign, planned.parsed.inline_data) is None
+
+    def test_max_rows_applies_to_inline_rows(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, INLINE_REQUEST, inline_data=True, max_rows=2)
+
+        error = _error(result, "limit_exceeded")
+        assert _has_detail(error, source="Tokens", reason="over_limit", rows=3, max_rows=2)
+        assert '"007"' not in json.dumps(result)
+
+    def test_set_named_like_a_configured_source_is_validation_failed(self, tmp_path: Path) -> None:
+        request = {"features": ["token"], "data": {"sales": {"token": ["a"]}}}
+
+        result = _explain(tmp_path, request, inline_data=True)
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/data/sales")
+
+    def test_inline_column_shadowing_a_source_column_is_refused(self, tmp_path: Path) -> None:
+        # An inline column cannot shadow a source column.
+        request = {"features": ["income"], "data": {"Inline": {"income": ["a", "b"]}}}
+
+        result = _explain(tmp_path, request, inline_data=True)
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, problem="unresolved")
+        assert '"a"' not in json.dumps(result)
+
+    def test_api_data_fg_option_stays_policy_denied(self, tmp_path: Path) -> None:
+        # Already denied before inline planning exists; this pins the guard.
+        key = "ApiDataFG"
+        request = {"features": [{"name": "token", "options": {key: {"Tokens": {"token": ["007"]}}}}]}
+
+        result = _explain(tmp_path, request, inline_data=True)
+
+        error = _error(result, "policy_denied")
+        assert [detail["path"] for detail in error["details"]] == [f"/features/0/options/{key}"]
+        assert '"007"' not in json.dumps(result)
+
+    def test_oversized_plan_id_is_limit_exceeded_without_values(self, tmp_path: Path) -> None:
+        # Inline JSON under the limit, but the signed base64 plan id is over it.
+        marker = "BIGVALUE_mcp_inline"
+        value = marker * (int(MAX_PLAN_ID_LENGTH * 0.85) // len(marker))
+        data = {"Tokens": {"token": [value]}}
+        assert len(json.dumps(data)) <= MAX_PLAN_ID_LENGTH
+        request = {"features": ["token"], "data": data}
+
+        result = _explain(tmp_path, request, inline_data=True)
+
+        error = _error(result, "limit_exceeded")
+        assert "plan_id" not in result
+        assert marker not in json.dumps(result)
+        assert error["message"] == "The request is too large for a plan id."
+
+    def test_oversized_inline_json_is_refused_before_planning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+
+        def recorder(*args: Any, **kwargs: Any) -> Any:
+            calls.append("diagnose")
+            raise AssertionError("planning must not run")
+
+        monkeypatch.setattr(mloda, "diagnose", recorder)
+        marker = "BIGVALUE_mcp_inline"
+        values = [f"{marker}{index:06d}" for index in range(MAX_PLAN_ID_LENGTH // 8)]
+        data = {"Tokens": {"token": values}}
+        assert len(json.dumps(data)) > MAX_PLAN_ID_LENGTH
+        request = {"features": ["token"], "data": data}
+
+        result = _explain(tmp_path, request, inline_data=True)
+
+        _error(result, "limit_exceeded")
+        assert calls == []
+        assert marker not in json.dumps(result)
+
+    def test_set_name_with_slash_is_reported_at_escaped_pointer(self, tmp_path: Path) -> None:
+        sources = {"a/b": _source("a/b", _write_sales(tmp_path))}
+        request = {"features": ["token"], "data": {"a/b": {"token": ["x"]}}}
+
+        result = _explain(tmp_path, request, sources=sources, inline_data=True)
+
+        error = _error(result, "validation_failed")
+        assert _has_detail(error, path="/data/a~1b")
+
+    def test_denying_api_data_fg_switches_inline_off(self, tmp_path: Path) -> None:
+        planner = _planner(
+            Settings(
+                deny_feature_groups=(DENIED, "ApiDataFG"),
+                sources={"sales": _source("sales", _write_sales(tmp_path))},
+                inline_data=True,
+            )
+        )
+
+        request = {"features": ["token"], "data": {"Tokens": {"token": ["SECRETVAL"]}}}
+
+        result = planner.explain(request)
+
+        error = _error(result, "validation_failed")
+        assert "plan_id" not in result
+        assert "SECRETVAL" not in json.dumps(error)
+
+
+class TestLock:
+    def test_lock_is_reentrant(self) -> None:
+        assert isinstance(MLODA_LOCK, type(threading.RLock()))
+
+    def test_planning_holds_the_lock_and_releases_it(self, tmp_path: Path, lock_probes: list[bool]) -> None:
+        _success(_explain(tmp_path, {"features": [DERIVED]}))
+
+        assert lock_probes
+        assert not any(lock_probes)
+        assert _lock_free_elsewhere()
+
+
+class TestKeepIndex:
+    def test_keep_index_without_index_is_validation_failed(self, tmp_path: Path) -> None:
+        request = {"features": ["customer_id", {"name": "income", "keep_index": True}]}
+
+        error = _error(_explain(tmp_path, request), "validation_failed")
+
+        assert _has_detail(error, path="/features/1")
+
+    def test_denied_column_in_index_is_policy_denied_at_its_pointer(
+        self, tmp_path: Path, denied_calls: list[str]
+    ) -> None:
+        request = {"features": [{"name": "income", "keep_index": True, "index": ["customer_id", "mcp4_salary"]}]}
+
+        result = _explain(tmp_path, request)
+
+        error = _error(result, "policy_denied")
+        assert _has_detail(error, path="/features/0/index/1")
+        assert denied_calls == []
+
+    def test_index_column_no_group_provides_is_an_internal_error_without_tables(self, tmp_path: Path) -> None:
+        request = {"features": [{"name": "income", "keep_index": True, "index": ["no_such_col_mcp4"]}]}
+
+        result = _explain(tmp_path, request)
+
+        _error(result, "internal")
+        assert "tables" not in result
+        json.dumps(result)
+        _assert_no_paths(result, tmp_path, "sales.csv")
+
+
+class TestDefaultOptions:
+    DEFAULTS: ClassVar[dict[str, Any]] = {
+        "options": {"dkey": DEFAULT_VALUE},
+        "context_options": {"dctx": DEFAULT_VALUE},
+    }
+
+    def test_defaults_reach_the_feature_group_and_stay_out_of_the_result(self, tmp_path: Path) -> None:
+        SEEN_OPTIONS.clear()
+
+        result = _success(_explain(tmp_path, {"features": [OPTS]}, **self.DEFAULTS))
+
+        assert SEEN_OPTIONS
+        assert all(group == {"dkey": DEFAULT_VALUE} for group, _ in SEEN_OPTIONS)
+        assert all(context == {"dctx": DEFAULT_VALUE} for _, context in SEEN_OPTIONS)
+        assert DEFAULT_VALUE not in json.dumps(result)
+        assert result["normalized_request"] == {"features": [OPTS]}
+
+    def test_flat_options_config_combines_with_context_defaults(self, tmp_path: Path) -> None:
+        SEEN_OPTIONS.clear()
+        feature = {"name": OPTS, "options": {"dkey": "own", "extra": 1}}
+
+        result = _success(_explain(tmp_path, {"features": [feature]}, allow_options=("dkey", "extra"), **self.DEFAULTS))
+
+        assert all(group == {"dkey": "own", "extra": 1} for group, _ in SEEN_OPTIONS)
+        assert all(context == {"dctx": DEFAULT_VALUE} for _, context in SEEN_OPTIONS)
+        assert result["normalized_request"] == {"features": [feature]}
+
+    def test_request_without_options_still_plans_when_defaults_are_unlisted(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", "income"]}, **self.DEFAULTS))
+        assert DEFAULT_VALUE not in json.dumps(result)
+
+    def test_caller_may_not_set_a_defaulted_key_that_is_not_listed(self, tmp_path: Path) -> None:
+        feature = {"name": "income", "options": {"dkey": "mine"}}
+
+        error = _error(_explain(tmp_path, {"features": [feature]}, **self.DEFAULTS), "policy_denied")
+
+        assert _has_detail(error, path="/features/0/options/dkey", problem="option_not_allowed")
+
+    def test_caller_may_set_a_defaulted_key_that_is_listed(self, tmp_path: Path) -> None:
+        feature = {"name": "income", "options": {"dkey": "mine"}}
+
+        result = _explain(tmp_path, {"features": [feature]}, allow_options=("dkey",), **self.DEFAULTS)
+
+        _success(result)
+
+    def test_source_column_and_chained_feature_together_with_group_defaults(self, tmp_path: Path) -> None:
+        result = _success(_explain(tmp_path, {"features": ["customer_id", DERIVED]}, options={"dkey": DEFAULT_VALUE}))
+
+        assert [step["feature_group"] for step in result["steps"]] == ["CsvFG", "PlannerDoubleMcp4"]
+        assert DEFAULT_VALUE not in json.dumps(result)
+
+
+class TestInlineLimits:
+    DATA: ClassVar[dict[str, Any]] = {
+        "A": {"x": ["ab", "cd", None, 12345]},
+        "B": {"y": [1.5, "e"]},
+    }  # 6 values, 5 chars
+
+    def _request(self) -> dict[str, Any]:
+        return {"features": ["x"], "data": self.DATA}
+
+    def test_values_over_limit(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, self._request(), inline_data=True, max_inline_values=5)
+
+        error = _error(result, "limit_exceeded")
+        assert _has_detail(error, reason="inline_values_over_limit", count=6, limit=5)
+        assert "ab" not in json.dumps({**result["error"], "audit_id": None})
+
+    def test_chars_over_limit(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, self._request(), inline_data=True, max_inline_chars=4)
+
+        error = _error(result, "limit_exceeded")
+        assert _has_detail(error, reason="inline_chars_over_limit", count=5, limit=4)
+        assert "ab" not in json.dumps({**result["error"], "audit_id": None})
+
+    def test_both_over_limit_report_both(self, tmp_path: Path) -> None:
+        result = _explain(tmp_path, self._request(), inline_data=True, max_inline_values=2, max_inline_chars=1)
+
+        error = _error(result, "limit_exceeded")
+        assert _has_detail(error, reason="inline_values_over_limit", count=6, limit=2)
+        assert _has_detail(error, reason="inline_chars_over_limit", count=5, limit=1)
+
+    def test_exactly_at_limit_passes(self, tmp_path: Path) -> None:
+        request = {"features": ["x"], "data": {"A": {"x": ["ab", "cd", None, 12345]}}}
+        _success(_explain(tmp_path, request, inline_data=True, max_inline_values=4, max_inline_chars=4))
+
+    def test_limit_is_checked_before_planning(self, tmp_path: Path) -> None:
+        request = {"features": ["no_such_column"], "data": self.DATA}
+
+        result = _explain(tmp_path, request, inline_data=True, max_inline_values=1)
+
+        _error(result, "limit_exceeded")
+
+    def test_disabled_inline_data_stays_policy_denied(self, tmp_path: Path) -> None:
+        _error(_explain(tmp_path, self._request(), max_inline_values=1), "policy_denied")
+
+
+TOKEN = "tok-Zk9-secret-77"  # nosec B105
+ROTATED = "tok-Qw3-rotated-55"  # nosec B105
+
+
+def _write_sqlite(tmp_path: Path) -> Path:
+    path = tmp_path / "wh.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute("create table facts (sq_id integer, sq_amount integer)")
+    connection.executemany("insert into facts values (?, ?)", [(1, 3), (2, 4), (3, 5)])
+    connection.commit()
+    connection.close()
+    return path
+
+
+def _cred_settings(tmp_path: Path, credentials: str = 'token = "TOK_VAR"', **overrides: Any) -> Settings:
+    sales = _write_sales(tmp_path)
+    head = (
+        '[mcp]\nmode = "execute"\n\n'
+        '[mcp.classification]\nsq_amount = "public"\nsq_id = "public"\n\n'
+        f'[mcp.sources.sales]\nfiles = ["{sales.as_posix()}"]\n'
+    )
+    path = tmp_path / "cred.toml"
+    path.write_text(credential_config(head, 'sq_id = "public"', credentials=credentials), encoding="utf-8")
+    return load_settings(path, env={}, overrides=overrides or None)
+
+
+def _cred_services(
+    settings: Settings,
+    env: Mapping[str, str],
+    base: DataAccessCollection | None = None,
+    extra_groups: frozenset[type[FeatureGroup]] = frozenset(),
+) -> tuple[Planner, Runner]:
+    plugins = PluginCollector.enabled_feature_groups({*FILE_SOURCE_GROUPS, SqliteFG, CredentialReadMcp8, *extra_groups})
+    catalog = Catalog.build(settings, plugins, env=env, data_access_collection=base)
+    planner = Planner(
+        settings,
+        catalog,
+        signing_key=KEY,
+        principal="alice",
+        plugin_collector=plugins,
+        clock=lambda: CLOCK_START,
+        env=env,
+        data_access_collection=base,
+    )
+    return planner, Runner(planner, clock=lambda: CLOCK_START)
+
+
+def _file_cred_services(tmp_path: Path, **overrides: Any) -> tuple[Planner, Runner, Path]:
+    secret_file = tmp_path / "pii"
+    secret_file.write_text(TOKEN + "\n")
+    settings = _cred_settings(
+        tmp_path, 'token = { file = "pii" }', options={CRED_KEY: "db"}, default_classification="public", **overrides
+    )
+    planner, runner = _cred_services(settings, {})
+    return planner, runner, secret_file
+
+
+def _is_db_record(record: logging.LogRecord, quoted: str) -> bool:
+    return record.name == "mloda.interfaces.service.sources" and quoted in record.getMessage()
+
+
+def _run(planner: Planner, runner: Runner, request: Any) -> dict[str, Any]:
+    explained = _success(planner.explain(request))
+    result: dict[str, Any] = runner.run(explained["plan_id"])
+    return result
+
+
+def _preview_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    assert not is_error(result), result
+    (table,) = result["tables"]
+    rows: list[dict[str, Any]] = table["preview"]["rows"]
+    return rows
+
+
+def _assert_value_absent(value: str, *texts: str) -> None:
+    for text in texts:
+        assert value not in text
+
+
+def _plan_text(plan_id: str) -> str:
+    segment = plan_id.split(".")[1]
+    return plan_id + base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)).decode()
+
+
+class TestCredentialTable:
+    @pytest.mark.parametrize(
+        ("credentials", "env", "message_has"),
+        [
+            ('token = "TOK_VAR"\nother = "OTHER_VAR"', {"TOK_VAR": TOKEN}, ["db", "other"]),
+            ('token = "TOK_VAR"\nother = "OTHER_VAR"', {"TOK_VAR": TOKEN, "OTHER_VAR": ""}, ["db", "other"]),
+            ('token = "TOK_VAR"\nother = { file = "nope.txt" }', {"TOK_VAR": TOKEN}, ["db", "other", "nope.txt"]),
+            ('token = "TOK_VAR"\nother = { file = "empty.txt" }', {"TOK_VAR": TOKEN}, ["db", "other"]),
+            ('token = "TOK_VAR"\nother = "OTHER_VAR"', {"TOK_VAR": TOKEN, "OTHER_VAR": " \t "}, ["db", "other"]),
+        ],
+        ids=["unset_var", "empty_var", "missing_file", "empty_file", "blank_var"],
+    )
+    def test_check_names_handle_and_field_never_a_value(
+        self, tmp_path: Path, credentials: str, env: dict[str, str], message_has: list[str]
+    ) -> None:
+        (tmp_path / "empty.txt").write_text("")
+        settings = _cred_settings(tmp_path, credentials)
+
+        problem = service_sources.check_credentials(settings, env)
+
+        assert problem is not None
+        for part in message_has:
+            assert part in problem
+        assert TOKEN not in problem
+        assert "OTHER_VAR" not in problem
+
+    def test_a_pasted_underscore_token_is_never_echoed_by_check_or_log(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        settings = _cred_settings(tmp_path, f'token = "{PASTED_UNDERSCORE}"')
+
+        with caplog.at_level(logging.DEBUG):
+            problem = service_sources.check_credentials(settings, {})
+            service_sources.ServiceCredentials(settings.credentials, {}).collection(settings.sources)
+
+        assert problem is not None
+        assert "[mcp.credentials.db] field 'token'" in problem
+        _assert_value_absent(PASTED_UNDERSCORE, problem, caplog.text)
+
+    def test_crlf_file_is_stripped_to_the_value(self, tmp_path: Path) -> None:
+        (tmp_path / "pii").write_bytes(ROTATED.encode() + b"\r\n")
+        settings = _cred_settings(tmp_path, 'token = "TOK_VAR"\nother = { file = "pii" }')
+
+        values = service_sources.credential_values(settings.credentials, {"TOK_VAR": TOKEN})
+
+        assert values == {"db": Credential(token=TOKEN, other=ROTATED)}
+
+    def test_whitespace_only_file_is_refused(self, tmp_path: Path) -> None:
+        (tmp_path / "blank.txt").write_text("  \t \n")
+        settings = _cred_settings(tmp_path, 'token = "TOK_VAR"\nother = { file = "blank.txt" }')
+
+        problem = service_sources.check_credentials(settings, {"TOK_VAR": TOKEN})
+
+        assert problem is not None
+        assert "db" in problem
+        assert "other" in problem
+
+    def test_non_utf8_file_names_handle_and_field_not_the_bytes(self, tmp_path: Path) -> None:
+        (tmp_path / "bin.txt").write_bytes(b"\xff\xfesecretbytes\xc3")
+        settings = _cred_settings(tmp_path, 'token = "TOK_VAR"\nother = { file = "bin.txt" }')
+
+        problem = service_sources.check_credentials(settings, {"TOK_VAR": TOKEN})
+
+        assert problem is not None
+        assert "db" in problem
+        assert "other" in problem
+        assert "bin.txt" in problem
+        assert "secretbytes" not in problem
+        assert "xff" not in problem
+
+    def test_check_passes_when_every_credential_resolves(self, tmp_path: Path) -> None:
+        (tmp_path / "pii").write_text(ROTATED + "\n")
+        settings = _cred_settings(tmp_path, 'token = "TOK_VAR"\nother = { file = "pii" }')
+
+        assert service_sources.check_credentials(settings, {"TOK_VAR": TOKEN}) is None
+
+    def test_values_read_env_and_file_and_strip_one_newline(self, tmp_path: Path) -> None:
+        (tmp_path / "pii").write_text(ROTATED + "\n\n")
+        settings = _cred_settings(tmp_path, 'token = "TOK_VAR"\nother = { file = "pii" }')
+
+        values = service_sources.credential_values(settings.credentials, {"TOK_VAR": TOKEN})
+
+        assert values == {"db": Credential(token=TOKEN, other=ROTATED + "\n")}
+
+    def test_check_refuses_a_handle_already_in_the_base_collection(self, tmp_path: Path) -> None:
+        settings = _cred_settings(tmp_path)
+        base = DataAccessCollection()
+        base.add_credentials("db", Credential(token="other-value-123"))
+
+        problem = service_sources.check_credentials(settings, {"TOK_VAR": TOKEN}, base)
+
+        assert problem is not None
+        assert "db" in problem
+
+    def test_collection_merges_into_a_copy_of_the_base(self, tmp_path: Path) -> None:
+        settings = _cred_settings(tmp_path)
+        base = DataAccessCollection()
+        base.add_credentials("code", Credential(token="code-value-123"))
+
+        merged = service_sources.data_access_collection(
+            settings.sources, service_sources.credential_values(settings.credentials, {"TOK_VAR": TOKEN}), base
+        )
+
+        assert merged.credentials["db"] == {"token": TOKEN}
+        assert merged.credentials["code"] == {"token": "code-value-123"}
+        assert merged.files
+        assert set(base.credentials) == {"code"}
+        assert not base.files
+
+    def test_collection_without_credentials_is_unchanged(self, tmp_path: Path) -> None:
+        configured = _settings(tmp_path).sources
+
+        assert service_sources.data_access_collection(configured).credentials == {}
+        assert service_sources.data_access_collection(configured, None, None).credentials == {}
+
+
+class TestCredentialRuns:
+    def test_a_default_handle_is_read_and_the_handle_and_token_stay_out_of_the_results(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _cred_settings(tmp_path)
+        config = tmp_path / "cred.toml"
+        original = config.read_text(encoding="utf-8")
+        assert "[mcp.credentials.db]" in original
+        config.write_text(
+            original.replace("[mcp.credentials.db]", f"[mcp.credentials.{CRED_DEFAULT_HANDLE}]"), encoding="utf-8"
+        )
+        settings = load_settings(config, env={}, overrides={"default_classification": "public"})
+        planner, runner = _cred_services(settings, {"TOK_VAR": TOKEN}, extra_groups=frozenset({CredentialDefaultMcp8}))
+
+        with caplog.at_level(logging.DEBUG):
+            explained = _success(planner.explain({"features": [CRED_DEFAULT_FEATURE]}))
+            result = runner.run(explained["plan_id"])
+
+        assert _preview_rows(result) == [{CRED_DEFAULT_FEATURE: cred_digest(TOKEN)}] * 5
+        for secret in (CRED_DEFAULT_HANDLE, TOKEN):
+            _assert_value_absent(
+                secret, json.dumps(explained), _plan_text(explained["plan_id"]), json.dumps(result), caplog.text
+            )
+
+    def test_sqlite_source_runs_through_a_table_credential(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        db = _write_sqlite(tmp_path)
+        settings = _cred_settings(tmp_path, 'sqlite = "WH_PATH"')
+        planner, runner = _cred_services(settings, {"WH_PATH": str(db)})
+
+        with caplog.at_level(logging.DEBUG):
+            explained = _success(planner.explain({"features": ["sq_amount"]}))
+            result = runner.run(explained["plan_id"])
+
+        assert [row["sq_amount"] for row in _preview_rows(result)] == [3, 4, 5]
+        assert explained["steps"][0]["feature_group"] == "SqliteFG"
+        _assert_value_absent(
+            str(db), json.dumps(explained), _plan_text(explained["plan_id"]), json.dumps(result), caplog.text
+        )
+
+    def test_read_credential_group_gets_the_registered_value(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        settings = _cred_settings(tmp_path, options={CRED_KEY: "db"})
+        planner, runner = _cred_services(settings, {"TOK_VAR": TOKEN})
+
+        with caplog.at_level(logging.DEBUG):
+            explained = _success(planner.explain({"features": [CRED_FEATURE]}))
+            result = runner.run(explained["plan_id"])
+
+        assert _preview_rows(result) == [{CRED_FEATURE: cred_digest(TOKEN)}] * 5
+        _assert_value_absent(
+            TOKEN, json.dumps(explained), _plan_text(explained["plan_id"]), json.dumps(result), caplog.text
+        )
+
+    def test_operator_data_access_handle_picks_one_of_two_credentials(self, tmp_path: Path) -> None:
+        first = _write_sqlite(tmp_path)
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        second = _write_sqlite(other_dir)
+        connection = sqlite3.connect(second)
+        connection.execute("update facts set sq_amount = sq_amount * 10")
+        connection.commit()
+        connection.close()
+        credentials = 'sqlite = "WH_ONE"\n\n[mcp.credentials.other]\nsqlite = "WH_TWO"'
+        settings = _cred_settings(tmp_path, credentials, options={"data_access_handle": "other"})
+        planner, runner = _cred_services(settings, {"WH_ONE": str(first), "WH_TWO": str(second)})
+
+        result = _run(planner, runner, {"features": ["sq_amount"]})
+
+        assert [row["sq_amount"] for row in _preview_rows(result)] == [30, 40, 50]
+
+    @pytest.mark.parametrize("key", ["data_access_handle", "connection_handle"])
+    def test_connection_choosing_option_is_refused_even_when_listed(self, tmp_path: Path, key: str) -> None:
+        settings = _cred_settings(tmp_path, allow_options=[key])
+        planner, _ = _cred_services(settings, {"TOK_VAR": TOKEN})
+        feature = {"name": CRED_FEATURE, "options": {key: "db"}}
+
+        error = _error(planner.explain({"features": [feature]}), "policy_denied")
+
+        assert _has_detail(error, path=f"/features/0/options/{key}", problem="data_access_option")
+
+    def test_handle_option_in_a_request_is_refused_even_when_listed(self, tmp_path: Path) -> None:
+        settings = _cred_settings(tmp_path, allow_options=[CRED_KEY])
+        planner, _ = _cred_services(settings, {"TOK_VAR": TOKEN})
+        feature = {"name": CRED_FEATURE, "options": {CRED_KEY: "db"}}
+
+        error = _error(planner.explain({"features": [feature]}), "policy_denied")
+
+        assert _has_detail(error, path=f"/features/0/options/{CRED_KEY}", problem="option_not_caller_settable")
+
+    def test_rotated_secret_file_is_used_by_the_next_run(self, tmp_path: Path) -> None:
+        planner, runner, secret_file = _file_cred_services(tmp_path)
+        request = {"features": [CRED_FEATURE]}
+
+        first = _run(planner, runner, request)
+        secret_file.write_text(ROTATED + "\n")
+        second = _run(planner, runner, request)
+
+        assert _preview_rows(first)[0] == {CRED_FEATURE: cred_digest(TOKEN)}
+        assert _preview_rows(second)[0] == {CRED_FEATURE: cred_digest(ROTATED)}
+
+    def test_env_is_read_live_not_copied(self, tmp_path: Path) -> None:
+        env = {"TOK_VAR": TOKEN}
+        settings = _cred_settings(tmp_path, options={CRED_KEY: "db"})
+        planner, runner = _cred_services(settings, env)
+        request = {"features": [CRED_FEATURE]}
+
+        env["TOK_VAR"] = ROTATED
+
+        assert _preview_rows(_run(planner, runner, request))[0] == {CRED_FEATURE: cred_digest(ROTATED)}
+
+    @pytest.mark.parametrize("entry", ["explain", "run"])
+    def test_credential_gone_after_startup_is_an_internal_error_naming_no_handle(
+        self, tmp_path: Path, entry: str
+    ) -> None:
+        planner, runner, secret_file = _file_cred_services(tmp_path)
+        request = {"features": [CRED_FEATURE]}
+        if entry == "explain":
+            secret_file.unlink()
+            result = planner.explain(request)
+        else:
+            explained = _success(planner.explain(request))
+            secret_file.unlink()
+            result = runner.run(explained["plan_id"])
+
+        error = _error(result, "internal")
+        dumped = json.dumps(result)
+        assert "ConfigError" in error["message"]
+        assert "db" not in error["message"]
+        _assert_value_absent("pii", dumped)
+        _assert_value_absent(TOKEN, dumped)
+
+    def test_base_collection_credential_is_usable_next_to_the_table(self, tmp_path: Path) -> None:
+        settings = _cred_settings(tmp_path, options={CRED_KEY: "code"})
+        collection = DataAccessCollection()
+        collection.add_credentials("code", Credential(token=ROTATED))
+        planner, runner = _cred_services(settings, {"TOK_VAR": TOKEN}, collection)
+
+        result = _run(planner, runner, {"features": [CRED_FEATURE]})
+
+        assert _preview_rows(result)[0] == {CRED_FEATURE: cred_digest(ROTATED)}
+
+    def test_missing_secret_file_spares_requests_that_read_no_credential(self, tmp_path: Path) -> None:
+        planner, runner, secret_file = _file_cred_services(tmp_path)
+        secret_file.unlink()
+
+        rows = _preview_rows(_run(planner, runner, {"features": ["income"]}))
+
+        assert [row["income"] for row in rows] == [10, 20, 30, 40, 50]
+
+    def test_restoring_the_secret_file_makes_the_credential_request_succeed_again(self, tmp_path: Path) -> None:
+        planner, runner, secret_file = _file_cred_services(tmp_path)
+        request = {"features": [CRED_FEATURE]}
+        secret_file.unlink()
+        _error(planner.explain(request), "internal")
+
+        secret_file.write_text(ROTATED + "\n")
+
+        assert _preview_rows(_run(planner, runner, request))[0] == {CRED_FEATURE: cred_digest(ROTATED)}
+
+    def test_unreadable_credential_never_lets_the_other_one_bind(self, tmp_path: Path) -> None:
+        first = _write_sqlite(tmp_path)
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        second = _write_sqlite(other_dir)
+        (tmp_path / "one.txt").write_text(str(first))
+        (tmp_path / "two.txt").write_text(str(second))
+        credentials = 'sqlite = { file = "one.txt" }\n\n[mcp.credentials.other]\nsqlite = { file = "two.txt" }'
+        planner, _ = _cred_services(_cred_settings(tmp_path, credentials), {})
+        (tmp_path / "two.txt").unlink()
+
+        result = planner.explain({"features": ["sq_amount"]})
+
+        error = _error(result, "internal")
+        assert "ConfigError" in error["message"]
+        dumped = json.dumps({**result, "error": {**error, "audit_id": None}})
+        for name in ("db", "other", "two.txt", "one.txt"):
+            _assert_value_absent(name, dumped)
+        _assert_value_absent(str(tmp_path), dumped)
+
+    def _partly_unreadable(self, tmp_path: Path, handle: str) -> tuple[Planner, Runner]:
+        credentials = 'token = "TOK_VAR"\n\n[mcp.credentials.other]\ntoken = { file = "gone.txt" }'
+        settings = _cred_settings(tmp_path, credentials, options={CRED_KEY: handle})
+        return _cred_services(settings, {"TOK_VAR": TOKEN})
+
+    def test_request_naming_a_readable_handle_works_while_another_is_unreadable(self, tmp_path: Path) -> None:
+        planner, runner = self._partly_unreadable(tmp_path, "db")
+
+        result = _run(planner, runner, {"features": [CRED_FEATURE]})
+
+        assert _preview_rows(result) == [{CRED_FEATURE: cred_digest(TOKEN)}] * 5
+
+    def test_request_naming_the_unreadable_handle_is_refused_without_naming_it(self, tmp_path: Path) -> None:
+        planner, _ = self._partly_unreadable(tmp_path, "other")
+
+        error = _error(planner.explain({"features": [CRED_FEATURE]}), "internal")
+
+        assert "ConfigError" in error["message"]
+        text = json.dumps({"message": error["message"], "details": error.get("details")})
+        for name in ("db", "other", "gone.txt"):
+            _assert_value_absent(name, text)
+
+    @pytest.mark.parametrize(
+        ("credentials", "overrides", "features"),
+        [
+            (
+                'token = "TOK_VAR"\n\n[mcp.credentials.wh]\nsqlite = "WH_PATH"',
+                {"data_access_handle": "wh"},
+                ["sq_amount"],
+            ),
+            ('sqlite = "WH_PATH"\ntoken = "TOK_VAR"', {CRED_KEY: "db"}, [CRED_FEATURE, "sq_amount"]),
+        ],
+        ids=["operator_handle", "single_credential"],
+    )
+    def test_unreadable_credential_refuses_a_request_that_binds_a_source_credential(
+        self, tmp_path: Path, credentials: str, overrides: dict[str, str], features: list[str]
+    ) -> None:
+        db = _write_sqlite(tmp_path)
+        gone = '\n\n[mcp.credentials.other]\ntoken = { file = "gone.txt" }'
+        env = {"TOK_VAR": TOKEN, "WH_PATH": str(db)}
+        request = {"features": features}
+        readable = _cred_settings(tmp_path, credentials, options=overrides)
+        _success(_cred_services(readable, env)[0].explain(request))
+        settings = _cred_settings(tmp_path, credentials + gone, options=overrides)
+        planner, _ = _cred_services(settings, env)
+
+        error = _error(planner.explain(request), "internal")
+
+        assert "ConfigError" in error["message"]
+
+    def test_base_credential_shadowing_an_unreadable_configured_handle_is_refused(self, tmp_path: Path) -> None:
+        base = DataAccessCollection()
+        secret_file = tmp_path / "pii"
+        secret_file.write_text(TOKEN + "\n")
+        settings = _cred_settings(tmp_path, 'token = { file = "pii" }', options={CRED_KEY: "db"})
+        planner, _ = _cred_services(settings, {}, base)
+        base.add_credentials("db", Credential(token=ROTATED))
+        secret_file.unlink()
+
+        error = _error(planner.explain({"features": [CRED_FEATURE]}), "internal")
+
+        assert "ConfigError" in error["message"]
+        _assert_value_absent(ROTATED, json.dumps({"message": error["message"], "details": error.get("details")}))
+
+    def test_unreadable_handle_logs_one_warning_and_one_info_when_back(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        planner, _, secret_file = _file_cred_services(tmp_path)
+        _success(planner.explain({"features": ["income"]}))
+        secret_file.unlink()
+
+        with caplog.at_level(logging.INFO):
+            for _ in range(3):
+                planner.explain({"features": ["income"]})
+            warnings = [
+                r for r in caplog.records if r.levelno == logging.WARNING and _is_db_record(r, "[mcp.credentials.db]")
+            ]
+            secret_file.write_text(TOKEN + "\n")
+            _success(planner.explain({"features": ["income"]}))
+            infos = [r for r in caplog.records if r.levelno == logging.INFO and _is_db_record(r, "'db'")]
+
+        assert len(warnings) == 1
+        assert len(infos) == 1
+        _assert_value_absent(TOKEN, caplog.text)
+
+    def test_secret_file_vanishing_after_the_existence_check_is_treated_as_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        planner, runner, _ = _file_cred_services(tmp_path)
+
+        def vanished(*args: Any, **kwargs: Any) -> Any:
+            raise FileNotFoundError("gone")
+
+        monkeypatch.setattr(service_sources, "open", vanished, raising=False)
+
+        rows = _preview_rows(_run(planner, runner, {"features": ["income"]}))
+        problem = service_sources.check_credentials(planner.settings, {})
+
+        assert [row["income"] for row in rows] == [10, 20, 30, 40, 50]
+        assert problem is not None
+        assert "db" in problem
+        assert "token" in problem
+        with pytest.raises(ConfigError, match="token"):
+            service_sources.credential_values(planner.settings.credentials, {})
+
+    @pytest.mark.parametrize("kind", ["file", "folder"])
+    def test_source_added_to_the_base_after_construction_is_seen_by_explain(self, tmp_path: Path, kind: str) -> None:
+        base = DataAccessCollection()
+        settings = _cred_settings(tmp_path, default_classification="public")
+        planner, _ = _cred_services(settings, {"TOK_VAR": TOKEN}, base)
+        extra = tmp_path / "extra"
+        extra.mkdir()
+        orders = _write_orders(extra)
+
+        if kind == "file":
+            base.add_file(str(orders))
+        else:
+            base.add_folder(str(extra))
+
+        assert _success(planner.explain({"features": ["amount"]}))["steps"]
+
+    @pytest.mark.parametrize("kind", ["file", "folder"])
+    def test_source_added_to_the_base_after_construction_is_seen_by_describe(self, tmp_path: Path, kind: str) -> None:
+        base = DataAccessCollection()
+        settings = _cred_settings(tmp_path, default_classification="public")
+        plugins = PluginCollector.enabled_feature_groups(set(FILE_SOURCE_GROUPS))
+        catalog = Catalog.build(settings, plugins, env={"TOK_VAR": TOKEN}, data_access_collection=base)
+        extra = tmp_path / "extra"
+        extra.mkdir()
+        orders = _write_orders(extra)
+
+        if kind == "file":
+            base.add_file(str(orders))
+        else:
+            base.add_folder(str(extra))
+
+        assert catalog.describe("amount")["feature_group"] == "CsvFG"
+
+    @pytest.mark.parametrize("target", ["planner", "catalog"])
+    def test_configured_handle_equal_to_a_base_handle_is_refused_when_built_directly(
+        self, tmp_path: Path, target: str
+    ) -> None:
+        settings = _cred_settings(tmp_path)
+        plugins = PluginCollector.enabled_feature_groups({*FILE_SOURCE_GROUPS, CredentialReadMcp8})
+        base = DataAccessCollection()
+        base.add_credentials("db", Credential(token="other-value-123"))
+        env = {"TOK_VAR": TOKEN}
+
+        with pytest.raises(ConfigError, match="db"):
+            if target == "catalog":
+                Catalog.build(settings, plugins, env=env, data_access_collection=base)
+            else:
+                plain = Catalog.build(settings, plugins, env=env)
+                Planner(settings, plain, plugin_collector=plugins, env=env, data_access_collection=base)
+
+    def test_planner_built_without_credentials_shares_its_catalogs_instance(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        credentials = 'token = "TOK_VAR"\n\n[mcp.credentials.other]\ntoken = { file = "gone.txt" }'
+        settings = _cred_settings(tmp_path, credentials, default_classification="public")
+        env = {"TOK_VAR": "short1"}
+        plugins = PluginCollector.enabled_feature_groups(set(FILE_SOURCE_GROUPS))
+        catalog = Catalog.build(settings, plugins, env=env)
+        planner = Planner(settings, catalog, signing_key=KEY, plugin_collector=plugins, env=env)
+
+        with caplog.at_level(logging.INFO):
+            catalog.describe("income")
+            _success(planner.explain({"features": ["income"]}))
+
+        short = [r for r in caplog.records if "shorter than" in r.getMessage()]
+        unreadable = [
+            r for r in caplog.records if r.levelno == logging.WARNING and r.name == "mloda.interfaces.service.sources"
+        ]
+        assert len(short) == 1
+        assert len(unreadable) == 1
+
+    def test_planning_failure_with_an_unreadable_credential_is_reported_as_the_credential_failure(
+        self, tmp_path: Path
+    ) -> None:
+        secret_file = tmp_path / "pii"
+        secret_file.write_text(TOKEN)
+        settings = _cred_settings(tmp_path, 'token = { file = "pii" }', default_classification="public")
+        planner, _ = _cred_services(settings, {}, extra_groups=frozenset({PlannerMissingInputMcp9}))
+        request = {"features": [PLAN_MISSING]}
+        _error(planner.explain(request), "missing_input_feature")
+        secret_file.unlink()
+
+        error = _error(planner.explain(request), "internal")
+
+        assert "ConfigError" in error["message"]
+
+    @pytest.mark.parametrize("command", ["explain", "run"])
+    def test_one_resolve_per_request(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+        settings = _cred_settings(tmp_path, 'token = "TOK_VAR"\nother = "OTHER_VAR"', options={CRED_KEY: "db"})
+        planner, runner = _cred_services(settings, {"TOK_VAR": TOKEN, "OTHER_VAR": ROTATED})
+        explained = _success(planner.explain({"features": [CRED_FEATURE]}))
+        reads: list[str] = []
+        real = service_sources._credential_value
+
+        def counting(handle: str, name: str, ref: Any, env: Mapping[str, str]) -> str:
+            reads.append(name)
+            return real(handle, name, ref, env)
+
+        monkeypatch.setattr(service_sources, "_credential_value", counting)
+
+        if command == "explain":
+            _success(planner.explain({"features": [CRED_FEATURE]}))
+        else:
+            _preview_rows(runner.run(explained["plan_id"]))
+
+        assert sorted(reads) == ["other", "token"]
+
+
+class TestCredentialHandleDiagnostics:
+    @staticmethod
+    def _explain(tmp_path: Path, handle: str | None, trusted: bool) -> dict[str, Any]:
+        overrides: dict[str, Any] = {} if handle is None else {"options": {CRED_KEY: handle}}
+        settings = dataclasses.replace(_cred_settings(tmp_path, **overrides), trusted_caller=trusted)
+        planner, _ = _cred_services(settings, {"TOK_VAR": TOKEN})
+        return planner.explain({"features": [CRED_FEATURE]})
+
+    @pytest.mark.parametrize(
+        ("handle", "named"), [("dbx", ["dbx"]), (None, [CRED_KEY, "is not set"])], ids=["misspelled", "unset"]
+    )
+    def test_a_trusted_caller_is_told_what_is_wrong(self, tmp_path: Path, handle: str | None, named: list[str]) -> None:
+        error = _error(self._explain(tmp_path, handle, True), "internal")
+
+        for needle in named:
+            assert needle in error["message"]
+        assert TOKEN not in json.dumps(error)
+
+    @pytest.mark.parametrize("handle", ["dbx", None], ids=["misspelled", "unset"])
+    def test_an_untrusted_caller_gets_the_generic_message(self, tmp_path: Path, handle: str | None) -> None:
+        result = self._explain(tmp_path, handle, False)
+
+        error = _error(result, "internal")
+        assert error["message"] == "Planning failed with ValueError."
+        dumped = json.dumps({**result, "error": {**error, "audit_id": None}})
+        for name in ("dbx", "db"):
+            _assert_value_absent(name, dumped)
+        _assert_value_absent(TOKEN, dumped)

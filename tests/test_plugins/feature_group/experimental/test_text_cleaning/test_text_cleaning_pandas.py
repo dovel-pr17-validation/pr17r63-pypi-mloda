@@ -1,0 +1,231 @@
+"""
+Tests for the PandasTextCleaning implementation.
+"""
+
+import pandas as pd
+import pytest
+
+from tests.test_plugins.feature_group.experimental.core_input_check import assert_core_rejects_missing_input
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.provider import FeatureSet
+from mloda.user import Options
+from mloda.provider import DefaultOptionKeys
+from mloda_plugins.feature_group.experimental.text_cleaning.base import TextCleaningFeatureGroup
+from mloda_plugins.feature_group.experimental.text_cleaning.pandas import PandasTextCleaning
+
+
+class TestPandasTextCleaning:
+    """Tests for the PandasTextCleaning implementation."""
+
+    def setup_method(self) -> None:
+        """Set up test data."""
+        # Create test data
+        self.df = pd.DataFrame(
+            {
+                "text": [
+                    "Hello World!",
+                    "TESTING text normalization",
+                    "This is a test with punctuation, special chars, and extra   spaces.",
+                    "Visit https://example.com or email test@example.com",
+                    "This contains stopwords like the and is and a",
+                ]
+            }
+        )
+
+    def test_get_source_text(self) -> None:
+        """Test that the source text is correctly retrieved."""
+        result = PandasTextCleaning._get_source_text(self.df, "text")
+
+        assert isinstance(result, pd.Series)
+        assert len(result) == len(self.df)
+        assert result.iloc[0] == "Hello World!"
+
+    def test_get_source_text_treats_missing_values_as_empty(self) -> None:
+        """Missing values become empty strings, like in the PythonDict feature group."""
+        df = pd.DataFrame({"text": ["Hello", None, "World"]})
+        result = PandasTextCleaning._get_source_text(df, "text")
+
+        assert result.tolist() == ["Hello", "", "World"]
+
+    @pytest.mark.parametrize("operation", ["normalize", "remove_punctuation"])
+    def test_operations_handle_missing_values(self, operation: str) -> None:
+        """Operations run on a column with a missing value instead of raising."""
+        df = pd.DataFrame({"text": ["Hello, World!", None]})
+        text = PandasTextCleaning._get_source_text(df, "text")
+        result = PandasTextCleaning._apply_operation(df, text, operation)
+
+        assert len(result) == 2
+        assert result.iloc[1] == ""
+
+    def test_add_result_to_data(self) -> None:
+        """Test that the result is correctly added to the data."""
+        result = pd.Series(["test1", "test2", "test3", "test4", "test5"])
+
+        df_result = PandasTextCleaning._add_result_to_data(self.df, "new_column", result)
+
+        assert "new_column" in df_result.columns
+        assert df_result["new_column"].iloc[0] == "test1"
+        assert df_result["new_column"].iloc[4] == "test5"
+
+    def test_normalize_operation(self) -> None:
+        """Test the normalize operation."""
+        text = self.df["text"]
+        result = PandasTextCleaning._normalize_text(text)
+
+        assert result.iloc[0] == "hello world!"
+        assert result.iloc[1] == "testing text normalization"
+
+    def test_remove_punctuation_operation(self) -> None:
+        """Test the remove_punctuation operation."""
+        text = self.df["text"]
+        result = PandasTextCleaning._remove_punctuation(text)
+
+        assert "!" not in result.iloc[0]
+        assert "," not in result.iloc[2]
+        assert "." not in result.iloc[2]
+
+    def test_remove_special_chars_operation(self) -> None:
+        """Test the remove_special_chars operation."""
+        text = self.df["text"]
+        result = PandasTextCleaning._remove_special_chars(text)
+
+        assert "!" not in result.iloc[0]
+        assert "," not in result.iloc[2]
+        assert "@" not in result.iloc[3]
+
+    def test_normalize_whitespace_operation(self) -> None:
+        """Test the normalize_whitespace operation."""
+        text = self.df["text"]
+        result = PandasTextCleaning._normalize_whitespace(text)
+
+        assert "   " not in result.iloc[2]
+        assert result.iloc[2].count(" ") < text.iloc[2].count(" ")
+
+    def test_remove_urls_operation(self) -> None:
+        """Test the remove_urls operation."""
+        text = self.df["text"]
+        result = PandasTextCleaning._remove_urls(text)
+
+        assert "https://example.com" not in result.iloc[3]
+        assert "test@example.com" not in result.iloc[3]
+
+    def test_apply_operation(self) -> None:
+        """Test the apply_operation method."""
+        text = self.df["text"]
+
+        # Test normalize
+        result = PandasTextCleaning._apply_operation(self.df, text, "normalize")
+        assert result.iloc[0] == "hello world!"
+
+        # Test invalid operation
+        with pytest.raises(ValueError) as excinfo:
+            PandasTextCleaning._apply_operation(self.df, text, "invalid_operation")
+
+        assert "Unsupported cleaning operation" in str(excinfo.value)
+
+    def test_calculate_single_operation(self) -> None:
+        """Test calculate with a single operation."""
+        # Create feature with normalize operation
+        feature = Feature(
+            FeatureName("text__cleaned_text"),
+            Options(
+                {
+                    TextCleaningFeatureGroup.CLEANING_OPERATIONS: ("normalize",),
+                }
+            ),
+        )
+        feature_set = FeatureSet()
+        feature_set.add(feature)
+
+        # Apply feature
+        result = PandasTextCleaning.calculate(TextCleaningFeatureGroup, self.df.copy(), feature_set, None)
+
+        # Check results
+        assert "text__cleaned_text" in result.columns
+        assert result["text__cleaned_text"].iloc[0] == "hello world!"
+        assert result["text__cleaned_text"].iloc[1] == "testing text normalization"
+
+    def test_calculate_multiple_operations(self) -> None:
+        """Test calculate with multiple operations."""
+        # Create feature with multiple operations
+        feature = Feature(
+            FeatureName("text__cleaned_text"),
+            Options(
+                {
+                    TextCleaningFeatureGroup.CLEANING_OPERATIONS: (
+                        "normalize",
+                        "remove_punctuation",
+                        "normalize_whitespace",
+                    ),
+                }
+            ),
+        )
+        feature_set = FeatureSet()
+        feature_set.add(feature)
+
+        # Apply feature
+        result = PandasTextCleaning.calculate(TextCleaningFeatureGroup, self.df.copy(), feature_set, None)
+
+        # Check results
+        assert "text__cleaned_text" in result.columns
+        assert result["text__cleaned_text"].iloc[0] == "hello world"  # Lowercase and no punctuation
+        assert "," not in result["text__cleaned_text"].iloc[2]  # No punctuation
+        assert "   " not in result["text__cleaned_text"].iloc[2]  # No extra spaces
+
+    def test_calculate_missing_source(self) -> None:
+        """Test calculate with a missing source feature."""
+        # Create feature with nonexistent source
+        feature = Feature(
+            FeatureName("nonexistent__cleaned_text"),
+            Options(
+                {
+                    TextCleaningFeatureGroup.CLEANING_OPERATIONS: ("normalize",),
+                }
+            ),
+        )
+        assert_core_rejects_missing_input(PandasTextCleaning, self.df.copy(), feature, ("nonexistent",))
+
+    def test_calculate_invalid_operation(self) -> None:
+        """Test calculate with an invalid operation."""
+        # Create feature with invalid operation
+        feature = Feature(
+            FeatureName("text__cleaned_text"),
+            Options(
+                {
+                    TextCleaningFeatureGroup.CLEANING_OPERATIONS: ("invalid_operation",),
+                }
+            ),
+        )
+        feature_set = FeatureSet()
+        feature_set.add(feature)
+
+        # Apply feature
+        with pytest.raises(ValueError) as excinfo:
+            PandasTextCleaning.calculate(TextCleaningFeatureGroup, self.df.copy(), feature_set, None)
+
+        assert "Unsupported cleaning operation" in str(excinfo.value)
+
+    def test_integration_with_configuration(self) -> None:
+        """Test integration with configuration-based feature creation."""
+        # Test configuration-based feature creation using new Options structure
+        feature = Feature(
+            "placeholder",  # Placeholder name for configuration-based feature
+            Options(
+                context={
+                    TextCleaningFeatureGroup.CLEANING_OPERATIONS: ("normalize", "remove_punctuation"),
+                    DefaultOptionKeys.in_features: "text",
+                }
+            ),
+        )
+
+        # Test that the feature matches the criteria for text cleaning
+        assert TextCleaningFeatureGroup.match_feature_group_criteria(feature.name, feature.options)
+
+        # Test input features extraction
+        feature_group = TextCleaningFeatureGroup()
+        input_features = feature_group.input_features(feature.options, feature.name)
+        assert input_features is not None
+        assert len(input_features) == 1
+        source_feature = next(iter(input_features))
+        assert source_feature.name == "text"

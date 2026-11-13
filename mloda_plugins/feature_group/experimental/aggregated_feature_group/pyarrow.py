@@ -1,0 +1,165 @@
+"""
+PyArrow implementation for aggregated feature groups.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from mloda.core.optional_dependency import loaded, require
+from mloda.provider import ComputeFramework, FeatureSet, Implementation
+from mloda.user.pyarrow import PyArrowTable
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.base import AggregatedFeatureGroup
+from mloda_plugins.feature_group.experimental.nan_safe_reduction import reduce_without_nan_warning
+
+_NUMPY_REASON = "pyarrow row-wise aggregation across multiple columns"
+
+
+class PyArrowAggregation(Implementation[AggregatedFeatureGroup]):
+    """
+    PyArrow implementation of aggregated feature group.
+
+    Supports multiple aggregation types in a single class.
+    """
+
+    feature_group = AggregatedFeatureGroup
+    compute_framework = PyArrowTable
+
+    @classmethod
+    def calculate(
+        cls, group: type[AggregatedFeatureGroup], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        return group.aggregate(
+            data,
+            features,
+            perform=cls._perform_aggregation,
+            add_column=cls._add_result_to_data,
+            columns=cls.compute_framework.extract_column_names,
+        )
+
+    @classmethod
+    def _add_result_to_data(cls, data: pa.Table, feature_name: str, result: Any) -> pa.Table:
+        """Add the result to the Table. Also accepts plain Python values from overrides."""
+        numpy = loaded("numpy")
+        if numpy is not None and isinstance(result, numpy.ndarray):
+            # Multi-column (row-wise) aggregation: one value per row already.
+            result_array = pa.array(result)
+        else:
+            # Single-column (vertical) aggregation: a scalar broadcast to every row.
+            result_array = pa.repeat(result, data.num_rows)
+
+        if feature_name in data.schema.names:
+            column_index = data.schema.names.index(feature_name)
+            data = data.remove_column(column_index)
+            return data.append_column(feature_name, result_array)
+        else:
+            return data.append_column(feature_name, result_array)
+
+    @classmethod
+    def _perform_aggregation(cls, data: pa.Table, aggregation_type: str, in_features: list[str]) -> Any:
+        """
+        Perform the aggregation using PyArrow compute functions.
+
+        Supports both single-column and multi-column aggregation:
+        - Single column: aggregates values within the column (returns scalar)
+        - Multi-column: aggregates across columns row-wise (returns array)
+
+        Args:
+            data: The PyArrow Table
+            aggregation_type: The type of aggregation to perform
+            in_features: List of source feature names (may be single or multiple columns)
+
+        Returns:
+            The result of the aggregation (pa.Scalar for single-column, preserving type on zero-row and
+            all-null input; array for multi-column)
+        """
+        if len(in_features) > 1:
+            np = require("numpy", _NUMPY_REASON)
+
+            # Multi-column: aggregate across columns row-wise
+            # PyArrow doesn't have direct horizontal operations, need to implement manually
+            columns = [data.column(name) for name in in_features]
+
+            # Cast to float64 only when a null is present, so it can be represented as NaN for the
+            # np.nan* reducers to skip. Casting unconditionally would both force every result to
+            # float64 and silently lose precision for int64 values beyond +/-2**53.
+            if any(col.null_count > 0 for col in columns):
+                arrays = [pc.cast(col, pa.float64()).to_numpy() for col in columns]
+            else:
+                arrays = [col.to_numpy() for col in columns]
+            stacked = np.column_stack(arrays)
+
+            # Reducers run on the null mask below; degenerate rows are patched so numpy never warns.
+            # Null and NaN are both missing: the mask covers Arrow nulls and float NaN.
+            missing = [
+                pc.or_(pc.is_null(col), pc.fill_null(pc.is_nan(col), False))
+                if pa.types.is_floating(col.type)
+                else pc.is_null(col)
+                for col in columns
+            ]
+            null_mask = np.column_stack([m.to_numpy(zero_copy_only=False) for m in missing])
+            valid_counts = np.sum(~null_mask, axis=1)
+            zeroed = np.where(null_mask, 0, stacked)
+
+            if aggregation_type == "sum":
+                result = zeroed.sum(axis=1)
+            elif aggregation_type == "count":
+                result = valid_counts
+            elif aggregation_type in ["avg", "mean", "std", "var"]:
+                row_sums = zeroed.sum(axis=1)
+                means = np.full(row_sums.shape, np.nan)
+                np.divide(row_sums, valid_counts, out=means, where=valid_counts > 0)
+                if aggregation_type in ["avg", "mean"]:
+                    result = means
+                else:
+                    squares = np.where(null_mask, 0.0, stacked - means[:, np.newaxis]) ** 2
+                    variances = np.full(row_sums.shape, np.nan)
+                    np.divide(squares.sum(axis=1), valid_counts - 1, out=variances, where=valid_counts >= 2)
+                    result = variances if aggregation_type == "var" else np.sqrt(variances)
+            elif aggregation_type in ["min", "max", "median"]:
+                all_nan_rows = np.sum(~np.isnan(stacked), axis=1) == 0
+                if aggregation_type == "min":
+                    result = reduce_without_nan_warning(stacked, all_nan_rows, lambda a: np.nanmin(a, axis=1))
+                elif aggregation_type == "max":
+                    result = reduce_without_nan_warning(stacked, all_nan_rows, lambda a: np.nanmax(a, axis=1))
+                else:
+                    result = reduce_without_nan_warning(stacked, all_nan_rows, lambda a: np.nanmedian(a, axis=1))
+            else:
+                raise ValueError(f"Unsupported aggregation type: {aggregation_type}")
+
+            # Rows with no values (std/var: fewer than 2) are masked, so they become null.
+            if aggregation_type in ["sum", "count"]:
+                return result
+            minimum = 2 if aggregation_type in ["std", "var"] else 1
+            return np.ma.masked_array(result, mask=valid_counts < minimum)
+        else:
+            # Single column: vertical aggregation (returns scalar)
+            column = data.column(in_features[0])
+            if pa.types.is_floating(column.type):
+                column = pc.if_else(pc.is_nan(column), pa.scalar(None, column.type), column)
+
+            if aggregation_type == "sum":
+                return pc.sum(column, min_count=0)
+            elif aggregation_type == "min":
+                return pc.min(column)
+            elif aggregation_type == "max":
+                return pc.max(column)
+            elif aggregation_type in ["avg", "mean"]:
+                return pc.mean(column)
+            elif aggregation_type == "count":
+                return pc.count(column)
+            elif aggregation_type == "std":
+                return pc.stddev(column, ddof=1)
+            elif aggregation_type == "var":
+                return pc.variance(column, ddof=1)
+            elif aggregation_type == "median":
+                # PyArrow doesn't have a direct median function
+                # We can approximate it using quantile with q=0.5
+                # quantile returns an array, so we need to extract the first value
+                result = pc.quantile(column, q=0.5)
+                return result[0]
+            else:
+                raise ValueError(f"Unsupported aggregation type: {aggregation_type}")

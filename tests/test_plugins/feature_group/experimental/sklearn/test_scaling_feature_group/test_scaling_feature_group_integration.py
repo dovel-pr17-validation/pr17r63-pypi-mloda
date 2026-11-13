@@ -1,0 +1,130 @@
+"""
+Integration test for ScalingFeatureGroup with mloda and artifact management.
+"""
+
+from mloda.user import PluginLoader
+import numpy as np
+import pytest
+from typing import Any
+
+from mloda.user import Feature
+from mloda.user import Options
+from mloda.user import PluginCollector
+from mloda.user import mloda
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.feature_group.experimental.sklearn.scaling.pandas import PandasScaling as PandasScaling
+from mloda_plugins.feature_group.experimental.sklearn.scaling.base import ScalingFeatureGroup
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.base import AggregatedFeatureGroup
+
+from tests.test_plugins.integration_plugins.test_data_creator import ATestDataCreator
+
+
+class ScalingIntegrationTestDataCreator(ATestDataCreator):
+    """Test data creator for scaling integration tests."""
+
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def get_raw_data(cls) -> dict[str, Any]:
+        """Return the raw data as a dictionary."""
+        return {
+            "Sales": [100, 200, 300, 400, 500],
+            "Revenue": [1000, 2000, 3000, 4000, 5000],
+        }
+
+
+class TestScalingFeatureGroupIntegration:
+    """Integration test for ScalingFeatureGroup."""
+
+    def test_scaling_with_aggregated_source_and_artifacts(self, tmp_path: Any) -> None:
+        """Test scaling feature group using aggregated feature as source with artifact save/load."""
+        # Skip test if sklearn not available
+        try:
+            import sklearn  # noqa: F401
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        PluginLoader().all()
+
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {ScalingIntegrationTestDataCreator, ScalingFeatureGroup, AggregatedFeatureGroup}
+        )
+
+        # Create features: aggregated feature and scaling of that aggregated feature
+        scaling_feature = Feature("Sales__sum_aggr__standard_scaled", Options({"artifact_storage_path": str(tmp_path)}))
+
+        # Phase 1: Train and save artifacts
+        api1 = mloda(
+            [scaling_feature],
+            [PandasDataFrame],
+            plugin_collector=plugin_collector,
+        )
+        results1 = api1.run()
+        artifacts1 = results1.artifacts
+
+        # Verify scaling feature was created
+        assert len(results1) == 1
+        df1 = results1[0]
+        assert "Sales__sum_aggr__standard_scaled" in df1.columns
+
+        # Verify artifacts were created for the scaling feature
+        assert len(artifacts1) >= 1
+        assert "Sales__sum_aggr__standard_scaled" in artifacts1
+
+        # Verify that scaling was applied (all values are 0 since source is constant)
+        scaled_values = df1["Sales__sum_aggr__standard_scaled"]
+        assert abs(scaled_values.mean()) < 0.1
+        # Since the aggregated feature is constant (all 1500), scaling results in all 0s
+        assert scaled_values.std() == 0.0
+
+        # Phase 2: Load artifacts and apply to same data (simulating reuse)
+        # Create features with artifact options for reuse
+        scaling_feature_reuse = Feature(
+            "Sales__sum_aggr__standard_scaled",
+            Options({**artifacts1, "artifact_storage_path": str(tmp_path)}),
+        )
+
+        api2 = mloda(
+            [scaling_feature_reuse],
+            [PandasDataFrame],
+            plugin_collector=plugin_collector,
+        )
+        results2 = api2.run()
+        artifacts2 = results2.artifacts
+
+        # Verify results are identical (indicating artifact reuse)
+        assert len(results2) == 1
+        df2 = results2[0]
+        assert "Sales__sum_aggr__standard_scaled" in df2.columns
+
+        # No new artifacts should be created (reused existing ones)
+        assert len(artifacts2) == 0
+
+        # Values should be identical (artifact was reused)
+        assert df1["Sales__sum_aggr__standard_scaled"].equals(df2["Sales__sum_aggr__standard_scaled"])
+
+
+class ZeroRowScalingTestDataCreator(ATestDataCreator):
+    """Test data creator returning zero rows."""
+
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def get_raw_data(cls) -> dict[str, Any]:
+        return {"Sales": np.array([], dtype="float64")}
+
+
+class TestScalingOnZeroRowsThroughTheEngine:
+    def test_zero_row_source_gives_an_empty_float64_column(self, tmp_path: Any) -> None:
+        pytest.importorskip("sklearn")
+        PluginLoader().all()
+        plugin_collector = PluginCollector.enabled_feature_groups({ZeroRowScalingTestDataCreator, ScalingFeatureGroup})
+        feature = Feature("Sales__standard_scaled", Options({"artifact_storage_path": str(tmp_path)}))
+
+        results = mloda.run_all([feature], compute_frameworks=[PandasDataFrame], plugin_collector=plugin_collector)
+
+        assert len(results) == 1
+        column = results[0]["Sales__standard_scaled"]
+        assert len(column) == 0
+        assert str(column.dtype) == "float64"

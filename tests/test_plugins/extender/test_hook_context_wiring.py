@@ -1,0 +1,1375 @@
+"""Tests wiring HookContext through ComputeFramework's three Extender hook call sites.
+
+Exercises run_calculate_feature, run_validate_input_features, and
+run_validate_output_features on a concrete PythonDictFramework instance. Also covers
+run_context/worker_index surfacing on the captured HookContext.
+"""
+
+import functools
+import gc
+import importlib
+import logging
+import uuid
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+from mloda.core.abstract_plugins.function_extender import Extender, ExtenderHook
+from mloda.core.abstract_plugins.hook_context import HookContext
+from mloda.core.abstract_plugins.run_context import RunContext
+from mloda.provider import (
+    Cause,
+    ComputeFramework,
+    DataCreatorFeatureGroup,
+    Divergence,
+    DivergenceKind,
+    FeatureGroup,
+    credential_handle_spec,
+)
+from mloda.user import Feature, ParallelizationMode, PluginCollector, mloda
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from mloda_plugins.feature_group.input_data.db_sources.sqlite_fg import SqliteFG
+from mloda_plugins.feature_group.input_data.file_formats.csv_fg import CsvFG
+from tests.helpers.bound_credential_cases import BOUND_KINDS, bound_case, csv_file_source, write_bound_sqlite
+from tests.helpers.credential_handle_stubs import HANDLE_KEY, ChsConsumerFG, ChsRawSecretFG, ChsVaultFG
+from tests.mixins.neutral_csv_source import neutral_csv_group
+from tests.test_plugins.extender.test_input_data_load_hook import _DirectLoader, _load
+from tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_source_group import (
+    toy_dac,
+)
+from tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_worker_implementation import (
+    WORKER_COLUMN,
+    ToyWorkerFG,
+)
+from tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_worker_implementation_impl import (
+    ToyWorkerPythonDict,
+)
+
+SAFE_FIELD_LOGGER = "mloda.core.abstract_plugins.components.utils"
+
+
+class _CalcFeatureGroup(FeatureGroup):
+    """Root feature group (input_features unimplemented) returning a sized list."""
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": i} for i in range(3)]
+
+
+class _ContextCapturingExtender(Extender):
+    """Calls func like a real extender, then reads HookContext.current() afterward."""
+
+    def __init__(self, hook: ExtenderHook, priority: int = 100) -> None:
+        self._hook = hook
+        self.priority = priority
+        self.captured: HookContext | None = None
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {self._hook}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        result = func(*args, **kwargs)
+        self.captured = HookContext.current()
+        return result
+
+
+class _UnusedCredentials(_ContextCapturingExtender):
+    """Reports (feature group, handle) declarations no step of that group binds or reads."""
+
+    def __init__(self) -> None:
+        super().__init__(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        self.contexts: list[HookContext] = []
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        result = super().__call__(func, *args, **kwargs)
+        if self.captured is not None:
+            self.contexts.append(self.captured)
+        return result
+
+    def unused(self) -> set[tuple[str, str]]:
+        used: set[tuple[str | None, str]] = set()
+        for c in self.contexts:
+            used |= {(c.feature_group_class, h) for h in (*c.credentials_read, c.bound_credential_handle) if h}
+        return {
+            (c.feature_group_class, h)
+            for c in self.contexts
+            for h in c.credential_handles
+            if c.feature_group_class and (c.feature_group_class, h) not in used
+        }
+
+
+class _OldStyleExtender(Extender):
+    """Mirrors today's real extenders: ignores HookContext entirely."""
+
+    def __init__(self, priority: int = 100) -> None:
+        self.priority = priority
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+
+def _build_feature_set() -> FeatureSet:
+    return FeatureSet([Feature("col")])
+
+
+def _build_framework(extenders: set[Extender]) -> PythonDictFramework:
+    return PythonDictFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset(), function_extender=extenders)
+
+
+class TestCalculateFeatureHookContext:
+    """FEATURE_GROUP_CALCULATE_FEATURE hook surfaces a populated HookContext."""
+
+    def test_captures_call_facts_and_post_call_instrumentation(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+
+        result = cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.hook == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE
+        assert captured.feature_group_class == f"{_CalcFeatureGroup.__module__}.{_CalcFeatureGroup.__qualname__}"
+        assert captured.feature_group_version == _CalcFeatureGroup.version()
+        assert captured.feature_names == feature_set.get_all_names()
+        assert captured.compute_framework_name == "PythonDictFramework"
+        assert captured.status == "success"
+        assert captured.duration_seconds is not None
+        assert captured.duration_seconds >= 0
+        assert captured.rows_out == len(result)
+
+
+class TestValidateInputFeatureHookContext:
+    """VALIDATE_INPUT_FEATURE hook surfaces a populated HookContext."""
+
+    def test_captures_hook_and_success_status(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.VALIDATE_INPUT_FEATURE)
+        cfw = _build_framework({extender})
+        # run_validate_input_features returns immediately without touching extenders when data is None.
+        cfw.data = {"col": [1, 2, 3]}
+
+        cfw.run_validate_input_features(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.hook == ExtenderHook.VALIDATE_INPUT_FEATURE
+        assert captured.status == "success"
+
+
+class TestValidateOutputFeatureHookContext:
+    """VALIDATE_OUTPUT_FEATURE hook surfaces a populated HookContext."""
+
+    def test_captures_hook_and_success_status(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.VALIDATE_OUTPUT_FEATURE)
+        cfw = _build_framework({extender})
+        # Preconditions: data isn't None; every feature in the set is a produced column ("col");
+        # features carry no data_type so DataTypeValidator no-ops.
+        cfw.data = {"col": [1, 2, 3]}
+        cfw.set_column_names()
+
+        cfw.run_validate_output_features(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.hook == ExtenderHook.VALIDATE_OUTPUT_FEATURE
+        assert captured.status == "success"
+
+
+class TestBackwardCompatibility:
+    """Adding the context seam must not change what an unmodified old-style extender receives."""
+
+    def test_old_style_extender_behavior_is_unchanged(self) -> None:
+        feature_set = _build_feature_set()
+
+        cfw_with_extender = _build_framework({_OldStyleExtender()})
+        result_with_extender = cfw_with_extender.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        cfw_without_extender = _build_framework(set())
+        result_without_extender = cfw_without_extender.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        assert result_with_extender == result_without_extender
+
+
+class TestHookContextScoping:
+    """HookContext.current() is scoped to the hook call, not leaked before/after."""
+
+    def test_current_is_none_before_and_after_the_call(self) -> None:
+        assert HookContext.current() is None
+
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        assert HookContext.current() is None
+
+
+class TestCompositeExtenderHookContext:
+    """Multiple extenders on the same hook observe the identical HookContext instance."""
+
+    def test_both_extenders_capture_the_same_context_instance(self) -> None:
+        feature_set = _build_feature_set()
+        extender_low = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, priority=10)
+        extender_high = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, priority=20)
+        cfw = _build_framework({extender_low, extender_high})
+
+        result = cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        assert extender_low.captured is not None
+        assert extender_high.captured is not None
+        assert extender_low.captured is extender_high.captured
+        assert extender_low.captured.status == "success"
+        assert extender_low.captured.duration_seconds is not None
+        assert extender_low.captured.rows_out == len(result)
+
+
+class TestDeclaredInputFeaturesBestEffort:
+    """Declared input features surface as None for the common root-feature case."""
+
+    def test_root_feature_group_input_features_is_none(self) -> None:
+        feature_set = _build_feature_set()
+        assert feature_set.options is not None
+        assert _CalcFeatureGroup().is_root(feature_set.options, feature_set.get_name_of_one_feature()) is True
+
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        assert extender.captured is not None
+        assert extender.captured.input_features is None
+
+
+class _DeclaringFeatureGroup(FeatureGroup):
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> dict[str, str | int | float | bool]:
+        return {"unit": "m", "scale": 2, "ratio": 0.5, "flag": True}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": 1}]
+
+
+class _RecordingFeatureGroup(FeatureGroup):
+    seen: list[Any] = []
+
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> dict[str, str | int | float | bool]:
+        cls.seen.append(features)
+        return {}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": 1}]
+
+
+class _MixedFeatureGroup(FeatureGroup):
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> dict[str, Any]:
+        return {
+            "unit": "m",
+            "tags": ["a"],
+            "nested": {"k": 1},
+            "nothing": None,
+            "raw": b"x",
+            "n": 3,
+            "bad": float("nan"),
+        }
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": 1}]
+
+
+_SHARED_DECLARATION: dict[str, str | int | float | bool] = {"unit": "m"}
+
+
+class _SharedMappingFeatureGroup(FeatureGroup):
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> dict[str, str | int | float | bool]:
+        return _SHARED_DECLARATION
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": 1}]
+
+
+class _RaisingDeclarationFeatureGroup(FeatureGroup):
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> dict[str, str | int | float | bool]:
+        raise RuntimeError("declaration boom")
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": 1}]
+
+
+class _ListDeclarationFeatureGroup(FeatureGroup):
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> Any:
+        return [("unit", "m")]
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": 1}]
+
+
+class _IntKeyDeclarationFeatureGroup(FeatureGroup):
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> Any:
+        return {1: "m", "unit": "m"}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return [{"value": 1}]
+
+
+def _captured_declared_attributes(feature_group: type[FeatureGroup]) -> tuple[Any, HookContext | None]:
+    extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+    result = _build_framework({extender}).run_calculate_feature(feature_group, _build_feature_set())
+    return result, extender.captured
+
+
+class TestDeclaredAttributesWiring:
+    """Feature-group hooks carry the group's declared_attributes(features), scalars only."""
+
+    def test_default_declared_attributes_is_empty_mapping(self) -> None:
+        assert FeatureGroup.declared_attributes(None) == {}
+
+    def test_calculate_hook_carries_the_declared_attributes(self) -> None:
+        _, captured = _captured_declared_attributes(_DeclaringFeatureGroup)
+
+        assert captured is not None
+        assert captured.declared_attributes == {"unit": "m", "scale": 2, "ratio": 0.5, "flag": True}
+        assert captured.reader_class is None
+
+    def test_declared_attributes_receives_the_feature_set(self) -> None:
+        feature_set = _build_feature_set()
+        _RecordingFeatureGroup.seen.clear()
+
+        _build_framework(
+            {_ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)}
+        ).run_calculate_feature(_RecordingFeatureGroup, feature_set)
+
+        assert any(seen is feature_set for seen in _RecordingFeatureGroup.seen)
+
+    def test_default_group_surfaces_empty_declared_attributes(self) -> None:
+        _, captured = _captured_declared_attributes(_CalcFeatureGroup)
+
+        assert captured is not None
+        assert captured.declared_attributes == {}
+
+    def test_non_scalar_entries_are_dropped(self) -> None:
+        _, captured = _captured_declared_attributes(_MixedFeatureGroup)
+
+        assert captured is not None
+        assert captured.declared_attributes == {"unit": "m", "n": 3}
+
+    def test_returned_mapping_is_copied_into_the_context(self) -> None:
+        _, captured = _captured_declared_attributes(_SharedMappingFeatureGroup)
+
+        assert captured is not None
+        assert captured.declared_attributes == {"unit": "m"}
+        assert captured.declared_attributes is not _SHARED_DECLARATION
+
+
+class _PublishingFeatureGroup(FeatureGroup):
+    @classmethod
+    def declared_attributes(cls, features: FeatureSet | None) -> dict[str, str | int | float | bool]:
+        return {"unit": "m"}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        HookContext.publish_result_attributes({"profile": "x", "lines": 3, "tags": ["a"]})
+        return [{"value": 1}]
+
+
+class TestResultAttributesWiring:
+    """Attributes published in calculate_feature are visible to extenders after func returns."""
+
+    def test_extender_sees_published_result_attributes_after_call(self) -> None:
+        result, captured = _captured_declared_attributes(_PublishingFeatureGroup)
+
+        assert result == [{"value": 1}]
+        assert captured is not None
+        assert captured.result_attributes == {"profile": "x", "lines": 3}
+        assert captured.declared_attributes == {"unit": "m"}
+
+    def test_publishing_without_extender_still_returns_result(self) -> None:
+        result = _build_framework(set()).run_calculate_feature(_PublishingFeatureGroup, _build_feature_set())
+
+        assert result == [{"value": 1}]
+
+
+class TestObservabilityFailureDoesNotBreakCalculation:
+    """An observability read failing must never fail run_calculate_feature itself."""
+
+    def test_declared_attributes_raising_degrades_to_none(self) -> None:
+        result, captured = _captured_declared_attributes(_RaisingDeclarationFeatureGroup)
+
+        assert result == [{"value": 1}]
+        assert captured is not None
+        assert captured.declared_attributes is None
+
+    def test_declared_attributes_non_mapping_degrades_to_none(self) -> None:
+        result, captured = _captured_declared_attributes(_ListDeclarationFeatureGroup)
+
+        assert result == [{"value": 1}]
+        assert captured is not None
+        assert captured.declared_attributes is None
+
+    def test_declared_attributes_non_str_key_degrades_to_none(self) -> None:
+        result, captured = _captured_declared_attributes(_IntKeyDeclarationFeatureGroup)
+
+        assert result == [{"value": 1}]
+        assert captured is not None
+        assert captured.declared_attributes is None
+
+    def test_ctor_requiring_arg_degrades_input_features_to_none(self) -> None:
+        class _CtorRequiresArgFeatureGroup(FeatureGroup):
+            """FeatureGroup whose __init__ requires a positional argument, so zero-arg feature_group() raises."""
+
+            def __init__(self, required: int) -> None:
+                self.required = required
+
+            @classmethod
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                return [{"value": i} for i in range(3)]
+
+        try:
+            feature_set = _build_feature_set()
+            extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+            cfw = _build_framework({extender})
+
+            result = cfw.run_calculate_feature(_CtorRequiresArgFeatureGroup, feature_set)
+
+            assert result == [{"value": i} for i in range(3)]
+            assert extender.captured is not None
+            assert extender.captured.input_features is None
+        finally:
+            del _CtorRequiresArgFeatureGroup
+            gc.collect()
+
+    def test_version_raising_degrades_to_unavailable_fallback(self) -> None:
+        class _VersionRaisesFeatureGroup(FeatureGroup):
+            """FeatureGroup whose version() classmethod raises."""
+
+            @classmethod
+            def version(cls) -> str:
+                raise RuntimeError("boom")
+
+            @classmethod
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                return [{"value": i} for i in range(3)]
+
+        try:
+            feature_set = _build_feature_set()
+            extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+            cfw = _build_framework({extender})
+
+            result = cfw.run_calculate_feature(_VersionRaisesFeatureGroup, feature_set)
+
+            assert result == [{"value": i} for i in range(3)]
+            assert extender.captured is not None
+            assert extender.captured.feature_group_version == "unavailable"
+        finally:
+            del _VersionRaisesFeatureGroup
+            gc.collect()
+
+    def test_version_raising_logs_exactly_one_warning_across_repeated_calls(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The fallback WARNING names the feature group and exception once, not on every hot-path hook call."""
+
+        class _RepeatedVersionRaisesFeatureGroup(FeatureGroup):
+            """FeatureGroup whose version() classmethod raises; invoked twice to probe dedup."""
+
+            @classmethod
+            def version(cls) -> str:
+                raise RuntimeError("boom")
+
+            @classmethod
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                return [{"value": i} for i in range(3)]
+
+        try:
+            feature_set = _build_feature_set()
+            extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+            cfw = _build_framework({extender})
+
+            with caplog.at_level(logging.WARNING, logger=SAFE_FIELD_LOGGER):
+                cfw.run_calculate_feature(_RepeatedVersionRaisesFeatureGroup, feature_set)
+                first_captured = extender.captured
+                cfw.run_calculate_feature(_RepeatedVersionRaisesFeatureGroup, feature_set)
+                second_captured = extender.captured
+
+            assert first_captured is not None
+            assert first_captured.feature_group_version == "unavailable"
+            assert second_captured is not None
+            assert second_captured.feature_group_version == "unavailable"
+
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno == logging.WARNING
+                and record.name == SAFE_FIELD_LOGGER
+                and ".version" in record.getMessage()
+            ]
+            assert len(warnings) == 1, f"Expected exactly one WARNING across both calls, got {warnings}"
+            assert "_RepeatedVersionRaisesFeatureGroup" in warnings[0]
+            assert "RuntimeError" in warnings[0]
+        finally:
+            del _RepeatedVersionRaisesFeatureGroup
+            gc.collect()
+
+    def test_version_returning_non_str_normalizes_to_unavailable_fallback(self) -> None:
+        class _VersionReturnsIntFeatureGroup(FeatureGroup):
+            """FeatureGroup whose version() classmethod returns a non-str value."""
+
+            @classmethod
+            def version(cls) -> str:
+                return 123  # type: ignore[return-value]
+
+            @classmethod
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                return [{"value": i} for i in range(3)]
+
+        try:
+            feature_set = _build_feature_set()
+            extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+            cfw = _build_framework({extender})
+
+            result = cfw.run_calculate_feature(_VersionReturnsIntFeatureGroup, feature_set)
+
+            assert result == [{"value": i} for i in range(3)]
+            assert extender.captured is not None
+            assert extender.captured.feature_group_version == "unavailable"
+            assert isinstance(extender.captured.feature_group_version, str)
+        finally:
+            del _VersionReturnsIntFeatureGroup
+            gc.collect()
+
+    def test_rows_in_len_raising_degrades_to_none(self) -> None:
+        class _LenRaisesDouble:
+            """Stand-in whose __len__ raises, simulating an observability row-count read gone wrong."""
+
+            def __len__(self) -> int:
+                raise RuntimeError("len boom")
+
+        try:
+            feature_set = _build_feature_set()
+            extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+            cfw = _build_framework({extender})
+            cfw.data = _LenRaisesDouble()
+
+            result = cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+            assert result == [{"value": i} for i in range(3)]
+            assert extender.captured is not None
+            assert extender.captured.rows_in is None
+        finally:
+            del _LenRaisesDouble
+            gc.collect()
+
+    def test_rows_out_len_raising_degrades_to_none(self) -> None:
+        class _LenRaisesDouble:
+            """Stand-in whose __len__ raises, simulating an observability row-count read gone wrong."""
+
+            def __len__(self) -> int:
+                raise RuntimeError("len boom")
+
+        class _ReturnsLenRaisesFeatureGroup(FeatureGroup):
+            """Returns a _LenRaisesDouble: the rows_out read must not break a successful calculation."""
+
+            double_factory = _LenRaisesDouble
+
+            @classmethod
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                return cls.double_factory()
+
+        try:
+            feature_set = _build_feature_set()
+            extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+            cfw = _build_framework({extender})
+
+            result = cfw.run_calculate_feature(_ReturnsLenRaisesFeatureGroup, feature_set)
+
+            assert isinstance(result, _LenRaisesDouble)
+            assert extender.captured is not None
+            assert extender.captured.rows_out is None
+        finally:
+            del _ReturnsLenRaisesFeatureGroup
+            del _LenRaisesDouble
+            gc.collect()
+
+
+class _FeatureGroupNameCapturingExtender(Extender):
+    """Calls Extender.feature_group_name(func) on the func it's handed and records the result."""
+
+    def __init__(self, priority: int = 100) -> None:
+        self.priority = priority
+        self.seen_name: str | None = None
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        self.seen_name = Extender.feature_group_name(func)
+        return func(*args, **kwargs)
+
+
+class TestInstrumentPreservesSelfForNameResolution:
+    """instrument's wrapper must carry __self__ so feature_group_name resolves correctly."""
+
+    def test_feature_group_name_resolves_through_extra_decorator(self) -> None:
+        def _plain_function_no_self(*args: Any, **kwargs: Any) -> Any:
+            """Function with no __self__: the wraps() target of _extra_decorator below."""
+            return None
+
+        def _extra_decorator(func: Any, _target: Any = _plain_function_no_self) -> Any:
+            """Simulates a plugin's own decorator stacked on @classmethod, using functools.wraps on a
+            __self__-less function so unwrap walks past the real bound classmethod."""
+
+            @functools.wraps(_target)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        class _DoublyDecoratedFeatureGroup(FeatureGroup):
+            """calculate_feature is wrapped in an extra decorator whose own __wrapped__ chain leads elsewhere."""
+
+            @classmethod
+            @_extra_decorator
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                return [{"value": i} for i in range(3)]
+
+        try:
+            feature_set = _build_feature_set()
+            extender = _FeatureGroupNameCapturingExtender()
+            cfw = _build_framework({extender})
+
+            cfw.run_calculate_feature(_DoublyDecoratedFeatureGroup, feature_set)
+
+            assert extender.seen_name == "_DoublyDecoratedFeatureGroup"
+        finally:
+            del _DoublyDecoratedFeatureGroup
+            del _extra_decorator
+            del _plain_function_no_self
+            gc.collect()
+
+
+class TestRunIdAndCarrierWiring:
+    """run_context is set post-construction, not a constructor kwarg; run_id/carrier surface unchanged."""
+
+    def test_run_id_and_carrier_surface_on_captured_hook_context(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        carrier = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+        cfw = _build_framework({extender})
+        cfw.run_context = RunContext(run_id="01909a3b-1234-7abc-8def-0123456789ab", carrier=carrier)
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.run_id == "01909a3b-1234-7abc-8def-0123456789ab"
+        assert captured.carrier == carrier
+
+    def test_run_id_and_carrier_default_to_none(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.run_id is None
+        assert captured.carrier is None
+
+
+class TestComputeFrameworkConstructorRejectsRunIdAndCarrierKwargs:
+    def test_run_id_kwarg_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match="run_id"):
+            # ignore below is a true positive: proving run_id really is rejected at runtime.
+            PythonDictFramework(  # type: ignore[call-arg]
+                mode=ParallelizationMode.SYNC,
+                children_if_root=frozenset(),
+                run_id="01909a3b-1234-7abc-8def-0123456789ab",
+            )
+
+    def test_carrier_kwarg_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match="carrier"):
+            PythonDictFramework(  # type: ignore[call-arg]
+                mode=ParallelizationMode.SYNC,
+                children_if_root=frozenset(),
+                carrier={"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+            )
+
+
+class TestTenantProjectPrincipalWiring:
+    """run_context is set post-construction; tenant_id/project_id/principal surface unchanged."""
+
+    def test_tenant_project_principal_surface_on_captured_hook_context(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+        cfw.run_context = RunContext(tenant_id="acme", project_id="proj1", principal="hash123")
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.tenant_id == "acme"
+        assert captured.project_id == "proj1"
+        assert captured.principal == "hash123"
+
+    def test_tenant_project_principal_default_to_none(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.tenant_id is None
+        assert captured.project_id is None
+        assert captured.principal is None
+
+
+class TestCarrierIsNotAliasedAcrossHooksSharingOneComputeFramework:
+    """VALIDATE_INPUT_FEATURE and VALIDATE_OUTPUT_FEATURE both build a HookContext off this
+    cfw's run_context within one feature-group step; each build must get its own carrier
+    copy, not the same dict object read straight off run_context.carrier."""
+
+    def test_two_hook_contexts_get_distinct_carrier_objects(self) -> None:
+        feature_set = _build_feature_set()
+        carrier = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+        input_extender = _ContextCapturingExtender(ExtenderHook.VALIDATE_INPUT_FEATURE)
+        output_extender = _ContextCapturingExtender(ExtenderHook.VALIDATE_OUTPUT_FEATURE)
+        cfw = _build_framework({input_extender, output_extender})
+        cfw.run_context = RunContext(carrier=carrier)
+        cfw.data = {"col": [1, 2, 3]}
+
+        cfw.run_validate_input_features(_CalcFeatureGroup, feature_set)
+        cfw.set_column_names()
+        cfw.run_validate_output_features(_CalcFeatureGroup, feature_set)
+
+        input_context = input_extender.captured
+        output_context = output_extender.captured
+        assert input_context is not None
+        assert output_context is not None
+        assert input_context.carrier == output_context.carrier == carrier
+        assert input_context.carrier is not output_context.carrier
+        assert input_context.carrier is not cfw.run_context.carrier
+        assert output_context.carrier is not cfw.run_context.carrier
+
+    def test_mutating_one_carrier_does_not_leak_into_the_other_or_run_context(self) -> None:
+        feature_set = _build_feature_set()
+        carrier = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+        input_extender = _ContextCapturingExtender(ExtenderHook.VALIDATE_INPUT_FEATURE)
+        output_extender = _ContextCapturingExtender(ExtenderHook.VALIDATE_OUTPUT_FEATURE)
+        cfw = _build_framework({input_extender, output_extender})
+        cfw.run_context = RunContext(carrier=carrier)
+        cfw.data = {"col": [1, 2, 3]}
+
+        cfw.run_validate_input_features(_CalcFeatureGroup, feature_set)
+        cfw.set_column_names()
+        cfw.run_validate_output_features(_CalcFeatureGroup, feature_set)
+
+        input_context = input_extender.captured
+        output_context = output_extender.captured
+        assert input_context is not None
+        assert input_context.carrier is not None
+        with pytest.raises(TypeError):
+            input_context.carrier["mutated"] = "yes"
+
+        assert output_context is not None
+        assert output_context.carrier is not None
+        assert "mutated" not in output_context.carrier
+        assert cfw.run_context.carrier is not None
+        assert "mutated" not in cfw.run_context.carrier
+
+
+class TestWorkerIndexWiring:
+    def test_worker_index_set_on_instance_surfaces_on_captured_hook_context(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+        cfw.worker_index = 3
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.worker_index == 3
+
+    def test_worker_index_defaults_to_none_when_not_assigned(self) -> None:
+        feature_set = _build_feature_set()
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+
+        assert cfw.worker_index is None
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, feature_set)
+
+        captured = extender.captured
+        assert captured is not None
+        assert captured.worker_index is None
+
+
+_FORGED_ID = "forged-run-id"
+_FORGED_STEP_UUID = uuid.uuid4()
+_FORGED_HANDLES = ("forged-handle",)
+_FORGED_BOUND = "forged-bound"
+_forge_outcomes: dict[str, type[BaseException] | None] = {}
+
+
+def _forge_plan_facts(features: FeatureSet) -> None:
+    """Reassign the plan-derived facts on the step's FeatureSet."""
+    features.implementation = ToyWorkerPythonDict
+    features.divergences = (Divergence(kind=DivergenceKind.VALUE, cause=Cause.BACKEND, reason="forged divergence"),)
+    features.allowed_variants = ("forged_variant",)
+    features.specialized_from = ("forged_parent",)
+    features.declared_input_feature_names = frozenset({"forged_input"})
+    features.declared_input_feature_edges = {"forged_output": ("forged_input",)}
+
+
+def _attempt(name: str, assign: Any) -> None:
+    try:
+        assign()
+    except Exception as exc:
+        _forge_outcomes[name] = type(exc)
+    else:
+        _forge_outcomes[name] = None
+
+
+class _ForgingFeatureGroup(DataCreatorFeatureGroup):
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"sealed_forge_col"}
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PythonDictFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        cfw = ComputeFramework.current()
+        assert cfw is not None
+
+        def forge_run_context() -> None:
+            cfw.run_context = RunContext(run_id=_FORGED_ID)
+
+        def forge_worker_index() -> None:
+            cfw.worker_index = 99
+
+        def forge_function_extender() -> None:
+            cfw.function_extender = set()
+
+        def forge_hook_extenders() -> None:
+            cfw._hook_extenders = {}
+
+        _attempt("run_context", forge_run_context)
+        _attempt("worker_index", forge_worker_index)
+        _attempt("function_extender", forge_function_extender)
+
+        def forge_calculate_context() -> None:
+            cfw._calculate_context = None
+
+        _attempt("_hook_extenders", forge_hook_extenders)
+        _attempt("_calculate_context", forge_calculate_context)
+        hook_table: Any = cfw._hook_extenders
+        function_extenders: Any = cfw.function_extender
+        _attempt("_hook_extenders.pop", lambda: hook_table.pop(ExtenderHook.VALIDATE_OUTPUT_FEATURE))
+        _attempt("_hook_extenders.clear", lambda: hook_table.clear())
+        _attempt("function_extender.clear", lambda: function_extenders.clear())
+        features.step_uuid = _FORGED_STEP_UUID
+        features.credential_handles = _FORGED_HANDLES
+        features.bound_credential_handle = _FORGED_BOUND
+        _forge_plan_facts(features)
+        features.features = {*features.features, Feature("sealed_forge_extra_forged")}
+        return {"sealed_forge_col": [1, 2, 3], "sealed_forge_extra_forged": [1, 2, 3]}
+
+
+class _HandleForgingFeatureGroup(_ForgingFeatureGroup):
+    """The forging group declaring a real credential handle."""
+
+    PROPERTY_MAPPING = {"forge_vault_handle": credential_handle_spec("Vault handle.")}
+
+
+class _ValidateForgingFeatureGroup(ChsConsumerFG):
+    """The consumer reassigning the per-step facts in validate_input_features, then loading a source."""
+
+    @classmethod
+    def validate_input_features(cls, data: Any, features: FeatureSet) -> None:
+        features.step_uuid = _FORGED_STEP_UUID
+        features.credential_handles = _FORGED_HANDLES
+        features.bound_credential_handle = _FORGED_BOUND
+        edges = features.declared_input_feature_edges
+        if edges is not None:
+            _attempt("edges", lambda: edges.__setitem__("forged_output", ("forged_input",)))
+        columns = features.declared_input_columns
+        if columns is not None:
+            _attempt("columns", lambda: columns.__setitem__("chs_consumer", ("missing_column",)))
+        run_parameters: Any = features.run_parameters
+        _attempt("run_parameters", lambda: run_parameters.__setitem__("forged_key", "forged"))
+        _forge_plan_facts(features)
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        _load(_DirectLoader, "access", features)
+        return super().calculate_feature(data, features)
+
+
+_PLAN_FIELDS = (
+    "implementation",
+    "divergences",
+    "allowed_variants",
+    "specialized_from",
+    "feature_names",
+    "input_features",
+    "input_feature_edges",
+)
+
+
+class _MultiHookCapturingExtender(Extender):
+    """Records the HookContext seen after CALCULATE and VALIDATE_OUTPUT hooks."""
+
+    def __init__(self) -> None:
+        self.priority = 100
+        self.captured: dict[ExtenderHook, HookContext] = {}
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, ExtenderHook.VALIDATE_OUTPUT_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        result = func(*args, **kwargs)
+        context = HookContext.current()
+        assert context is not None
+        self.captured[context.hook] = context
+        return result
+
+
+class _ValidateInputCapturingExtender(_MultiHookCapturingExtender):
+    """Also records the VALIDATE_INPUT_FEATURE and INPUT_DATA_LOAD contexts."""
+
+    def wraps(self) -> set[ExtenderHook]:
+        return super().wraps() | {ExtenderHook.VALIDATE_INPUT_FEATURE, ExtenderHook.INPUT_DATA_LOAD}
+
+
+class TestAttachedFrameworkIsSealedDuringARealRun:
+    def _run(
+        self,
+        mode: ParallelizationMode = ParallelizationMode.SYNC,
+        group: type[FeatureGroup] = _ForgingFeatureGroup,
+        options: dict[str, Any] | None = None,
+    ) -> _MultiHookCapturingExtender:
+        _forge_outcomes.clear()
+        extender = _MultiHookCapturingExtender()
+        collection: dict[str, Any] = {}
+        if options is not None:
+            collection["data_access_collection"] = DataAccessCollection(credentials={"vault-main": {"key": "forge-1"}})
+        mloda.run_all(
+            [Feature(name="sealed_forge_col", options=options or {})],
+            compute_frameworks=["PythonDictFramework"],
+            **collection,
+            plugin_collector=PluginCollector.enabled_feature_groups({group}),
+            parallelization_modes={mode},
+            function_extender={extender},
+        )
+        return extender
+
+    def test_feature_group_cannot_reassign_sealed_attributes(self) -> None:
+        self._run()
+
+        assert _forge_outcomes == {
+            "run_context": AttributeError,
+            "worker_index": AttributeError,
+            "function_extender": AttributeError,
+            "_hook_extenders": AttributeError,
+            "_hook_extenders.pop": TypeError,
+            "_hook_extenders.clear": TypeError,
+            "function_extender.clear": AttributeError,
+            "_calculate_context": AttributeError,
+        }
+
+    def test_later_hooks_keep_the_real_identity(self) -> None:
+        extender = self._run()
+
+        calculate = extender.captured[ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE]
+        validate = extender.captured[ExtenderHook.VALIDATE_OUTPUT_FEATURE]
+        assert calculate.run_id is not None
+        assert calculate.run_id != _FORGED_ID
+        assert validate.run_id == calculate.run_id
+        assert validate.worker_index == calculate.worker_index != 99
+        assert calculate.step_uuid is not None
+        assert validate.step_uuid == calculate.step_uuid
+
+    @pytest.mark.parametrize("mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING])
+    def test_later_hooks_keep_the_planned_step_facts(self, mode: ParallelizationMode) -> None:
+        extender = self._run(mode, _HandleForgingFeatureGroup, {"forge_vault_handle": "vault-main"})
+
+        calculate = extender.captured[ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE]
+        validate = extender.captured[ExtenderHook.VALIDATE_OUTPUT_FEATURE]
+        assert validate.credential_handles == ("vault-main",)
+        assert validate.step_uuid is not None
+        assert validate.step_uuid == calculate.step_uuid
+        assert validate.step_uuid != _FORGED_STEP_UUID
+        assert validate.bound_credential_handle is None
+        for field in _PLAN_FIELDS:
+            assert getattr(validate, field) == getattr(calculate, field), field
+        assert validate.implementation is None
+        assert validate.divergences == ()
+        assert validate.allowed_variants == ()
+        assert validate.specialized_from == ()
+        assert validate.feature_names == ("sealed_forge_col",)
+        assert validate.input_features is None
+        assert validate.input_feature_edges is None
+
+    def test_validate_input_features_reassignment_does_not_reach_later_hooks(self) -> None:
+        extender = _ValidateInputCapturingExtender()
+        _forge_outcomes.clear()
+
+        mloda.run_all(
+            [Feature("chs_consumer", options={HANDLE_KEY: "vault-main"})],
+            compute_frameworks=[PandasDataFrame],
+            data_access_collection=DataAccessCollection(credentials={"vault-main": {"key": "forge-2"}}),
+            plugin_collector=PluginCollector.enabled_feature_groups({ChsRawSecretFG, _ValidateForgingFeatureGroup}),
+            parallelization_modes={ParallelizationMode.SYNC},
+            function_extender={extender},
+        )
+
+        assert _forge_outcomes["edges"] is TypeError
+        assert _forge_outcomes["columns"] is TypeError
+        assert _forge_outcomes["run_parameters"] is TypeError
+        forging_name = _ValidateForgingFeatureGroup.__qualname__
+        planned = extender.captured[ExtenderHook.VALIDATE_INPUT_FEATURE]
+        assert planned.feature_group_class is not None
+        assert planned.feature_group_class.endswith(forging_name)
+        assert planned.credential_handles == ("vault-main",)
+        for hook in (
+            ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+            ExtenderHook.VALIDATE_OUTPUT_FEATURE,
+            ExtenderHook.INPUT_DATA_LOAD,
+        ):
+            later = extender.captured[hook]
+            if hook != ExtenderHook.INPUT_DATA_LOAD:
+                assert later.feature_group_class is not None
+                assert later.feature_group_class.endswith(forging_name)
+            assert later.step_uuid == planned.step_uuid != _FORGED_STEP_UUID
+            assert later.credential_handles == planned.credential_handles != _FORGED_HANDLES
+            assert later.bound_credential_handle == planned.bound_credential_handle != _FORGED_BOUND
+            for field in _PLAN_FIELDS:
+                assert getattr(later, field) == getattr(planned, field), (hook, field)
+
+    def test_prepared_session_keeps_its_extenders_across_runs(self) -> None:
+        extender = _MultiHookCapturingExtender()
+        session = mloda.prepare(
+            [Feature(name="sealed_forge_col")],
+            compute_frameworks=["PythonDictFramework"],
+            plugin_collector=PluginCollector.enabled_feature_groups({_ForgingFeatureGroup}),
+            parallelization_modes={ParallelizationMode.SYNC},
+            function_extender={extender},
+        )
+        session.run()
+        first_uuid = extender.captured[ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE].step_uuid
+        extender.captured.clear()
+        _forge_outcomes.clear()
+
+        session.run()
+
+        assert ExtenderHook.VALIDATE_OUTPUT_FEATURE in extender.captured
+        second_uuid = extender.captured[ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE].step_uuid
+        assert first_uuid is not None
+        assert second_uuid == first_uuid
+
+    def test_prepared_session_declared_input_columns_survive_forging_across_runs(self) -> None:
+        session = mloda.prepare(
+            [Feature("chs_consumer", options={HANDLE_KEY: "vault-main"})],
+            compute_frameworks=[PandasDataFrame],
+            data_access_collection=DataAccessCollection(credentials={"vault-main": {"key": "forge-2"}}),
+            plugin_collector=PluginCollector.enabled_feature_groups({ChsRawSecretFG, _ValidateForgingFeatureGroup}),
+            parallelization_modes={ParallelizationMode.SYNC},
+        )
+        for _ in range(2):
+            _forge_outcomes.clear()
+            results = session.run()
+            assert results
+            assert _forge_outcomes["columns"] is TypeError
+
+
+class TestImplementationIdentityOnCalculateFeature:
+    """Source group and operation group steps carry the implementation and version; plain groups leave both None."""
+
+    def _calculate_context(self, column: str, group: type, dac: Any) -> HookContext:
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        mloda.run_all(
+            [column],
+            compute_frameworks=["PythonDictFramework"],
+            plugin_collector=PluginCollector.enabled_feature_groups({group}),
+            data_access_collection=dac,
+            parallelization_modes={ParallelizationMode.SYNC},
+            function_extender={extender},
+        )
+        assert extender.captured is not None
+        return extender.captured
+
+    def test_implementation_step_carries_path_and_version(self) -> None:
+        context = self._calculate_context(WORKER_COLUMN, ToyWorkerFG, toy_dac(h1={WORKER_COLUMN: [1, 2]}))
+
+        assert context.implementation == f"{ToyWorkerPythonDict.__module__}:{ToyWorkerPythonDict.__qualname__}"
+        assert context.implementation_version == ToyWorkerPythonDict.version()
+
+    def test_neutral_step_is_marked_neutral_without_a_version(self, tmp_path: Path) -> None:
+        group = neutral_csv_group(tmp_path / "n.csv")
+
+        context = self._calculate_context("toyfmt_audit", group, toy_dac(h1={"toyfmt_audit": [1, 2]}))
+
+        assert context.implementation == "neutral"
+        assert context.implementation_version is None
+
+    def test_plain_group_step_has_neither(self) -> None:
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        cfw = _build_framework({extender})
+
+        cfw.run_calculate_feature(_CalcFeatureGroup, _build_feature_set())
+
+        assert extender.captured is not None
+        assert extender.captured.implementation is None
+        assert extender.captured.implementation_version is None
+        assert extender.captured.divergences == ()
+        assert extender.captured.contract_version is None
+        assert extender.captured.allowed_variants == ()
+
+    @pytest.mark.parametrize(
+        "framework_name, impl_name", [("PandasDataFrame", "OpToyPandas"), ("PyArrowTable", "OpToyPyArrow")]
+    )
+    def test_operation_step_carries_path_and_version(self, framework_name: str, impl_name: str) -> None:
+        toy = importlib.import_module(
+            "tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_operation_group"
+        )
+        impl: Any = getattr(toy, impl_name)
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        validate_output = _ContextCapturingExtender(ExtenderHook.VALIDATE_OUTPUT_FEATURE)
+
+        mloda.run_all(
+            [Feature(toy.OPTOY_FEATURE, {toy.OPTOY_KEY: "sum"}, compute_framework=framework_name)],
+            compute_frameworks=["PandasDataFrame", "PyArrowTable"],
+            plugin_collector=PluginCollector.enabled_feature_groups({toy.OpToyFG}),
+            parallelization_modes={ParallelizationMode.SYNC},
+            function_extender={extender, validate_output},
+        )
+
+        assert extender.captured is not None
+        assert extender.captured.feature_group_class == f"{toy.OpToyFG.__module__}.{toy.OpToyFG.__qualname__}"
+        assert extender.captured.implementation == f"{impl.__module__}:{impl.__qualname__}"
+        assert extender.captured.implementation_version == impl.version()
+        assert validate_output.captured is not None
+        assert validate_output.captured.implementation == extender.captured.implementation
+        assert validate_output.captured.implementation_version == extender.captured.implementation_version
+        group_only = [("feature_group", None, "group returns floats")]
+        expected = group_only + (
+            [("implementation", "PandasDataFrame", "skips NaN in sum")] if framework_name == "PandasDataFrame" else []
+        )
+        for captured in (extender.captured, validate_output.captured):
+            assert captured.contract_version == 3
+            assert sorted(
+                (r.source.value if r.source else None, r.framework, r.reason) for r in captured.divergences
+            ) == sorted(expected)
+
+    @pytest.mark.parametrize("allow", [None, "skip_nan"], ids=["not_allowed", "allowed"])
+    def test_operation_step_carries_the_allowed_variants(self, allow: str | None) -> None:
+        toy = importlib.import_module(
+            "tests.test_core.test_abstract_plugins.test_components.test_input_data.toy_operation_group"
+        )
+        options: dict[str, Any] = {toy.OPTOY_KEY: "sum"}
+        if allow is not None:
+            options["allow_variants"] = allow
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+
+        mloda.run_all(
+            [Feature(toy.OPTOY_VARIANT_FEATURE, options)],
+            compute_frameworks=["PandasDataFrame", "PyArrowTable"],
+            plugin_collector=PluginCollector.enabled_feature_groups({toy.OpToyVariantFG}),
+            parallelization_modes={ParallelizationMode.SYNC},
+            function_extender={extender},
+        )
+
+        assert extender.captured is not None
+        assert extender.captured.allowed_variants == (() if allow is None else ("skip_nan",))
+
+
+class TestHookContextCredentialHandles:
+    """Every compute-step hook context carries the step's declared credential handles."""
+
+    @pytest.mark.parametrize(
+        "hook",
+        [
+            ExtenderHook.VALIDATE_INPUT_FEATURE,
+            ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+            ExtenderHook.VALIDATE_OUTPUT_FEATURE,
+        ],
+    )
+    def test_the_declared_handles_reach_the_context(self, hook: ExtenderHook) -> None:
+        extender = _ContextCapturingExtender(hook)
+
+        mloda.run_all(
+            [Feature("chs_consumer", options={HANDLE_KEY: "vault-main"})],
+            compute_frameworks=[PandasDataFrame],
+            data_access_collection=DataAccessCollection(credentials={"vault-main": {"key": "chs-wiring-1"}}),
+            plugin_collector=PluginCollector.enabled_feature_groups({ChsRawSecretFG, ChsConsumerFG}),
+            parallelization_modes={ParallelizationMode.SYNC},
+            function_extender={extender},
+        )
+
+        assert extender.captured is not None
+        assert extender.captured.credential_handles == ("vault-main",)
+        assert extender.captured.credentials_read == ()
+
+    def test_a_hand_built_context_defaults_to_no_handles(self) -> None:
+        context = HookContext(
+            hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+            feature_group_class=None,
+            feature_group_version=None,
+            compute_framework_name=None,
+        )
+
+        assert context.credential_handles == ()
+
+    def test_a_step_without_handles_has_an_empty_tuple(self) -> None:
+        extender = _ContextCapturingExtender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+
+        _build_framework({extender}).run_calculate_feature(_CalcFeatureGroup, _build_feature_set())
+
+        assert extender.captured is not None
+        assert extender.captured.credential_handles == ()
+
+
+class TestHookContextBoundCredentialHandle:
+    """A database source step reports the handle of the credential its match binds."""
+
+    _HOOKS = [
+        ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+        ExtenderHook.VALIDATE_OUTPUT_FEATURE,
+    ]
+
+    def _run(
+        self,
+        hook: ExtenderHook,
+        dac: DataAccessCollection | None,
+        options: dict[str, Any],
+        group: type[FeatureGroup] = SqliteFG,
+        extender: _ContextCapturingExtender | None = None,
+        extra_features: list[Feature] | None = None,
+        extra_groups: set[type[FeatureGroup]] | None = None,
+    ) -> HookContext | None:
+        extender = extender or _ContextCapturingExtender(hook)
+        mloda.run_all(
+            [Feature("bound_col", options=options), *(extra_features or [])],
+            compute_frameworks=[PyArrowTable, PandasDataFrame],
+            data_access_collection=dac,
+            plugin_collector=PluginCollector.enabled_feature_groups({group, *(extra_groups or set())}),
+            parallelization_modes={ParallelizationMode.SYNC},
+            function_extender={extender},
+        )
+        return extender.captured
+
+    @pytest.mark.parametrize("hook", _HOOKS)
+    @pytest.mark.parametrize("kind", BOUND_KINDS)
+    def test_the_bound_handle_reaches_the_context(self, tmp_path: Path, hook: ExtenderHook, kind: str) -> None:
+        dac, options, expected = bound_case(tmp_path, kind)
+
+        captured = self._run(hook, dac, options)
+
+        assert captured is not None
+        assert captured.credential_handles == expected
+        assert captured.bound_credential_handle == expected[0]
+        assert captured.credentials_read == ()
+
+    @pytest.mark.parametrize("hook", _HOOKS)
+    def test_a_file_source_keeps_no_handles(self, tmp_path: Path, hook: ExtenderHook) -> None:
+        captured = self._run(hook, csv_file_source(tmp_path), {}, CsvFG)
+
+        assert captured is not None
+        assert captured.credential_handles == ()
+        assert captured.bound_credential_handle is None
+
+    @pytest.mark.parametrize("hook", _HOOKS)
+    @pytest.mark.parametrize(
+        ("declared", "expected"),
+        [("db-main", ("db-main",)), ("zz-vault", ("db-main", "zz-vault")), ("aa-vault", ("aa-vault", "db-main"))],
+    )
+    def test_a_handle_declared_and_bound_is_listed_once(
+        self, tmp_path: Path, hook: ExtenderHook, declared: str, expected: tuple[str, ...]
+    ) -> None:
+        dac, _, _ = bound_case(tmp_path, "named")
+        assert dac is not None
+        if declared != "db-main":
+            dac = dac.with_credentials({declared: {"token": "hook-sort-token"}})  # nosec B105
+
+        class _BoundHandleSqliteFG(SqliteFG):
+            PROPERTY_MAPPING = {"bound_vault_handle": credential_handle_spec("Vault handle.")}
+
+        captured = self._run(hook, dac, {"bound_vault_handle": declared}, _BoundHandleSqliteFG)
+
+        assert captured is not None
+        assert captured.credential_handles == expected
+        assert captured.bound_credential_handle == "db-main"
+
+    @pytest.mark.parametrize("kind", ["bound-only", "declared-unread", "declared-and-bound", "cross-step"])
+    def test_an_unused_credentials_extender_flags_only_declared_unread_handles(self, tmp_path: Path, kind: str) -> None:
+        credentials: dict[str, Any] = {"db-main": {"sqlite": str(write_bound_sqlite(tmp_path))}}
+
+        class _DeclaredSqliteFG(SqliteFG):
+            PROPERTY_MAPPING = {"unused_vault_handle": credential_handle_spec("Vault handle.")}
+
+        class _BoundHandleSqliteFG(SqliteFG):
+            PROPERTY_MAPPING = {"bound_vault_handle": credential_handle_spec("Vault handle.")}
+
+        def name(group: type[FeatureGroup]) -> str:
+            return f"{group.__module__}.{group.__qualname__}"
+
+        group: type[FeatureGroup] = SqliteFG
+        options: dict[str, Any] = {}
+        extra: list[Feature] = []
+        extra_groups: set[type[FeatureGroup]] = set()
+        expected: set[tuple[str, str]] = set()
+        if kind == "declared-unread":
+            group, options = _DeclaredSqliteFG, {"unused_vault_handle": "vault-x"}
+            credentials["vault-x"] = {"key": "k"}
+            expected = {(name(_DeclaredSqliteFG), "vault-x")}
+        elif kind == "declared-and-bound":
+            group, options = _BoundHandleSqliteFG, {"bound_vault_handle": "db-main"}
+        elif kind == "cross-step":
+            extra = [Feature("chs_vault_a", options={HANDLE_KEY: "db-main"})]
+            extra_groups = {ChsVaultFG}
+            expected = {(name(ChsVaultFG), "db-main")}
+
+        extender = _UnusedCredentials()
+        self._run(
+            ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+            DataAccessCollection(credentials=credentials),
+            options,
+            group,
+            extender,
+            extra,
+            extra_groups,
+        )
+
+        assert extender.contexts
+        assert extender.unused() == expected

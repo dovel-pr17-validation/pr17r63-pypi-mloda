@@ -1,0 +1,259 @@
+"""Regression guards for the compute-framework-neutral file seam, then the format x framework matrix.
+
+Reading a CSV via ``run_all`` yields the requested columns on PyArrowTable, PandasDataFrame and PolarsDataFrame;
+the matrix classes below cover every stock source group per framework. No backend objects are built at import,
+class or parametrize time.
+"""
+
+from __future__ import annotations
+
+import csv
+import importlib
+import os
+import tempfile
+from collections.abc import Collection, Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from mloda.provider import ReadFileFG
+from mloda.user import DataAccessCollection, mloda
+from mloda._testing.framework_adapter import (
+    DuckDBAdapter,
+    IcebergAdapter,
+    PandasAdapter,
+    PolarsAdapter,
+    PolarsLazyAdapter,
+    PyArrowAdapter,
+    PythonDictAdapter,
+    SqliteAdapter,
+)
+from mloda._testing.source.loads_into_framework_suite import FileLoaderNameTestMixin, FileLoadsIntoFrameworkTestMixin
+from tests.mixins.reader_feature_groups.format_file_writers import (
+    write_csv,
+    write_feather,
+    write_json,
+    write_orc,
+    write_parquet,
+)
+from tests.mixins.reader_feature_groups.lazy_source_group import lazy_group
+
+
+@pytest.fixture(autouse=True)
+def _stock_sources_loaded() -> None:
+    importlib.import_module("mloda_plugins.feature_group.input_data.stock_sources")
+    importlib.import_module("mloda_plugins.compute_framework.base_implementations.pyarrow.table")
+    importlib.import_module("mloda_plugins.compute_framework.base_implementations.pandas.dataframe")
+
+
+@pytest.fixture()
+def csv_path() -> Iterator[str]:
+    fd, path = tempfile.mkstemp(suffix=".csv")
+    os.close(fd)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["A", "B"])
+        writer.writerow(["1", "3"])
+        writer.writerow(["2", "4"])
+    yield path
+    os.remove(path)
+
+
+def test_csv_reads_into_pyarrow_table(csv_path: str) -> None:
+    """FileSource -> pa.Table direct path: PyArrowTable still returns A and B."""
+    result = mloda.run_all(
+        ["A", "B"],
+        compute_frameworks=["PyArrowTable"],
+        data_access_collection=DataAccessCollection(files={csv_path}),
+    )
+    columns = result[0].to_pydict()
+    assert "A" in columns
+    assert "B" in columns
+
+
+def test_csv_reads_into_pandas_dataframe(csv_path: str) -> None:
+    """FileSource -> pa.Table -> pandas chained path: PandasDataFrame still returns A and B."""
+    result = mloda.run_all(
+        ["A", "B"],
+        compute_frameworks=["PandasDataFrame"],
+        data_access_collection=DataAccessCollection(files={csv_path}),
+    )
+    columns: Any = list(result[0].columns)
+    assert "A" in columns
+    assert "B" in columns
+
+
+def test_csv_reads_into_polars_dataframe(csv_path: str) -> None:
+    """FileSource -> pa.Table -> polars chained path: PolarsDataFrame still returns A and B."""
+    pytest.importorskip("polars")
+    importlib.import_module("mloda_plugins.compute_framework.base_implementations.polars.dataframe")
+    result = mloda.run_all(
+        ["A", "B"],
+        compute_frameworks=["PolarsDataFrame"],
+        data_access_collection=DataAccessCollection(files={csv_path}),
+    )
+    columns: Any = list(result[0].columns)
+    assert "A" in columns
+    assert "B" in columns
+
+
+def test_csv_pointer_runs_under_duckdb_with_a_dac_connection(csv_path: str) -> None:
+    """The CsvFG pointer is a path, never a connection; the DuckDB connection comes from the DataAccessCollection."""
+    duckdb = pytest.importorskip("duckdb")
+    importlib.import_module("mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_framework")
+    from mloda.user import Feature, PluginCollector
+    from mloda_plugins.feature_group.input_data.file_formats.csv_fg import CsvFG
+    from tests.helpers.frame_records import records_from_frame
+
+    conn = duckdb.connect()
+    try:
+        result = mloda.run_all(
+            [Feature("A", options={"CsvFG": csv_path}), Feature("B", options={"CsvFG": csv_path})],
+            compute_frameworks=["DuckDBFramework"],
+            plugin_collector=PluginCollector.enabled_feature_groups({CsvFG}),
+            data_access_collection=DataAccessCollection(connections={"warehouse": conn}),
+        )
+
+        rows = sorted((int(r["A"]), int(r["B"])) for r in records_from_frame(result[0]))
+        assert rows == [(1, 3), (2, 4)]
+    finally:
+        conn.close()
+
+
+class _CsvFiles:
+    feature_group_class = lazy_group("csv_fg", "CsvFG")
+
+    def write_file(self, path: Path, columns: dict[str, list[Any]]) -> None:
+        write_csv(path, columns)
+
+
+class _ParquetFiles:
+    feature_group_class = lazy_group("parquet_fg", "ParquetFG")
+
+    def write_file(self, path: Path, columns: dict[str, list[Any]]) -> None:
+        write_parquet(path, columns)
+
+
+class _JsonFiles:
+    feature_group_class = lazy_group("json_fg", "JsonFG")
+
+    def write_file(self, path: Path, columns: dict[str, list[Any]]) -> None:
+        write_json(path, columns)
+
+
+class _FeatherFiles:
+    feature_group_class = lazy_group("feather_fg", "FeatherFG")
+
+    def write_file(self, path: Path, columns: dict[str, list[Any]]) -> None:
+        write_feather(path, columns)
+
+
+class _OrcFiles:
+    feature_group_class = lazy_group("orc_fg", "OrcFG")
+
+    def write_file(self, path: Path, columns: dict[str, list[Any]]) -> None:
+        write_orc(path, columns)
+
+
+class _DefaultNeutralParquetFG(ReadFileFG):
+    """A third-party style Parquet group that keeps the default FileSource ``load_neutral``."""
+
+    @classmethod
+    def suffixes(cls) -> tuple[str, ...]:
+        return (".dnparquet",)
+
+    @classmethod
+    def file_format(cls) -> str:
+        return "parquet"
+
+    @classmethod
+    def column_names(cls, path: str) -> Collection[str]:
+        import pyarrow.parquet as pyarrow_parquet
+
+        return list(pyarrow_parquet.read_schema(path).names)
+
+
+class _DefaultNeutralParquetFiles:
+    feature_group_class: type[ReadFileFG] = _DefaultNeutralParquetFG
+
+    def write_file(self, path: Path, columns: dict[str, list[Any]]) -> None:
+        write_parquet(path, columns)
+
+
+class TestDefaultNeutralParquetIntoPythonDict(_DefaultNeutralParquetFiles, FileLoadsIntoFrameworkTestMixin):
+    adapter_class = PythonDictAdapter
+
+
+class TestCsvIntoPyArrowTable(_CsvFiles, FileLoaderNameTestMixin):
+    adapter_class = PyArrowAdapter
+    expected_loader = "mloda_plugins.feature_group.input_data.file_formats.csv_fg:CsvPyArrowTable"
+
+
+class TestCsvIntoPandasDataFrame(_CsvFiles, FileLoaderNameTestMixin):
+    adapter_class = PandasAdapter
+    expected_loader = "neutral"
+
+
+class TestCsvIntoPolarsDataFrame(_CsvFiles, FileLoadsIntoFrameworkTestMixin):
+    adapter_class = PolarsAdapter
+
+
+class TestCsvIntoPythonDict(_CsvFiles, FileLoadsIntoFrameworkTestMixin):
+    adapter_class = PythonDictAdapter
+
+
+class TestCsvIntoDuckDB(_CsvFiles, FileLoadsIntoFrameworkTestMixin):
+    adapter_class = DuckDBAdapter
+
+
+class TestCsvIntoSqlite(_CsvFiles, FileLoadsIntoFrameworkTestMixin):
+    adapter_class = SqliteAdapter
+
+
+class TestCsvIntoIceberg(_CsvFiles, FileLoadsIntoFrameworkTestMixin):
+    adapter_class = IcebergAdapter
+
+
+class TestCsvIntoPolarsLazy(_CsvFiles, FileLoadsIntoFrameworkTestMixin):
+    adapter_class = PolarsLazyAdapter
+
+
+class TestParquetIntoPyArrowTable(_ParquetFiles, FileLoaderNameTestMixin):
+    adapter_class = PyArrowAdapter
+    expected_loader = "mloda_plugins.feature_group.input_data.file_formats.parquet_fg:ParquetPyArrowTable"
+
+
+class TestParquetIntoPandasDataFrame(_ParquetFiles, FileLoaderNameTestMixin):
+    adapter_class = PandasAdapter
+    expected_loader = "neutral"
+
+
+class TestJsonIntoPyArrowTable(_JsonFiles, FileLoaderNameTestMixin):
+    adapter_class = PyArrowAdapter
+    expected_loader = "mloda_plugins.feature_group.input_data.file_formats.json_fg:JsonPyArrowTable"
+
+
+class TestJsonIntoPandasDataFrame(_JsonFiles, FileLoaderNameTestMixin):
+    adapter_class = PandasAdapter
+    expected_loader = "neutral"
+
+
+class TestFeatherIntoPyArrowTable(_FeatherFiles, FileLoaderNameTestMixin):
+    adapter_class = PyArrowAdapter
+    expected_loader = "mloda_plugins.feature_group.input_data.file_formats.feather_fg:FeatherPyArrowTable"
+
+
+class TestFeatherIntoPandasDataFrame(_FeatherFiles, FileLoaderNameTestMixin):
+    adapter_class = PandasAdapter
+    expected_loader = "neutral"
+
+
+class TestOrcIntoPyArrowTable(_OrcFiles, FileLoaderNameTestMixin):
+    adapter_class = PyArrowAdapter
+    expected_loader = "mloda_plugins.feature_group.input_data.file_formats.orc_fg:OrcPyArrowTable"
+
+
+class TestOrcIntoPandasDataFrame(_OrcFiles, FileLoaderNameTestMixin):
+    adapter_class = PandasAdapter
+    expected_loader = "neutral"

@@ -1,0 +1,145 @@
+"""ApiDataFG against the shared SourceFeatureGroup contract; tests it diverges from are redefined on the host."""
+
+from typing import Any, cast
+
+import pytest
+
+from mloda._testing.source.source_suite import MatchRefuseAll, SourceFeatureGroupTestMixin, _spy
+from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+from mloda.core.abstract_plugins.components.input_data.source_feature_group import HANDLE_OPTION
+from mloda.core.abstract_plugins.components.match_rejection import CoreDeclineCode
+from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
+from mloda.core.prepare.identify_feature_group import FeatureResolutionError, IdentifyFeatureGroupClass
+from mloda.provider import ApiDataFG, Cause, SourceFeatureGroup
+from mloda.steward import ReaderProbeScope, reader_probe_scope
+from mloda.user import Feature
+
+_TWO_SETS = {"k": ("api_col",), "k2": ("other_col",)}
+
+
+class TestApiDataFGContract(SourceFeatureGroupTestMixin):
+    feature_group_class: type[SourceFeatureGroup] = ApiDataFG
+    present_column = "api_col"
+    missing_column = "api_missing"
+    expected_source = "api_data:k"
+    switched_off = {
+        "test_a_refusing_input_data_match_gate_keeps_the_source_untouched_and_reports_the_reason": Cause.OTHER,
+        "test_pointed_with_a_missing_column_aborts_naming_source_and_columns": Cause.OTHER,
+        "test_a_typo_of_a_known_column_suggests_it_only_where_the_columns_are_shown": Cause.OTHER,
+        "test_a_subclass_takes_over_a_pointer_keyed_on_its_parent": Cause.OTHER,
+    }
+
+    def own_dac(self) -> DataAccessCollection:
+        return DataAccessCollection().with_api_data_columns({"k": ("api_col",)})
+
+    def foreign_dac(self) -> DataAccessCollection:
+        dac = DataAccessCollection()
+        dac.add_file("foreign_file", "foreign.csv")
+        return dac
+
+    def own_pointer(self) -> Any:
+        return "k"
+
+    # A pointer must name a set in the collection; the second-set case is test_a_pointer_resolves_against_the_collections_sets.
+    def other_pointer(self) -> tuple[Any, str]:
+        return "k", "api_data:k"
+
+    def run_all_kwargs(self) -> dict[str, Any]:
+        return {"api_data": {"k": {"api_col": [1, 2]}}}
+
+    def _pointed(self, name: str, key: Any = "k") -> Feature:
+        return self._feature(name, {self._group_name(): key})
+
+    # Diverges: a column named in a set counts as pointed, so a refusal aborts resolution instead of declining.
+    def test_a_refusing_input_data_match_gate_keeps_the_source_untouched_and_reports_the_reason(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        touched: list[str] = []
+        for name in ("find_sources", "columns", "has_column"):
+            monkeypatch.setattr(ApiDataFG, name, _spy(name, getattr(ApiDataFG, name), touched))
+
+        with reader_probe_scope(ReaderProbeScope(MatchRefuseAll(), None, None, None, None)):
+            with pytest.raises(FeatureResolutionError) as exc_info:
+                self._evaluate(self._own_feature(), self.own_dac())
+
+        assert touched == []
+        elimination = exc_info.value.result.eliminations[ApiDataFG]
+        assert "refused at INPUT_DATA_MATCH" in elimination.reason
+        assert "no clearance" in elimination.reason
+        assert elimination.code is CoreDeclineCode.EXTENDER_REFUSED
+
+    # data_access_handle is not an ApiDataFG option, so any handle value is ignored.
+    @pytest.mark.parametrize("handle", ["unknown_handle_for_suite", "foreign_file", ["own_handle"]])
+    def test_any_handle_value_is_ignored_and_the_own_source_is_claimed(self, handle: Any) -> None:
+        feature = Feature(self.present_column, self._options(context={HANDLE_OPTION: handle}))
+        assert self._claims(feature, self.own_dac())
+        assert self._claimed_match(feature).source == self.expected_source
+
+    # Diverges: the pointer names a set that must be in the collection, so it resolves against own_dac.
+    def test_pointed_with_a_missing_column_aborts_naming_source_and_columns(self) -> None:
+        with pytest.raises(FeatureResolutionError) as exc_info:
+            self._resolve(self._pointed(self.missing_column), self.own_dac())
+        message = str(exc_info.value)
+        assert self.expected_source in message
+        assert self.present_column in message
+        assert exc_info.value.result.eliminations[ApiDataFG].code is CoreDeclineCode.COLUMN_NOT_FOUND
+
+    # An unpointed missing column names the source but does not show the columns, even with an undeclared str handle.
+    @pytest.mark.parametrize("handle", [None, "k"])
+    def test_an_unpointed_missing_column_names_the_source_and_hides_the_columns(self, handle: str | None) -> None:
+        feature = (
+            Feature(self.missing_column)
+            if handle is None
+            else Feature(self.missing_column, self._options(context={HANDLE_OPTION: handle}))
+        )
+        unpointed = self._evaluate(feature, self.own_dac())
+        reason = unpointed.eliminations[ApiDataFG].reason
+        assert self.expected_source in reason
+        assert self.present_column not in reason
+
+    # Diverges: a pointed typo is checked against the collection's set, and no handle narrows.
+    def test_a_typo_of_a_known_column_suggests_it_only_where_the_columns_are_shown(self) -> None:
+        typo = f"{self.present_column}x"
+        with pytest.raises(ValueError) as exc_info:
+            self._resolve(self._pointed(typo), self.own_dac())
+        assert f"did you mean '{self.present_column}'?" in str(exc_info.value)
+
+        unpointed = self._evaluate(Feature(typo), self.own_dac())
+        assert "did you mean" not in unpointed.eliminations[ApiDataFG].reason
+
+    # Diverges: the pointed set must be in the collection, so the takeover is evaluated with own_dac.
+    def test_a_subclass_takes_over_a_pointer_keyed_on_its_parent(self) -> None:
+        sub = self._gated_subclass()
+        mapping: FeatureGroupEnvironmentMapping = {cast(type[SourceFeatureGroup], sub): {self.load_framework}}
+        feature = self._feature(self.present_column, {ApiDataFG.__name__: "k"})
+        result = IdentifyFeatureGroupClass.evaluate(feature, mapping, None, self.own_dac())
+        assert sub in result.identified
+        del sub, mapping, result, feature
+
+    def test_a_pointer_resolves_against_the_collections_sets(self) -> None:
+        dac = DataAccessCollection().with_api_data_columns(_TWO_SETS)
+        feature = self._pointed("other_col", "k2")
+        assert self._claims(feature, dac)
+        assert self._claimed_match(feature).source == "api_data:k2"
+
+    def test_two_sets_sharing_a_column_abort_pointing_at_the_group_without_undeclared_options(self) -> None:
+        dac = DataAccessCollection().with_api_data_columns({"k": ("api_col",), "k2": ("api_col",)})
+        with pytest.raises(ValueError) as exc_info:
+            self._resolve(Feature(self.present_column), dac)
+        message = str(exc_info.value)
+        assert "point ApiDataFG at one source" in message
+        assert "data_access_handle" not in message
+        assert "column_to_file" not in message
+
+    def test_an_unknown_pointer_key_aborts_naming_the_known_keys(self) -> None:
+        dac = DataAccessCollection().with_api_data_columns(_TWO_SETS)
+        with pytest.raises(FeatureResolutionError) as exc_info:
+            self._resolve(self._pointed(self.present_column, "nope"), dac)
+        message = str(exc_info.value)
+        assert "nope" in message
+        assert "['k', 'k2']" in message
+        assert exc_info.value.result.eliminations[ApiDataFG].code is CoreDeclineCode.HANDLE_UNKNOWN
+
+    def test_a_pointer_with_no_collection_aborts_with_no_known_keys(self) -> None:
+        with pytest.raises(FeatureResolutionError, match="known keys: \\[\\]"):
+            self._resolve(self._pointed(self.present_column), None)

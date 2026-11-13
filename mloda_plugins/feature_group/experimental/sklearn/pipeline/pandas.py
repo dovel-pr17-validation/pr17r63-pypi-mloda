@@ -1,0 +1,131 @@
+"""
+Pandas implementation for scikit-learn pipeline feature groups.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from mloda.provider import ComputeFramework, FeatureGroup, FeatureSet, Implementation
+
+from mloda.user.pandas import PandasDataFrame
+from mloda_plugins.feature_group.experimental.sklearn.pipeline.base import SklearnPipelineFeatureGroup
+
+
+class PandasSklearnPipeline(Implementation[SklearnPipelineFeatureGroup]):
+    """
+    Pandas implementation for scikit-learn pipeline feature groups.
+
+    This implementation works with pandas DataFrames and provides seamless
+    integration between mloda's pandas compute framework and scikit-learn pipelines.
+    """
+
+    feature_group = SklearnPipelineFeatureGroup
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def calculate(
+        cls,
+        group: type[SklearnPipelineFeatureGroup],
+        data: Any,
+        features: FeatureSet,
+        framework: ComputeFramework | None,
+    ) -> Any:
+        return group.run_pipeline(
+            data,
+            features,
+            training_data=cls._extract_training_data,
+            apply=cls._apply_pipeline,
+            add_column=cls._add_result_to_data,
+        )
+
+    @classmethod
+    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
+        """Add the result to the DataFrame."""
+        # Handle different result types from sklearn pipelines
+        if hasattr(result, "shape") and len(result.shape) == 2:
+            # Multi-dimensional result (e.g., from PCA, multiple features)
+            if result.shape[1] == 1:
+                # Single column result
+                data[feature_name] = result.flatten()
+            else:
+                # Multiple columns - use naming convention with ~ separator
+                named_columns = FeatureGroup.apply_naming_convention(result, feature_name)
+                for col_name, col_data in named_columns.items():
+                    data[col_name] = col_data
+        elif hasattr(result, "shape") and len(result.shape) == 1:
+            # Single dimensional result
+            data[feature_name] = result
+        else:
+            # Scalar or other result type
+            data[feature_name] = result
+
+        return data
+
+    @classmethod
+    def _extract_training_data(cls, data: Any, source_features: list[Any]) -> Any:
+        """
+        Extract training data for the specified features from pandas DataFrame.
+
+        Args:
+            data: The pandas DataFrame
+            source_features: List of source feature names
+
+        Returns:
+            Training data as numpy array for sklearn
+        """
+        # Extract the specified columns
+        feature_data = data[source_features]
+
+        # Handle missing values by dropping rows with NaN
+        # This is a simple strategy - more sophisticated handling could be added
+        feature_data = feature_data.dropna()
+        if len(feature_data) == 0:
+            raise ValueError("Cannot fit sklearn pipeline on zero rows (no complete rows) without a fitted artifact.")
+
+        # Convert to numpy array for sklearn
+        return feature_data.values
+
+    @classmethod
+    def _apply_pipeline(cls, data: Any, source_features: list[Any], fitted_pipeline: Any) -> Any:
+        """
+        Apply the fitted pipeline to the pandas DataFrame.
+
+        Args:
+            data: The pandas DataFrame
+            source_features: List of source feature names
+            fitted_pipeline: The fitted sklearn pipeline
+
+        Returns:
+            Transformed data as numpy array
+        """
+        # Extract the specified columns
+        feature_data = data[source_features]
+
+        # Handle missing values - for prediction, we need to handle them differently
+        # than during training. Here we'll use simple forward fill and backward fill
+        feature_data = feature_data.ffill().bfill()
+
+        # If there are still NaN values, fill with 0 (this is a simple strategy)
+        feature_data = feature_data.fillna(0)
+
+        # Convert to numpy array and apply pipeline
+        X = feature_data.values
+        if X.shape[0] == 0:
+            if feature_data.select_dtypes(include=["number", "bool"]).shape[1] != feature_data.shape[1]:
+                raise ValueError("Cannot apply sklearn pipeline to zero rows of non-numeric sources.")
+
+            # Probe one all-zero row for fitted width and dtype, then all-ones if rejected; slice to zero rows.
+            first_error: ValueError | None = None
+            for fill in (0, 1):
+                try:
+                    return fitted_pipeline.transform(feature_data.reindex(range(1), fill_value=fill).values)[:0]
+                except ValueError as error:
+                    first_error = first_error or error
+            raise ValueError(
+                "Cannot apply sklearn pipeline to zero rows: "
+                f"the fitted pipeline rejects the all-zero and all-ones probe rows: {first_error}"
+            ) from first_error
+        result = fitted_pipeline.transform(X)
+
+        return result

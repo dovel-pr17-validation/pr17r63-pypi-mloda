@@ -1,0 +1,302 @@
+"""
+Base implementation for missing value imputation feature groups.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from mloda.provider import FeatureChainParser
+from mloda.provider import OperationFeatureGroup
+from mloda.user import Feature
+from mloda.provider import (
+    FeatureChainParserMixin,
+)
+from mloda.provider import FeatureSet
+from mloda.provider import DefaultOptionKeys
+from mloda.provider import PropertySpec
+from mloda.provider import SubtypeDeclaration
+from mloda.user import FeatureName, Options
+from mloda_plugins.feature_group.experimental.key_features import with_key_features
+
+
+class MissingValueFeatureGroup(FeatureChainParserMixin, OperationFeatureGroup):
+    """
+    Base class for all missing value imputation feature groups.
+
+    Missing value feature groups impute missing values in the source feature using
+    the specified imputation method. They support both string-based feature creation
+    and configuration-based creation with proper group/context parameter separation.
+
+    Reference contract: null and NaN-like scalars (float and Decimal NaN, NaT, pd.NA) are missing;
+    mean/median/mode skip them; missing cells are filled; mode ties take the smallest value;
+    single-column, multi-column and grouped paths; a group with no value falls back to the column
+    statistic. A row with a missing group key part joins no group (statistics fill it from the column,
+    ffill/bfill leave it). A cell no method fills stays missing (null, NaN in pandas), e.g. a
+    multi-column row with no value or an ffill/bfill edge.
+
+    ## Supported Imputation Methods
+
+    - `mean`: Impute with the mean of non-missing values
+    - `median`: Impute with the median of non-missing values
+    - `mode`: Impute with the most frequent value
+    - `constant`: Impute with a specified constant value
+    - `ffill`: Forward fill (use the last valid value)
+    - `bfill`: Backward fill (use the next valid value)
+
+    ## Feature Creation Methods
+
+    ### 1. String-Based Creation
+
+    Features follow the naming pattern: `{in_features}__{imputation_method}_imputed`
+
+    Examples:
+    ```python
+    features = [
+        "income__mean_imputed",      # Impute missing values in income with the mean
+        "age__median_imputed",       # Impute missing values in age with the median
+        "category__constant_imputed" # Impute missing values in category with a constant value
+    ]
+    ```
+
+    ### 2. Configuration-Based Creation
+
+    Uses Options with proper group/context parameter separation:
+
+    ```python
+    feature = Feature(
+        name="placeholder",  # Placeholder name, will be replaced
+        options=Options(
+            context={
+                MissingValueFeatureGroup.IMPUTATION_METHOD: "mean",
+                DefaultOptionKeys.in_features: "income",
+            }
+        )
+    )
+    ```
+
+    ## Parameter Classification
+
+    ### Context Parameters (Default)
+    These parameters don't affect Feature Group resolution/splitting:
+    - `imputation_method`: The type of imputation to perform
+    - `in_features`: The source feature to impute missing values
+    - `constant_value`: Constant value for constant imputation (optional)
+    - `group_by_features`: Features to group by before imputation (optional)
+
+    ### Group Parameters
+    Currently none for MissingValueFeatureGroup. Parameters that affect Feature Group
+    resolution/splitting would be placed here.
+
+    ## Usage Examples
+
+    ### String-Based Creation
+
+    ```python
+    from mloda.user import Feature
+
+    # Impute missing income values with mean
+    feature = Feature(name="income__mean_imputed")
+
+    # Impute missing age values with median
+    feature = Feature(name="age__median_imputed")
+
+    # Impute missing category values with mode
+    feature = Feature(name="category__mode_imputed")
+
+    # Forward fill missing temperature values
+    feature = Feature(name="temperature__ffill_imputed")
+    ```
+
+    ### Configuration-Based Creation
+
+    ```python
+    from mloda.user import Feature
+    from mloda.user import Options
+    from mloda.provider import DefaultOptionKeys
+
+    # Mean imputation using configuration
+    feature = Feature(
+        name="placeholder",
+        options=Options(
+            context={
+                MissingValueFeatureGroup.IMPUTATION_METHOD: "mean",
+                DefaultOptionKeys.in_features: "income",
+            }
+        )
+    )
+
+    # Constant imputation with a specific value
+    feature = Feature(
+        name="placeholder",
+        options=Options(
+            context={
+                MissingValueFeatureGroup.IMPUTATION_METHOD: "constant",
+                DefaultOptionKeys.in_features: "status",
+                "constant_value": "unknown",
+            }
+        )
+    )
+
+    # Group-based imputation (e.g., mean by category)
+    feature = Feature(
+        name="placeholder",
+        options=Options(
+            context={
+                MissingValueFeatureGroup.IMPUTATION_METHOD: "mean",
+                DefaultOptionKeys.in_features: "price",
+                "group_by_features": ["product_category", "region"],
+            }
+        )
+    )
+    ```
+
+    ## Requirements
+    - Input data must contain the source feature to be imputed
+    - For group-based imputation, grouping features are requested as inputs
+    - For constant imputation, a constant_value must be provided
+    """
+
+    CONTRACT_VERSION = 1
+
+    IMPUTATION_METHOD = "imputation_method"
+    # Define supported imputation methods
+    IMPUTATION_METHODS = {
+        "mean": "Impute with the mean of non-missing values",
+        "median": "Impute with the median of non-missing values",
+        "mode": "Impute with the most frequent value",
+        "constant": "Impute with a specified constant value",
+        "ffill": "Forward fill (use the last valid value)",
+        "bfill": "Backward fill (use the next valid value)",
+    }
+
+    SUBTYPES = SubtypeDeclaration(key=IMPUTATION_METHOD)
+
+    PREFIX_PATTERN = r".*__(?P<imputation_method>[\w]+)_imputed$"
+
+    # In-feature configuration for FeatureChainParserMixin
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+
+    PROPERTY_MAPPING = {
+        IMPUTATION_METHOD: PropertySpec(
+            "Imputation method to apply",
+            allowed_values=IMPUTATION_METHODS,
+            context=True,
+            strict_validation=True,
+        ),
+        DefaultOptionKeys.in_features: PropertySpec(
+            "Source feature to impute missing values",
+            context=True,
+            strict_validation=False,
+        ),
+        "constant_value": PropertySpec(
+            "Constant value to use for constant imputation method",
+            context=True,
+            strict_validation=False,
+            default=None,  # Optional: only the constant method uses it
+        ),
+        "group_by_features": PropertySpec(
+            "Optional list of features to group by before imputation",
+            context=True,
+            strict_validation=False,
+            default=None,  # Optional: no grouping
+        ),
+    }
+
+    @classmethod
+    def get_imputation_method(cls, feature_name: str) -> str:
+        """Extract the imputation method from the feature name."""
+        imputation_method = cls.resolve_feature_name(feature_name).value_for(cls.IMPUTATION_METHOD)
+        if imputation_method is None:
+            raise ValueError(f"Invalid missing value feature name format: {feature_name}")
+
+        # Validate imputation method
+        if imputation_method not in cls.IMPUTATION_METHODS:
+            raise ValueError(
+                f"Unsupported imputation method: {imputation_method}. "
+                f"Supported methods: {', '.join(cls.IMPUTATION_METHODS.keys())}"
+            )
+
+        return imputation_method
+
+    @classmethod
+    def _group_by_features(cls, options: Options) -> list[Any] | None:
+        """The group_by_features option as a list; a bare string is one key."""
+        value = options.get("group_by_features")
+        return None if value is None or value == "" else FeatureChainParser._unpack_property_value(value)
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        """Source features plus the group_by_features columns."""
+        sources = super().input_features(options, feature_name) or set()
+        return with_key_features(sources, self._group_by_features(options) or [])
+
+    @classmethod
+    def _extract_imputation_method(cls, feature: Feature) -> str | None:
+        """
+        Extract imputation method from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based.
+
+        Args:
+            feature: The feature to extract imputation method from
+
+        Returns:
+            Imputation method name or None if not found
+        """
+        imputation_method = cls._resolve_operation(feature, cls.IMPUTATION_METHOD)
+
+        # Validate imputation method if found
+        if imputation_method is not None and imputation_method not in cls.IMPUTATION_METHODS:
+            raise ValueError(
+                f"Unsupported imputation method: {imputation_method}. "
+                f"Supported methods: {', '.join(cls.IMPUTATION_METHODS.keys())}"
+            )
+
+        return imputation_method
+
+    @classmethod
+    def _extract_imputation_method_and_source_feature(cls, feature: Feature) -> tuple[str, str]:
+        """
+        Extract imputation method and source feature name from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based approach.
+
+        Args:
+            feature: The feature to extract parameters from
+
+        Returns:
+            Tuple of (imputation_method, source_feature_name)
+
+        Raises:
+            ValueError: If parameters cannot be extracted
+        """
+        return cls._extract_operation_and_source_feature(feature, cls._extract_imputation_method, "imputation method")
+
+    @classmethod
+    def impute(
+        cls,
+        data: Any,
+        features: FeatureSet,
+        *,
+        perform: Callable[[Any, str, list[str], Any, list[str] | None], Any],
+        add_column: Callable[[Any, str, Any], Any],
+        columns: Callable[[Any], set[str]],
+    ) -> Any:
+        """Shared loop: resolve each feature's sources, run perform, add the result."""
+        for feature in features.get_sorted_features():
+            imputation_method, source_feature = cls._extract_imputation_method_and_source_feature(feature)
+
+            available = columns(data)
+            resolved_columns = cls.resolve_multi_column_feature(source_feature, available)
+
+            constant_value = feature.options.get("constant_value")
+            group_by_features = cls._group_by_features(feature.options)
+
+            if imputation_method == "constant" and constant_value is None:
+                raise ValueError("Constant value must be provided for constant imputation method")
+
+            result = perform(data, imputation_method, resolved_columns, constant_value, group_by_features)
+            data = add_column(data, feature.name, result)
+        return data

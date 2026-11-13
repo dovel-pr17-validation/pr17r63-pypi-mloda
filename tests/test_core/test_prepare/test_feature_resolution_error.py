@@ -1,0 +1,277 @@
+"""Failing tests for the typed resolution exception ``FeatureResolutionError`` (issue #809).
+
+The raising seam in ``IdentifyFeatureGroupClass.__init__`` raises a bare ``ValueError`` when a feature
+cannot be resolved. This suite pins its replacement: ``FeatureResolutionError(ValueError)``, defined in
+``mloda.core.prepare.identify_feature_group`` beside the evaluation seam. It carries ``feature_name: str``
+and ``result: EvaluationResult``, keeps the rendered message text unchanged (the message still comes from
+``render_resolution_failure``), and is re-exported from ``mloda.user`` and ``mloda.steward``.
+
+All fixture names carry an ``_809`` suffix: test feature groups become global subclasses and the suite
+runs in parallel, so a shared name would leak into another module's candidate universe.
+"""
+
+import copy
+import pickle  # nosec B403
+from typing import Any
+
+import pytest
+
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.plugin_option.plugin_collector import PluginCollector
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
+from mloda.core.prepare.identify_feature_group import (
+    FeatureResolutionError,
+    IdentifyFeatureGroupClass,
+)
+from mloda.core.prepare.resolution_failure_renderer import render_resolution_failure
+from mloda.user import mlodaAPI
+from tests.helpers.plugin_stubs import make_fg
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
+
+
+# Unique feature names so no other double in the parallel suite collides on them.
+KNOWN_FEATURE_809 = "resolution_error_known_809"
+NO_MATCH_FEATURE_809 = "resolution_error_no_match_809"
+MULTIPLE_FEATURE_809 = "resolution_error_multiple_809"
+
+
+class ResolutionErrorFw_809(ComputeFramework):
+    """Dummy compute framework for the typed-resolution-error tests."""
+
+
+ResolutionErrorKnownFG_809 = make_fg("ResolutionErrorKnownFG_809", matches=KNOWN_FEATURE_809)
+
+ResolutionErrorSiblingAFG_809 = make_fg("ResolutionErrorSiblingAFG_809", matches=MULTIPLE_FEATURE_809)
+
+ResolutionErrorSiblingBFG_809 = make_fg("ResolutionErrorSiblingBFG_809", matches=MULTIPLE_FEATURE_809)
+
+
+def _no_match_accessible_plugins() -> FeatureGroupEnvironmentMapping:
+    """One candidate that matches only its own known name: any other name yields failure_kind 'none'."""
+    return {ResolutionErrorKnownFG_809: {ResolutionErrorFw_809}}
+
+
+def _raised_resolution_error_809() -> FeatureResolutionError:
+    """Catch and return the typed error the raising seam produces for the no-match fixture."""
+    feature = Feature(NO_MATCH_FEATURE_809)
+
+    with pytest.raises(FeatureResolutionError) as exc_info:
+        evaluate_or_raise(
+            feature=feature,
+            accessible_plugins=_no_match_accessible_plugins(),
+            links=None,
+            data_access_collection=None,
+        )
+
+    return exc_info.value
+
+
+class TestFeatureResolutionErrorAtTheSeam:
+    """The raising seam raises the typed error, carrying the evaluation it just ran."""
+
+    def test_unresolvable_feature_raises_the_typed_error(self) -> None:
+        """An unresolvable feature raises FeatureResolutionError, which is a ValueError."""
+        feature = Feature(NO_MATCH_FEATURE_809)
+
+        with pytest.raises(FeatureResolutionError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=_no_match_accessible_plugins(),
+                links=None,
+                data_access_collection=None,
+            )
+
+        assert isinstance(exc_info.value, ValueError)
+        assert exc_info.value.feature_name == NO_MATCH_FEATURE_809
+        assert exc_info.value.refusals == ()
+        assert exc_info.value.__cause__ is None
+
+    def test_the_error_carries_the_evaluation_result(self) -> None:
+        """The raised error exposes the structured EvaluationResult of its single pass."""
+        feature = Feature(NO_MATCH_FEATURE_809)
+
+        with pytest.raises(FeatureResolutionError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=_no_match_accessible_plugins(),
+                links=None,
+                data_access_collection=None,
+            )
+
+        result = exc_info.value.result
+        assert result.failure_kind == "none"
+        assert isinstance(result.criteria_matched, set)
+        assert isinstance(result.candidate_frameworks, dict)
+
+    def test_the_message_text_is_unchanged(self) -> None:
+        """str(error) is exactly render_resolution_failure over the same evaluation."""
+        feature = Feature(NO_MATCH_FEATURE_809)
+
+        with pytest.raises(FeatureResolutionError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=_no_match_accessible_plugins(),
+                links=None,
+                data_access_collection=None,
+            )
+
+        result = IdentifyFeatureGroupClass.evaluate(
+            feature=feature,
+            accessible_plugins=_no_match_accessible_plugins(),
+            links=None,
+        )
+        expected = render_resolution_failure(result, feature)
+        assert expected is not None
+        assert str(exc_info.value) == expected
+
+    def test_ambiguous_match_reports_multiple_with_its_candidates(self) -> None:
+        """An ambiguous match carries failure_kind 'multiple' and a non-empty criteria_matched."""
+        feature = Feature(MULTIPLE_FEATURE_809)
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            ResolutionErrorSiblingAFG_809: {ResolutionErrorFw_809},
+            ResolutionErrorSiblingBFG_809: {ResolutionErrorFw_809},
+        }
+
+        with pytest.raises(FeatureResolutionError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+                data_access_collection=None,
+            )
+
+        assert exc_info.value.feature_name == MULTIPLE_FEATURE_809
+        result = exc_info.value.result
+        assert result.failure_kind == "multiple"
+        assert result.criteria_matched
+
+
+class TestFeatureResolutionErrorEndToEnd:
+    """The engine path surfaces the typed error unchanged."""
+
+    def test_run_all_raises_the_typed_error_for_an_unresolvable_name(self) -> None:
+        """mlodaAPI.run_all with an unresolvable feature name raises FeatureResolutionError."""
+        with pytest.raises(FeatureResolutionError):
+            mlodaAPI.run_all(
+                [NO_MATCH_FEATURE_809],
+                compute_frameworks=[ResolutionErrorFw_809],
+                plugin_collector=PluginCollector.enabled_feature_groups({ResolutionErrorKnownFG_809}),
+            )
+
+
+class _UnloadableRefusal_809(Exception):
+    """Cannot be unpickled: the required keyword-only argument is not in args."""
+
+    def __init__(self, *, code: str) -> None:
+        super().__init__("unloadable refusal")
+        self.code = code
+
+
+class TestFeatureResolutionErrorTransport:
+    """The typed error survives the transport boundaries the engine uses: pickle and deepcopy.
+
+    ``BaseException.__reduce__`` reconstructs an exception from ``self.args``, which here is only the
+    rendered message. Without a ``__reduce__`` override the round trips below raise ``TypeError`` for
+    the two missing constructor arguments instead of returning an equivalent error.
+    """
+
+    def test_pickle_round_trip_preserves_message_name_and_result(self) -> None:
+        """pickle.loads(pickle.dumps(error)) yields an equal FeatureResolutionError."""
+        original = _raised_resolution_error_809()
+
+        restored = pickle.loads(pickle.dumps(original))  # nosec B301
+
+        assert isinstance(restored, FeatureResolutionError)
+        assert str(restored) == str(original)
+        assert restored.feature_name == original.feature_name
+        assert restored.result.failure_kind == original.result.failure_kind
+
+    def test_deepcopy_round_trip_preserves_message_name_and_result(self) -> None:
+        """copy.deepcopy(error) yields an equal FeatureResolutionError."""
+        original = _raised_resolution_error_809()
+
+        duplicate = copy.deepcopy(original)
+
+        assert isinstance(duplicate, FeatureResolutionError)
+        assert str(duplicate) == str(original)
+        assert duplicate.feature_name == original.feature_name
+        assert duplicate.result.failure_kind == original.result.failure_kind
+
+    @pytest.mark.parametrize(
+        "round_trip",
+        [lambda e: pickle.loads(pickle.dumps(e)), copy.deepcopy],  # nosec B301
+        ids=["pickle", "deepcopy"],
+    )
+    def test_round_trip_drops_refusals_even_when_one_cannot_be_unpickled(self, round_trip: Any) -> None:
+        original = _raised_resolution_error_809()
+        with_refusal = FeatureResolutionError(
+            str(original), original.feature_name, original.result, refusals=(_UnloadableRefusal_809(code="s"),)
+        )
+        assert len(with_refusal.refusals) == 1
+
+        restored = round_trip(with_refusal)
+
+        assert isinstance(restored, FeatureResolutionError)
+        assert str(restored) == str(original)
+        assert restored.refusals == ()
+
+    @pytest.mark.parametrize(
+        "round_trip",
+        [lambda e: pickle.loads(pickle.dumps(e)), copy.deepcopy],  # nosec B301
+        ids=["pickle", "deepcopy"],
+    )
+    @pytest.mark.parametrize("path", [("outer_809", "inner_809"), ()])
+    def test_round_trip_preserves_the_resolving_path(self, round_trip: Any, path: tuple[str, ...]) -> None:
+        original = _raised_resolution_error_809()
+        kwargs: dict[str, Any] = {"resolving_path": path} if path else {}
+        with_path = FeatureResolutionError(str(original), original.feature_name, original.result, **kwargs)
+
+        restored = round_trip(with_path)
+
+        assert restored.resolving_path == path
+
+    @pytest.mark.parametrize(
+        "round_trip",
+        [lambda e: pickle.loads(pickle.dumps(e)), copy.deepcopy],  # nosec B301
+        ids=["pickle", "deepcopy"],
+    )
+    def test_variant_blocked_pin_error_round_trips_with_its_attributes(self, round_trip: Any) -> None:
+        from mloda.core.abstract_plugins.implementation_pin_error import VariantBlockedPinError
+
+        original = VariantBlockedPinError(
+            "pin blocked",
+            feature="f_809",
+            feature_group="G_809",
+            variants=("v1", "v2"),
+            allow_variants=("v1",),
+            resolving_path=("root_809", "f_809"),
+            planned_names=("root_809", "f_809", "g_809"),
+        )
+
+        restored = round_trip(original)
+
+        assert isinstance(restored, VariantBlockedPinError)
+        assert str(restored) == "pin blocked"
+        assert restored.feature == "f_809"
+        assert restored.feature_group == "G_809"
+        assert restored.variants == ("v1", "v2")
+        assert restored.allow_variants == ("v1",)
+        assert restored.resolving_path == ("root_809", "f_809")
+        assert restored.planned_names == ("root_809", "f_809", "g_809")
+
+
+class TestFeatureResolutionErrorImportSurfaces:
+    """The typed error is re-exported from the user and steward surfaces."""
+
+    def test_user_surface_reexports_the_same_class(self) -> None:
+        """mloda.user exposes the exact class the core module defines."""
+        from mloda.user import FeatureResolutionError as user_error
+
+        assert user_error is FeatureResolutionError
+
+    def test_steward_surface_reexports_the_same_class(self) -> None:
+        """mloda.steward exposes the exact class the core module defines."""
+        from mloda.steward import FeatureResolutionError as steward_error
+
+        assert steward_error is FeatureResolutionError

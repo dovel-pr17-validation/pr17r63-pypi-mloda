@@ -1,0 +1,580 @@
+import copy as _copy
+import logging
+from collections.abc import Iterable, Mapping
+from typing import Any, Callable, cast
+
+from mloda.core.abstract_plugins.components.credential import Credential, RegisteredCredential
+from mloda.core.abstract_plugins.components.credential_access import ResolvedCredential
+from mloda.core.abstract_plugins.components.credential_leaves import (
+    MIN_REDACT_LENGTH,
+    CredentialKeyPolicy,
+    credential_identity_literals,
+    credential_key_names,
+    normalize_credential_key,
+    credential_secret_literals,
+    iter_credential_leaves,
+    public_key_names,
+)
+from mloda.core.abstract_plugins.components.credential_scrub import (
+    redact_mapping,
+    registered_secrets_scope,
+    scrub_credentials,
+)
+from mloda.core.abstract_plugins.components.hashable_dict import HashableDict
+
+logger = logging.getLogger(__name__)
+
+CONNECTION_HANDLE_OPTION = "connection_handle"
+
+RESERVED_HANDLE_NAMES: dict[str, str] = {
+    "<pointer>": "the plan record uses it for a credential outside the collection",
+    "<unnamed>": "the plan record uses it for an auto-named entry",
+}
+
+
+def _refuse_reserved_handle(handle: Any) -> None:
+    if isinstance(handle, str) and handle in RESERVED_HANDLE_NAMES:
+        raise ValueError(f"Handle '{handle}' is reserved: {RESERVED_HANDLE_NAMES[handle]}. Pick another name.")
+
+
+def _copy_containers(value: Any, memo: dict[int, Any]) -> Any:
+    """Copy dict, RegisteredCredential, list, tuple and set containers; every other object is shared."""
+    kind = type(value)
+    if kind not in (dict, RegisteredCredential, list, tuple, set):
+        return value
+    if id(value) in memo:
+        return memo[id(value)]
+    if kind is tuple:
+        result: Any = tuple(_copy_containers(item, memo) for item in value)
+    elif kind is list:
+        result = memo[id(value)] = []
+        result.extend(_copy_containers(item, memo) for item in value)
+    elif kind is set:
+        result = memo[id(value)] = set()
+        result.update(_copy_containers(item, memo) for item in value)
+    else:
+        result = memo[id(value)] = kind()
+        for key, item in value.items():
+            result[key] = _copy_containers(item, memo)
+    memo[id(value)] = result
+    return result
+
+
+_KIND_TO_ATTR: dict[str, str] = {
+    "connection": "connections",
+    "file": "files",
+    "folder": "folders",
+    "credentials": "credentials",
+}
+
+
+class DataAccessCollection:
+    """Registry of data resources keyed by stable handle names.
+
+    Consumers bind one resource via ``resolve(...)``, which raises on ambiguity
+    rather than letting non-deterministic iteration decide.
+
+    See ``docs/docs/in_depth/named-data-access-handles.md``.
+    """
+
+    def __init__(
+        self,
+        connections: dict[str, Any] | set[Any] | list[Any] | None = None,
+        files: dict[str, str] | set[str] | list[str] | None = None,
+        folders: dict[str, str] | set[str] | list[str] | None = None,
+        credentials: dict[str, Any] | list[Any] | Credential | None = None,
+        column_to_file: dict[str, str] | None = None,
+        public_credential_keys: Iterable[str] | None = None,
+        secret_credential_keys: Iterable[str] | None = None,
+    ) -> None:
+        """Build the collection from named or auto-named resources.
+
+        Accepted shapes, by intent:
+          * ``dict[handle, value]``: named resources, for multi-source setups
+            where a consumer is pointed at one entry via
+            ``Options(data_access_handle=...)``.
+          * ``set`` / ``list`` of bare values: single-source convenience;
+            entries get internal auto-handles the user never references.
+          * ``credentials`` additionally accepts a single ``Credential`` (or
+            ``Credential`` entries in the list/dict forms). A credential is
+            itself a dict, so the bare ``{connector_id: slot}`` shape would be
+            read as ``{handle: value}``; the typed form removes that ambiguity
+            and is stored as a ``RegisteredCredential`` (a dict whose repr
+            redacts values) at registration. List-form and named-form
+            credential values must be mappings (``dict`` or ``Credential``);
+            anything else raises an early mis-wrap ``ValueError``.
+            ``HashableDict`` is no longer accepted on the credentials path; the
+            class itself stays for hashability-required internals (e.g. ``Options``
+            hashing). Credentials have no ``set``
+            form (dicts are unhashable). Any other top-level ``credentials``
+            value (``str``, ``bytes``, ``int``, ...) raises ``ValueError``.
+
+        ``column_to_file`` maps a column to either a file handle or a file path
+        (paths are normalized to their handle).
+
+        ``public_credential_keys`` / ``secret_credential_keys`` leave keys unmasked or mask them; secret wins.
+        """
+        self._public_credential_keys = self._key_set("public_credential_keys", public_credential_keys)
+        self._secret_credential_keys = self._key_set("secret_credential_keys", secret_credential_keys)
+        self._auto_handles: set[str] = set()
+
+        credentials = self._normalize_credentials(credentials)
+
+        # Start with user-supplied dict entries; collect non-dict inputs for a second pass
+        # so that auto-handle numbering can dodge every user-supplied handle (across all kinds).
+        self.connections: dict[str, Any] = self._copy_if_dict(connections)
+        self.files: dict[str, str] = self._copy_if_dict(files)
+        self.folders: dict[str, str] = self._copy_if_dict(folders)
+        self.credentials: dict[str, Any] = self._copy_if_dict(credentials)
+
+        self._check_cross_kind_handle_uniqueness()
+
+        self._assign_auto_handles("connection", self.connections, connections)
+        self._assign_auto_handles("file", self.files, files)
+        self._assign_auto_handles("folder", self.folders, folders)
+        self._assign_auto_handles("credentials", self.credentials, credentials)
+
+        self.column_to_file: dict[str, str] | None = self._normalize_column_to_file(column_to_file)
+        self._api_data_columns: dict[str, tuple[str, ...]] = {}
+        self._api_data_types: dict[str, type] = {}
+
+        for credential_handle in self.credentials:
+            self._warn_short_secrets(credential_handle)
+
+    @staticmethod
+    def _key_set(name: str, keys: Iterable[str] | None) -> frozenset[str]:
+        if keys is None:
+            return frozenset()
+        names = public_key_names(name, keys) if name == "public_credential_keys" else credential_key_names(name, keys)
+        return frozenset(normalize_credential_key(k) for k in names)
+
+    def credential_key_policy(self) -> CredentialKeyPolicy:
+        """The declared key policy: plugin public keys plus this collection's own public and secret keys."""
+        # Function-local: avoids an import cycle through the feature group module.
+        from mloda.core.abstract_plugins.components.credential_handle import public_credential_keys
+
+        return CredentialKeyPolicy(
+            public_credential_keys() | self._public_credential_keys, self._secret_credential_keys
+        )
+
+    @property
+    def api_data_columns(self) -> Mapping[str, tuple[str, ...]]:
+        """Column names per api_data set, frozen at prepare time."""
+        return self._api_data_columns
+
+    @property
+    def api_data_types(self) -> Mapping[str, type]:
+        """The container type recorded per api_data set at prepare time."""
+        return self._api_data_types
+
+    def with_api_data_columns(
+        self, spec: Mapping[str, tuple[str, ...]], types: Mapping[str, type] | None = None
+    ) -> "DataAccessCollection":
+        """A copy carrying the api_data column spec and the recorded set types."""
+        duplicate = self.copy()
+        duplicate._api_data_columns = dict(spec)
+        duplicate._api_data_types = dict(types or {})
+        return duplicate
+
+    def copy(self) -> "DataAccessCollection":
+        """Return an independent collection sharing the registered objects."""
+        duplicate = _copy.copy(self)
+        duplicate.connections = dict(self.connections)
+        duplicate.files = dict(self.files)
+        duplicate.folders = dict(self.folders)
+        duplicate.credentials = dict(self.credentials)
+        duplicate._auto_handles = set(self._auto_handles)
+        duplicate.column_to_file = None if self.column_to_file is None else dict(self.column_to_file)
+        duplicate._api_data_columns = dict(self._api_data_columns)
+        duplicate._api_data_types = dict(self._api_data_types)
+        return duplicate
+
+    def with_copied_credentials(self) -> "DataAccessCollection":
+        """A copy whose credential containers are copied too; connections and other leaves stay shared."""
+        duplicate = self.copy()
+        memo: dict[int, Any] = {}
+        duplicate.credentials = {handle: _copy_containers(value, memo) for handle, value in self.credentials.items()}
+        return duplicate
+
+    def with_credentials(self, credentials: Mapping[str, Any]) -> "DataAccessCollection":
+        """A copy with the given handles' credentials replaced; this collection is never modified."""
+        for handle in credentials:
+            _refuse_reserved_handle(handle)
+        duplicate = self.copy()
+        normalized = cast(dict[str, Any], self._normalize_credentials(dict(credentials)))
+        duplicate.credentials.update(normalized)
+        for handle in credentials:
+            duplicate._warn_short_secrets(handle)
+        return duplicate
+
+    @property
+    def auto_handles(self) -> frozenset[str]:
+        """The handles assigned automatically rather than named by the user."""
+        return frozenset(self._auto_handles)
+
+    def bind_auto_connection(self, connection: Any, handle: str) -> None:
+        """Register ``connection`` under the auto ``handle``, dropping its other auto entries."""
+        for existing in [h for h, c in self.connections.items() if c is connection and h in self._auto_handles]:
+            del self.connections[existing]
+            self._auto_handles.discard(existing)
+        self._reject_duplicate(handle)
+        self.connections[handle] = connection
+        self._auto_handles.add(handle)
+
+    @classmethod
+    def _normalize_credentials(
+        cls, credentials: dict[str, Any] | list[Any] | Credential | None
+    ) -> dict[str, Any] | list[Any] | None:
+        if credentials is None:
+            return None
+        if isinstance(credentials, Credential):
+            return [cls._unwrap_credential(credentials)]
+        if isinstance(credentials, dict):
+            context_keys = tuple(credentials.keys())
+            return {
+                handle: cls._validated_credential_value(handle, value, context_keys)
+                for handle, value in credentials.items()
+            }
+        if isinstance(credentials, (str, bytes, bytearray)) or not isinstance(credentials, Iterable):
+            # Single mis-wrapped value, not a sequence of credentials. HashableDict raises the migration error.
+            cls._unwrap_credential(credentials)
+            raise ValueError(
+                f"credentials must be a Credential, a dict of {{handle: credential}}, or a list of credentials; "
+                f"got {type(credentials).__name__}."
+            )
+        return [cls._validated_list_entry(index, entry) for index, entry in enumerate(credentials)]
+
+    @classmethod
+    def _validated_list_entry(cls, index: int, entry: Any) -> Any:
+        unwrapped = cls._unwrap_credential(entry)
+        if isinstance(unwrapped, dict):
+            return unwrapped
+        raise ValueError(
+            f"credentials list entry {index} has type {type(entry).__name__}, not a mapping. Each list entry "
+            f"must be a dict or a Credential, e.g. credentials=[Credential(dsn=...)]."
+        )
+
+    @staticmethod
+    def _unwrap_credential(value: Any) -> Any:
+        if isinstance(value, ResolvedCredential):
+            return RegisteredCredential(dict(value))
+        if isinstance(value, Credential):
+            value = value.data
+        if isinstance(value, HashableDict):
+            raise ValueError(
+                "HashableDict is no longer accepted as a credential value. "
+                "Pass Credential({...}) or a plain dict instead. "
+                "(HashableDict itself is not removed; it stays for hashability-required "
+                "internals such as Options hashing.)"
+            )
+        if isinstance(value, dict):
+            return RegisteredCredential(value)
+        return value
+
+    @classmethod
+    def _validated_credential_value(cls, handle: str, value: Any, context_keys: tuple[str, ...] | None = None) -> Any:
+        unwrapped = cls._unwrap_credential(value)
+        if isinstance(unwrapped, dict):
+            return unwrapped
+        fields = ", ".join(f"'{key}': ..." for key in (context_keys if context_keys is not None else (handle,)))
+        raise ValueError(
+            f"credentials value for handle '{handle}' is not a mapping. A bare dict is read as "
+            f"{{handle: credential}}, so a single credential must be wrapped: use the list form "
+            f"credentials=[{{{fields}}}], the typed form credentials=Credential({{{fields}}}), "
+            f"or the named form credentials={{'my-db': {{{fields}}}}}."
+        )
+
+    @staticmethod
+    def _copy_if_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    def _assign_auto_handles(self, kind: str, registry: dict[str, Any], raw: Any) -> None:
+        if raw is None or isinstance(raw, dict):
+            return
+        for entry in raw:
+            handle = self._next_auto_handle(kind)
+            registry[handle] = entry
+            self._auto_handles.add(handle)
+
+    def _next_auto_handle(self, kind: str) -> str:
+        counter = 0
+        handle = f"_auto_{kind}_{counter}"
+        while self._handle_taken(handle):
+            counter += 1
+            handle = f"_auto_{kind}_{counter}"
+        return handle
+
+    def _handle_taken(self, handle: str) -> bool:
+        for attr in _KIND_TO_ATTR.values():
+            registry: dict[str, Any] = getattr(self, attr)
+            if handle in registry:
+                return True
+        return False
+
+    def _normalize_column_to_file(self, column_to_file: dict[str, str] | None) -> dict[str, str] | None:
+        if column_to_file is None:
+            return None
+        path_to_handle: dict[str, str] = {}
+        for handle, path in self.files.items():
+            if path not in path_to_handle:
+                path_to_handle[path] = handle
+        normalized: dict[str, str] = {}
+        for col, value in column_to_file.items():
+            if value in self.files:
+                normalized[col] = value
+            elif value in path_to_handle:
+                normalized[col] = path_to_handle[value]
+            else:
+                raise ValueError(
+                    scrub_credentials(
+                        f"column_to_file value '{value}' for column '{col}' is not a known file handle or path. "
+                        f"Available file handles: {sorted(self.files.keys())}. "
+                        f"Available file paths: {sorted(self.files.values())}."
+                    )
+                )
+        return normalized
+
+    def _check_cross_kind_handle_uniqueness(self) -> None:
+        seen: dict[str, str] = {}
+        for kind, attr in _KIND_TO_ATTR.items():
+            registry: dict[str, Any] = getattr(self, attr)
+            for handle in registry:
+                _refuse_reserved_handle(handle)
+                if handle in seen:
+                    raise ValueError(
+                        f"Handle '{handle}' is registered under both kind '{seen[handle]}' and kind '{kind}'. "
+                        f"Handles must be globally unique across kinds."
+                    )
+                seen[handle] = kind
+
+    def add_connection(self, *args: Any) -> None:
+        """Register a connection. ``add_connection(value)`` auto-names it; ``add_connection(handle, value)`` names it."""
+        handle, value = self._resolve_mutator_args("connection", args)
+        self._reject_duplicate(handle)
+        self.connections[handle] = value
+
+    def add_file(self, *args: Any) -> None:
+        """Register a file. ``add_file(path)`` auto-names it; ``add_file(handle, path)`` names it."""
+        handle, value = self._resolve_mutator_args("file", args)
+        self._reject_duplicate(handle)
+        self.files[handle] = value
+
+    def add_folder(self, *args: Any) -> None:
+        """Register a folder. ``add_folder(path)`` auto-names it; ``add_folder(handle, path)`` names it."""
+        handle, value = self._resolve_mutator_args("folder", args)
+        self._reject_duplicate(handle)
+        self.folders[handle] = value
+
+    def add_credentials(self, *args: Any) -> None:
+        """Register credentials. ``add_credentials(value)`` auto-names them; ``add_credentials(handle, value)`` names them."""
+        handle, value = self._resolve_mutator_args("credentials", args)
+        self._reject_duplicate(handle)
+        self.credentials[handle] = self._validated_credential_value(handle, value)
+        self._warn_short_secrets(handle)
+
+    def _resolve_mutator_args(self, kind: str, args: tuple[Any, ...]) -> tuple[str, Any]:
+        if len(args) == 1:
+            handle = self._next_auto_handle(kind)
+            self._auto_handles.add(handle)
+            return handle, args[0]
+        if len(args) == 2:
+            return args[0], args[1]
+        raise TypeError(f"add_{kind}() takes 1 (value) or 2 (handle, value) positional arguments, got {len(args)}.")
+
+    def _reject_duplicate(self, handle: str) -> None:
+        _refuse_reserved_handle(handle)
+        for kind, attr in _KIND_TO_ATTR.items():
+            if handle in getattr(self, attr):
+                raise ValueError(
+                    f"Handle '{handle}' is already registered under kind '{kind}'. Handles must be unique across kinds."
+                )
+
+    def handles(self) -> dict[str, str]:
+        """Return ``{handle: kind}`` for every registered resource."""
+        result: dict[str, str] = {}
+        for kind, attr in _KIND_TO_ATTR.items():
+            for handle in getattr(self, attr):
+                result[handle] = kind
+        return result
+
+    def resolve(
+        self,
+        kind: str,
+        predicate: Callable[[Any], bool] | None = None,
+        hint: str | None = None,
+    ) -> Any:
+        """Resolve a single resource of ``kind``, optionally narrowed by ``predicate``.
+
+        Hint semantics:
+          * missing handle: ValueError naming kind + handle + available handles of that kind
+          * wrong kind: ValueError naming actual vs requested kind
+          * predicate fails: ValueError naming predicate mismatch
+          * otherwise: return the entry
+
+        No-hint semantics: 0 matches -> None, 1 match -> the entry,
+        >1 matches -> ValueError listing candidate handles and mentioning ``data_access_handle``.
+        """
+        attr = _KIND_TO_ATTR.get(kind)
+        if attr is None:
+            raise ValueError(f"Unknown kind '{kind}'. Expected one of {sorted(_KIND_TO_ATTR.keys())}.")
+        registry: dict[str, Any] = getattr(self, attr)
+
+        if hint is not None:
+            if hint not in registry:
+                actual_kind = self.handles().get(hint)
+                if actual_kind is not None:
+                    raise ValueError(
+                        f"Handle '{hint}' is registered under kind '{actual_kind}', but kind '{kind}' was requested."
+                    )
+                raise ValueError(
+                    f"Handle '{hint}' not found for kind '{kind}'. "
+                    f"Available handles of kind '{kind}': {sorted(registry.keys())}"
+                )
+            entry = registry[hint]
+            if predicate is not None and not predicate(entry):
+                raise ValueError(
+                    f"Handle '{hint}' of kind '{kind}' did not satisfy the predicate (predicate mismatch)."
+                )
+            return entry
+
+        if predicate is None:
+            matches: list[tuple[str, Any]] = list(registry.items())
+        else:
+            matches = [(h, v) for h, v in registry.items() if predicate(v)]
+
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0][1]
+
+        candidate_handles = [h for h, _ in matches]
+        all_auto = all(h in self._auto_handles for h in candidate_handles)
+        if all_auto:
+            if kind == "credentials":
+                bullets = "\n".join(f"  - {self._redacted_credential(v)}" for _, v in matches)
+            else:
+                bullets = "\n".join(f"  - {v}" for _, v in matches)
+            raise ValueError(
+                f"Ambiguous resolve for kind '{kind}': {len(matches)} matches:\n"
+                f"{bullets}\n"
+                f"Name them and set Options(data_access_handle=...) to pick one, "
+                f"or remove one from the collection."
+            )
+        raise ValueError(
+            f"Ambiguous resolve for kind '{kind}': {len(matches)} candidates {candidate_handles}; "
+            f"set 'data_access_handle' in Options to disambiguate."
+        )
+
+    @staticmethod
+    def _redacted_credential(value: Any) -> str:
+        if isinstance(value, dict):
+            return "{" + ", ".join(f"'{key}': {redacted!r}" for key, redacted in redact_mapping(value).items()) + "}"
+        return "'***'"
+
+    def redact(self, text: str) -> str:
+        """Exact-match every registered credential string value of 8+ chars, then ``scrub_credentials``."""
+        with registered_secrets_scope(frozenset(self._credential_str_leaves())):
+            return scrub_credentials(text)
+
+    def secret_literals(self) -> frozenset[str]:
+        """The str leaves of 8+ chars of a registered credential, except known-safe connection fields."""
+        policy = self.credential_key_policy()
+        return frozenset().union(*(credential_secret_literals(value, policy) for value in self.credentials.values()))
+
+    def identity_literals(self) -> frozenset[str]:
+        """The str leaves of 8+ chars under a credential-shaped or steward secret key, for a published identity."""
+        policy = self.credential_key_policy()
+        return frozenset().union(*(credential_identity_literals(value, policy) for value in self.credentials.values()))
+
+    def _warn_short_secrets(self, handle: str) -> None:
+        shown = "<unnamed>" if handle in self._auto_handles else handle
+        for item in iter_credential_leaves(self.credentials[handle], self.credential_key_policy()):
+            text = item.leaf
+            if (
+                (item.shaped or item.declared)
+                and isinstance(text, str)
+                and text.strip()
+                and len(text) < MIN_REDACT_LENGTH
+            ):
+                logger.warning(
+                    "Credential '%s' value at '%s' is shorter than %d characters, so it is not masked by exact "
+                    "match in errors and logs. Use %d or more characters.",
+                    shown,
+                    item.path,
+                    MIN_REDACT_LENGTH,
+                    MIN_REDACT_LENGTH,
+                )
+
+    def _credential_str_leaves(self) -> set[str]:
+        leaves: set[str] = set()
+        visited: set[int] = set()
+        for value in self.credentials.values():
+            self._collect_str_leaves(value, leaves, visited)
+        return leaves
+
+    @classmethod
+    def _collect_str_leaves(cls, value: Any, leaves: set[str], visited: set[int]) -> None:
+        if isinstance(value, Credential):
+            value = value.data
+        if isinstance(value, str):
+            if len(value) >= MIN_REDACT_LENGTH and value.strip():
+                leaves.add(value)
+            return
+        if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+            container_id = id(value)
+            if container_id in visited:
+                return
+            visited.add(container_id)
+            iterable: Iterable[Any] = value.values() if isinstance(value, Mapping) else value
+            for nested in iterable:
+                cls._collect_str_leaves(nested, leaves, visited)
+
+
+def credential_handle_of(dac: DataAccessCollection | None, credentials: Any) -> str | None:
+    """The handle whose registered credential is `credentials` by identity, else None."""
+    items = dac.credentials.items() if dac else ()
+    return next((handle for handle, value in items if value is credentials), None)
+
+
+def resolve_connection_handle(framework: Any, dac: Any, options: Any | None) -> tuple[str | None, bool, str | None]:
+    """Resolve the DAC connection handle for `framework`: (handle, explicit, reason)."""
+    named = options.get(CONNECTION_HANDLE_OPTION) if options is not None else None
+    if dac is None:
+        if named is not None:
+            raise ValueError(
+                f"Option '{CONNECTION_HANDLE_OPTION}' names '{named}' but no DataAccessCollection is given."
+            )
+        return None, False, None
+    connections: dict[str, Any] = dac.connections
+    foreign: str | None = None
+    if named is not None:
+        entry = dac.resolve("connection", hint=named)
+        if framework._connection_matches(entry):
+            return named, True, None
+        shown = "<unnamed>" if named in dac.auto_handles else named
+        foreign = f"Connection handle '{shown}' holds a connection this framework does not accept."
+    hint = options.get("data_access_handle") if options is not None else None
+    if foreign is None and hint in connections and framework._connection_matches(connections[hint]):
+        return hint, True, None
+    matches = [h for h, conn in connections.items() if framework._connection_matches(conn)]
+    if len(matches) == 1:
+        return matches[0], False, None
+    if foreign is not None:
+        return None, True, foreign
+    if matches:
+        given = sorted(h for h in matches if h not in dac._auto_handles)
+        unnamed = len(matches) - len(given)
+        parts = []
+        if given:
+            parts.append(f"named {given}")
+        if unnamed:
+            parts.append(f"{unnamed} unnamed")
+        return (
+            None,
+            False,
+            f"Ambiguous connections ({' and '.join(parts)}): name them in the DataAccessCollection "
+            f"and set '{CONNECTION_HANDLE_OPTION}' or 'data_access_handle' to pick one.",
+        )
+    return None, False, None

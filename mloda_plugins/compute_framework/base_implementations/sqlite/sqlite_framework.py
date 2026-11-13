@@ -1,0 +1,207 @@
+import logging
+import re
+import sqlite3
+import sys
+from collections.abc import Sequence
+from typing import Any
+
+from mloda.core.abstract_plugins.components.data_types import DataType
+from mloda.provider import BaseMergeEngine
+from mloda.provider import ComputeFramework, ConnectionRequirement
+from mloda.provider import OutputSchema
+from mloda.provider import BaseFilterEngine, BaseMaskEngine
+from mloda.user import FeatureName, ParallelizationMode
+from mloda_plugins.compute_framework.base_implementations.sql.sql_utils import (
+    MissingRelationColumnError,
+    fold_identifier,
+)
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_filter_engine import SqliteFilterEngine
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_mask_engine import SqliteMaskEngine
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_merge_engine import SqliteMergeEngine
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_relation import SqliteRelation
+
+logger = logging.getLogger(__name__)
+
+_SQLITE_MISSING_COLUMN_PREFIX = "no such column"
+
+
+def _regexp(pattern: str, string: str | None) -> bool:
+    """SQLite REGEXP implementation. Warning: pattern comes from filter values; malicious
+    patterns (e.g. '(a+)+$') can cause exponential backtracking on crafted input."""
+    if string is None:
+        return False
+    return bool(re.search(pattern, string))
+
+
+class SqliteFramework(ComputeFramework):
+    INSTALL_HINT = 'pip install "mloda[sqlite]"'
+
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
+        if framework_connection_object is None:
+            raise ValueError(
+                "A sqlite3.Connection object is required. Put the connection in the DataAccessCollection and select it with connection_handle."
+            )
+        if not isinstance(framework_connection_object, sqlite3.Connection):
+            raise ValueError(f"Expected a sqlite3.Connection object, got {type(framework_connection_object)}")
+        if self.framework_connection_object is not None:
+            if self.framework_connection_object is not framework_connection_object:
+                raise ValueError("A different connection is already set. Cannot replace an existing connection.")
+            return  # same connection passed again — safe no-op
+        framework_connection_object.create_function("REGEXP", 2, _regexp, deterministic=True)
+        # Quoted unknown columns raise instead of reading as string literals; Connection.setconfig needs 3.12+.
+        if sys.version_info >= (3, 12) and hasattr(sqlite3, "SQLITE_DBCONFIG_DQS_DML"):
+            framework_connection_object.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+        self.framework_connection_object = framework_connection_object
+
+    @classmethod
+    def connection_requirement(cls) -> ConnectionRequirement:
+        return ConnectionRequirement.REQUIRED
+
+    @classmethod
+    def _connection_matches(cls, conn: Any) -> bool:
+        return isinstance(conn, sqlite3.Connection)
+
+    @classmethod
+    def connection_of(cls, data: Any) -> Any | None:
+        return data.connection if isinstance(data, SqliteRelation) else None
+
+    @staticmethod
+    def is_available() -> bool:
+        """sqlite3 is stdlib, but the relation and merge engine speak Arrow, so pyarrow decides."""
+        try:
+            import pyarrow  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    @classmethod
+    def expected_data_framework(cls) -> Any:
+        return SqliteRelation
+
+    @classmethod
+    def is_missing_column_error(cls, error: Exception) -> bool:
+        if isinstance(error, MissingRelationColumnError):
+            return True
+        return isinstance(error, sqlite3.OperationalError) and str(error).startswith(_SQLITE_MISSING_COLUMN_PREFIX)
+
+    @classmethod
+    def result_framework(cls) -> type[ComputeFramework]:
+        from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+
+        return PyArrowTable
+
+    @classmethod
+    def merge_engine(cls) -> type[BaseMergeEngine]:
+        return SqliteMergeEngine
+
+    def select_data_by_column_names(
+        self,
+        data: Any,
+        selected_feature_names: Sequence[FeatureName],
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
+    ) -> Any:
+        """Materialize the final result as a PyArrow Table."""
+        selected = self.select_native_data_by_column_names(
+            data, selected_feature_names, column_ordering, request_feature_order
+        )
+        table = selected.to_arrow_table()
+        selected.drop()
+        return table
+
+    def select_native_data_by_column_names(
+        self,
+        data: Any,
+        selected_feature_names: Sequence[FeatureName],
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
+    ) -> Any:
+        """The selected columns as a lazy SqliteRelation."""
+        column_names = set(data.columns)
+        _selected_feature_names = self.identify_naming_convention(
+            selected_feature_names, column_names, ordering=column_ordering, request_feature_order=request_feature_order
+        )
+        return data.select(*list(_selected_feature_names))
+
+    @classmethod
+    def extract_column_names(cls, data: Any) -> set[str]:
+        return set(data.columns)
+
+    def _row_count(self, data: Any) -> int | None:
+        """A SqliteRelation's __len__ runs a SELECT COUNT(*), a real query; never call it for observability."""
+        if isinstance(data, SqliteRelation):
+            return None
+        return super()._row_count(data)
+
+    def _append_columns(self, data: Any, columns: dict[str, Any]) -> Any | None:
+        if not isinstance(data, SqliteRelation):
+            return None
+        if {fold_identifier(c) for c in data.columns} & {fold_identifier(n) for n in columns}:
+            return None
+        rows = len(data)
+        if any(len(values) != rows for values in columns.values()):
+            return None
+        return data.append_columns({name: list(values) for name, values in columns.items()})
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Report propagated hints (None per unresolved column) or, without hints, carried zero-row types else PRAGMA; never scans rows."""
+        if not isinstance(data, SqliteRelation):
+            return super()._output_schema(data)
+        columns = data.columns
+        if not columns:
+            return None
+        hints = data.type_hints if data.type_hints is not None else data.types
+        return tuple(
+            (name, None if hint is None else str(hint))
+            for name, hint in sorted(zip(columns, hints), key=lambda pair: pair[0])
+        )
+
+    def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
+        if not hasattr(data, "columns") or column_name not in data.columns:
+            return None
+        idx = data.columns.index(column_name)
+        return str(data.types[idx])
+
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
+        if not hasattr(data, "columns") or column_name not in data.columns:
+            return None
+        idx = data.columns.index(column_name)
+        return DataType.from_arrow_type_safe(data.types[idx])
+
+    def transform(
+        self,
+        data: Any,
+        feature_names: Sequence[str],
+    ) -> Any:
+        transformed_data = self.apply_compute_framework_transformer(data)
+        if transformed_data is not None:
+            return transformed_data
+
+        if isinstance(data, dict):
+            if self.framework_connection_object is None:
+                raise ValueError(
+                    "Framework connection object is not set. Please call set_framework_connection_object() first."
+                )
+            return SqliteRelation.from_dict(self.framework_connection_object, data)
+
+        if hasattr(data, "__iter__") and not isinstance(data, (str, bytes)):
+            if len(feature_names) == 1:
+                feature_name = next(iter(feature_names))
+                return self.data.append_column(feature_name, list(data))
+            raise ValueError(f"Only one feature can be added at a time: {feature_names}")
+
+        raise ValueError(f"Data {type(data)} is not supported by {self.__class__.__name__}")
+
+    @classmethod
+    def supported_parallelization_modes(cls) -> set[ParallelizationMode]:
+        """The live connection is reused without thread isolation and cannot cross a process boundary."""
+        return {ParallelizationMode.SYNC}
+
+    @classmethod
+    def filter_engine(cls) -> type[BaseFilterEngine]:
+        return SqliteFilterEngine
+
+    @classmethod
+    def mask_engine(cls) -> type[BaseMaskEngine]:
+        return SqliteMaskEngine

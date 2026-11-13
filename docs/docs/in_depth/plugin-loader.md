@@ -1,0 +1,142 @@
+# PluginLoader
+
+The PluginLoader dynamically loads and manages plugins from the `mloda_plugins` package, and discovers plugins shipped by separately installed packages via [entry points](#entry-points).
+
+## Quick Start
+
+```python
+from mloda.user import PluginLoader
+
+# Load all plugins
+loader = PluginLoader.all()
+
+# Or load specific groups
+loader = PluginLoader()
+loader.load_group("feature_group")
+```
+
+## Main Methods
+
+### `PluginLoader.all()`
+Creates a loader, loads all bundled plugins, then folds in installed [entry points](#entry-points).
+
+### `load_group(group_name: str)`
+Loads all plugins from a specific group folder, including nested subdirectories. Supports slash-separated paths for subdirectories (e.g. `"feature_group/input_data/document_formats"`).
+
+### `load_matching(group_name: str, pattern: str, skip_dirs=())`
+Loads only files within a group whose filename matches a glob pattern (e.g. `"*transformer*"`), skipping files whose parent directory name is in `skip_dirs`. Useful when only a subset of files in a group is needed.
+
+### `load_all_plugins()`
+Loads all plugin groups.
+
+### `load_entry_points(group: str | None = None)`
+Discovers plugins from installed packages that declare [entry points](#entry-points). Pass a group name to restrict discovery to one group; `None` loads all three. Returns the sorted, deduplicated list of registry keys it registered.
+
+### `list_loaded_modules(plugin_category: str | None)`
+Lists loaded plugin modules, optionally filtered by category.
+
+### `display_plugin_graph(plugin_category: str | None)`
+Shows plugin dependencies as a graph.
+
+## Example
+
+```python
+# Create loader and load plugins
+loader = PluginLoader()
+loader.load_all_plugins()
+
+# List loaded modules
+modules = loader.list_loaded_modules()
+
+# Show dependencies
+graph = loader.display_plugin_graph()
+```
+
+Plugins are automatically discovered from `.py` files in these directories.
+
+## Entry Points
+
+Separately installed packages publish plugins through three entry-point groups, one per plugin base type:
+
+- `mloda.feature_groups` for FeatureGroup classes
+- `mloda.compute_frameworks` for ComputeFramework classes
+- `mloda.extenders` for Extender classes
+
+### Manifest Convention
+
+A package declares one entry per group it ships plugins for. The entry points at a module attribute, the manifest: a plain sequence of plugin classes. The entry-point name (`my-pkg` below) is a package label only, never a registry key; registered classes keep the usual `module:qualname` keys.
+
+```toml
+# pyproject.toml
+[project.entry-points."mloda.feature_groups"]
+my-pkg = "my_pkg.manifest:FEATURE_GROUPS"
+
+[project.entry-points."mloda.compute_frameworks"]
+my-pkg = "my_pkg.manifest:COMPUTE_FRAMEWORKS"
+```
+
+A manifest of an existing group may also list `Implementation` classes.
+
+The manifest module lists the concrete classes explicitly:
+
+```py
+# my_pkg/manifest.py
+from mloda.provider import FeatureGroup
+
+class CustomerChurnFeatureGroup(FeatureGroup):
+    """Shipped by my-pkg; registers under its module:qualname key."""
+
+FEATURE_GROUPS = [CustomerChurnFeatureGroup]
+```
+
+### Declaring Optional Dependencies
+
+A package can name its own optional import roots per entry point via a companion `mloda.optional_dependencies` entry, whose name matches the entry it protects:
+
+```toml
+[project.entry-points."mloda.feature_groups"]
+my-pkg = "my_pkg.manifest:FEATURE_GROUPS"
+
+[project.entry-points."mloda.optional_dependencies"]
+my-pkg = "my_pkg.optional_deps:OPTIONAL_DEPENDENCIES"
+```
+
+```py
+# my_pkg/optional_deps.py
+# Must always be safely importable on its own.
+OPTIONAL_DEPENDENCIES = ("some_optional_lib",)
+```
+
+The declaration is scoped to the distribution that published it (matched by the installed package, not the entry-point name), so two unrelated packages reusing the same entry-point label never collide.
+
+A root may name a namespace subpackage: `mloda.enterprise` covers itself and every module under it, but not `mloda.enterprisex` or the rest of `mloda`. Declare the shallowest package that can be absent, since Python reports the shallowest missing package: `mloda.enterprise`, not `mloda.enterprise.bar`, unless another installed package always provides `mloda.enterprise`.
+
+### Loading
+
+Discovery is lazy: installing a package does nothing by itself. Manifests are imported and registered only when `load_entry_points()` runs, either directly or as the final step of `PluginLoader.all()`. Discovered classes register into the default registry with provenance `source="entry_point"` (see [Plugin Registry](plugin_registry.md)).
+
+```python
+from mloda.user import PluginLoader
+
+loader = PluginLoader()
+
+# All three groups; returns the sorted, deduplicated registry keys that were registered.
+keys = loader.load_entry_points()
+assert keys == sorted(set(keys))
+
+# One group only; unknown group names raise ValueError.
+fg_keys = loader.load_entry_points(group="mloda.feature_groups")
+```
+
+### Behavior Notes
+
+- **Validation is loud, by design.** A malformed entry point fails discovery with an error instead of being skipped: a manifest that is not a list or tuple of plugin classes, or that contains classes of the wrong base type for its group, raises `TypeError` naming the entry point.
+- **Abstract classes are skipped** silently; manifests may list a shared abstract base alongside its concrete subclasses.
+- **Collisions raise.** If a different class already holds a manifest class's `module:qualname` key, loading raises `PluginRegistryCollisionError`. Loading the same manifests twice is idempotent.
+- **Missing optional dependencies skip.** `ImportError` (covers `ModuleNotFoundError` too) around an entry point's `.load()` is caught. It is attributed to a declared (or global `OPTIONAL_PLUGIN_DEPENDENCIES`) optional root either by the error's own module name, or by the innermost (deepest) traceback frame, i.e. where the failure actually happened, belonging to that root's code. A match skips only that entry point and logs at WARNING naming the entry point and the missing module; otherwise the error re-raises.
+- **Skips are visible.** A skipped module under the loader's base package (`mloda_plugins` by default) logs one DEBUG record (a bare install stays quiet) and a skipped entry point logs one WARNING, each naming the module and the missing dependency, and logging again only when that dependency changes, after a successful load in between, or after `reset_cache()`. `PluginLoader.skipped_plugins()` returns every skipped module and entry point with its missing dependency; `reset_cache()` clears it.
+- **Reusable directly.** The traceback-frame attribution above is importable directly: `traceback_blames_root(exc, root)` from `mloda.provider` or `mloda.steward`, for downstream packages building their own optional-dependency guards. Callers must exclude their own module's root from the roots they pass in, the same way `load_entry_points` excludes the entry point's own module, so a namespace collision can't misattribute the caller's own bug to that root.
+- **Own-package failures raise.** A declared root that contains the entry point's own module (`mloda` or `mloda.community` for a `mloda.community.foo` plugin) is never eligible for name or traceback attribution, so a genuine failure in the plugin's own code still raises even if it shares a name with a declared optional root.
+- **Same top-level package.** A missing module under the entry point's own top-level package re-raises, unless its name sits under an eligible declared root (a `mloda.community` plugin declaring `mloda.enterprise`); traceback attribution alone does not rescue it. When the missing module is the entry point's own module or a parent package (files gone, metadata left), the error names the entry point, distribution and module, and suggests `pip install --force-reinstall <distribution>`.
+- **Policies apply, after import.** A registration denied by an installed [plugin policy](plugin_registry.md#governance) raises inside `register()`; the loader catches the denial, skips the class, leaves its key out of the returned list, and logs one warning per denied key per registry instance. The policy gates registration only, not import: the manifest module is imported before the policy applies, so installing a package implies trusting its import side effects.
+- **Discovery is cached per process.** An in-place edit of an existing `entry_points.txt` needs `all(force_reload=True)` or `reset_cache()`. The plugin module list is cached too, so a plugin file added to the plugin package at runtime needs the same.

@@ -1,0 +1,407 @@
+"""Scope check for a FeatureGroup subclass: it takes over only when its selecting option is set."""
+
+from __future__ import annotations
+
+import functools
+from collections.abc import Callable, Collection, Sequence
+from typing import Any
+
+from mloda._testing.feature_group_shape import (
+    _UNKNOWN_VALUE,
+    _probe,
+    _base_options,
+    _cell_same,
+    _first_value,
+    _name_bound_keys,
+    _availability_reason,
+    _input_problems,
+    _no_implementation_reason,
+    _not_applicable_reason,
+    _rule_reason,
+    _route_block,
+    _run as _run_group,
+    _same,
+    _written,
+    _serving_implementation,
+)
+from mloda._testing.framework_adapter import FrameworkAdapter, PythonDictAdapter
+from mloda._testing.result import CheckResult
+from mloda._testing.suite import assert_passed
+from mloda._testing.typed_data import TypedTestData
+from mloda.core.abstract_plugins.components.divergence import Divergence, DivergenceKind, allowed_variants
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
+from mloda.core.abstract_plugins.components.property_spec import PropertySpec
+from mloda.core.abstract_plugins.components.utils import is_nominal_subclass, safe_field_with_error
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.abstract_plugins.implementation import Implementation
+from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping, PreFilterPlugins
+from mloda.core.prepare.identify_feature_group import evaluate_and_render
+
+
+def _mapping(
+    parent: type[FeatureGroup], subclass: type[FeatureGroup]
+) -> tuple[FeatureGroupEnvironmentMapping, list[str]]:
+    loaded = PreFilterPlugins.get_cfw_subclasses()
+    mapping: FeatureGroupEnvironmentMapping = {}
+    failures: list[str] = []
+    for cls in (parent, subclass):
+        mapping[cls] = {cfw for cfw in cls.compute_framework_definition() if cfw in loaded}
+        if not mapping[cls]:
+            failures.append(f"setup: no compute framework of {cls.__name__} is loaded")
+    return mapping, failures
+
+
+def _evaluate(feature: Feature, mapping: FeatureGroupEnvironmentMapping) -> tuple[Any, str | None, str | None]:
+    """(result, message, aborted): an escalated match abort comes back as its text instead of raising."""
+    outcome, error = safe_field_with_error(lambda: evaluate_and_render(feature, mapping), None)
+    if outcome is None:
+        return None, None, error
+    return outcome[0], outcome[1], None
+
+
+def _combined(base: Options, selecting: Options) -> Options:
+    return Options(group={**base.group, **selecting.group}, context={**base.context, **selecting.context})
+
+
+def _optional_probes(
+    parent: type[FeatureGroup], base: Options, keys: set[str], bound: frozenset[str] = frozenset()
+) -> list[tuple[str, Options]]:
+    taken = {*base.group, *base.context, *keys, *bound}
+    probes = []
+    for key, spec in (parent.PROPERTY_MAPPING or {}).items():
+        if key in taken or not isinstance(spec, PropertySpec):
+            continue
+        value = _first_value(parent, key, spec)
+        if value is not None:
+            probes.append((key, Options(group={**base.group, key: value}, context=dict(base.context))))
+    return probes
+
+
+def _value_probes(
+    subclass: type[FeatureGroup],
+    parent: type[FeatureGroup],
+    base: Options,
+    selecting: Options,
+    bound: frozenset[str] = frozenset(),
+) -> list[tuple[str, Any, Callable[[], Options]]]:
+    """(key, value, options factory) per selecting key and other value; a fresh Options per call."""
+    reserved = {k.value for k in DefaultOptionKeys}
+    probes: list[tuple[str, Any, Callable[[], Options]]] = []
+    for section in ("group", "context"):
+        for key, chosen in getattr(selecting, section).items():
+            if key in reserved or key in bound:
+                continue
+            found = [(c.PROPERTY_MAPPING or {}).get(key) for c in (subclass, parent)]
+            specs = [f for f in found if isinstance(f, PropertySpec)]
+            allowed = [v for s in specs for v in (s.allowed_values or ())]
+            others = [v for v in allowed if not _cell_same(v, chosen)]
+            values = sorted(
+                {repr(v): v for v in others}.values(),
+                key=repr,
+            )
+            if not specs or not all(s.allowed_values and s.strict_validation for s in specs):
+                values.append(_UNKNOWN_VALUE)
+            for value in values:
+                probes.append((key, value, functools.partial(_replaced, base, selecting, section, key, value)))
+    return probes
+
+
+def _replaced(base: Options, selecting: Options, section: str, key: str, value: Any) -> Options:
+    combined = _combined(base, selecting)
+    sections = {"group": dict(combined.group), "context": dict(combined.context)}
+    sections[section][key] = value
+    return Options(group=sections["group"], context=sections["context"])
+
+
+def _plain_failure(
+    name: str,
+    options: Options,
+    label: str,
+    mapping: FeatureGroupEnvironmentMapping,
+    parent: type[FeatureGroup],
+    subclass: type[FeatureGroup],
+) -> str | None:
+    result, message, aborted = _evaluate(Feature(name, options), mapping)
+    if aborted is not None:
+        return f"setup: matching '{name}' {label} aborted: {aborted}"
+    found = set(result.identified)
+    if found == {parent}:
+        return None
+    if found == {subclass}:
+        return f"steals: '{name}' {label} resolves to {subclass.__name__}"
+    if found:
+        return f"setup: '{name}' {label} is ambiguous between {', '.join(sorted(c.__name__ for c in found))}"
+    return f"setup: {parent.__name__} itself does not resolve '{name}' {label}: {message}"
+
+
+def _value_failure(
+    name: str,
+    label: str,
+    make: Callable[[], Options],
+    mapping: FeatureGroupEnvironmentMapping,
+    parent: type[FeatureGroup],
+    subclass: type[FeatureGroup],
+) -> list[str]:
+    result, _, aborted = _evaluate(Feature(name, make()), mapping)
+    if aborted is not None:
+        return [f"setup: matching '{name}' {label} aborted: {aborted}"]
+    found = set(result.identified)
+    if found == {subclass}:
+        alone = _probe(parent, name, make())
+        if alone.aborted is not None:
+            return [f"setup: matching '{name}' on {parent.__name__} {label} aborted: {alone.aborted}"]
+        return [f"steals: '{name}' {label} resolves to {subclass.__name__}"] if alone.matched else []
+    if len(found) > 1:
+        return [f"setup: '{name}' {label} is ambiguous between {', '.join(sorted(c.__name__ for c in found))}"]
+    return []
+
+
+def _free_only(base: Options, selecting: Options, free: frozenset[str]) -> Options:
+    return Options(
+        group={**base.group, **{k: v for k, v in selecting.group.items() if k in free}},
+        context={**base.context, **{k: v for k, v in selecting.context.items() if k in free}},
+    )
+
+
+def _scope_failures(
+    subclass: type[FeatureGroup],
+    parent: type[FeatureGroup],
+    names: list[str],
+    base: Options,
+    selecting: Options,
+    bound: frozenset[str] = frozenset(),
+    free: frozenset[str] = frozenset(),
+) -> list[str]:
+    keys = {*selecting.group, *selecting.context}
+    mapping, failures = _mapping(parent, subclass)
+    if failures:
+        return failures
+    label = f"without {sorted(keys)}"
+    probes = [("", base), *_optional_probes(parent, base, keys, bound)]
+    value_probes = _value_probes(subclass, parent, base, selecting, bound)
+    for name in names:
+        for key, options in probes:
+            failure = _plain_failure(name, options, f"with option '{key}'" if key else label, mapping, parent, subclass)
+            if failure is not None:
+                failures.append(failure)
+        for key, value, make in value_probes:
+            failures += _value_failure(name, f"with '{key}'={value!r}", make, mapping, parent, subclass)
+        if free:
+            make_free = functools.partial(_free_only, base, selecting, free)
+            label = f"with free keys only {sorted(free)}"
+            failures += _value_failure(name, label, make_free, mapping, parent, subclass)
+        selected, selected_message, aborted = _evaluate(Feature(name, _combined(base, selecting)), mapping)
+        if aborted is not None:
+            failures.append(f"misses: matching '{name}' with {sorted(keys)} aborted: {aborted}")
+        elif set(selected.identified) != {subclass}:
+            found = selected_message or ", ".join(sorted(c.__name__ for c in selected.identified))
+            failures.append(f"misses: '{name}' with {sorted(keys)} resolves to {found}")
+    return failures
+
+
+_EXCUSING = (DivergenceKind.VALUE, DivergenceKind.TYPE, DivergenceKind.VARIANT)
+
+
+def _own_records(
+    subclass: type[FeatureGroup],
+    parent: type[FeatureGroup],
+    sub_impl: type[Implementation[Any]] | None,
+    parent_impl: type[Implementation[Any]] | None,
+) -> list[Divergence]:
+    # Records equal to the parent's count as inherited, not as the subclass's own.
+    records = [r for r in subclass.DIVERGENCES if r not in parent.DIVERGENCES]
+    if sub_impl is not None and parent_impl is not None and sub_impl is not parent_impl:
+        records += [r for r in sub_impl.divergences if r not in parent_impl.divergences]
+    return [r for r in records if r.kind in _EXCUSING]
+
+
+def _value_failures(
+    subclass: type[FeatureGroup],
+    parent: type[FeatureGroup],
+    names: list[str],
+    base: Options,
+    selecting: Options,
+    data: TypedTestData,
+    adapter: FrameworkAdapter,
+    notes: list[str],
+    require_run: bool,
+) -> list[str]:
+    failures: list[str] = []
+    skipped = failures if require_run else notes
+    for cls in (parent, subclass):
+        reason = _not_applicable_reason(cls) or _availability_reason(adapter)
+        if reason is not None:
+            notes.append(f"values: {reason}")
+            return []
+        reason = _rule_reason(cls, adapter) or _no_implementation_reason(cls, adapter)
+        if reason is not None:
+            skipped.append(f"values: {reason}")
+            return failures
+    chosen = _combined(base, selecting)
+    impls = {cls: _serving_implementation(cls, adapter) for cls in (parent, subclass)}
+    remaining = []
+    for name in names:
+        blocked = False
+        for cls, options in ((parent, base), (subclass, chosen)):
+            block, raised = _route_block(cls, adapter, name, options)
+            if raised is not None:
+                failures.append(f"values: {raised}")
+            elif block is not None:
+                skipped.append(f"values: {block}")
+            blocked = blocked or raised is not None or block is not None
+        if not blocked:
+            remaining.append(name)
+    if not remaining:
+        return failures
+    names = remaining
+    problems = _input_problems(parent, names, base, data) + _input_problems(subclass, names, chosen, data)
+    if problems:
+        return failures + [f"values: {p}" for p in dict.fromkeys(problems)]
+    expected, error = _run_group(parent, adapter, data, names, base)
+    if error is not None:
+        return [*failures, f"setup: {parent.__name__} run raised: {error}"]
+    actual, error = _run_group(subclass, adapter, data, names, chosen)
+    if error is not None:
+        return [*failures, f"values: {subclass.__name__} run raised: {error}"]
+    allowed = allowed_variants(chosen)
+    records = [
+        r
+        for r in _own_records(subclass, parent, impls[subclass], impls[parent])
+        if r.kind is not DivergenceKind.VARIANT or r.variant in allowed
+    ]
+    written = _written(adapter, data, expected, names)
+    wrote = {w[1] for w in written}
+    for name in dict.fromkeys(names):
+        if name not in wrote:
+            failures.append(f"setup: {parent.__name__} wrote no column for '{name}'")
+    if adapter.row_count(expected) == 0:
+        skipped.append(f"values: {parent.__name__} returned no rows, nothing compared")
+        return failures
+
+    def covered(name: str, parts: frozenset[str]) -> bool:
+        subtype = Implementation.canonical_subtype(subclass, name, chosen)
+        return any(r.applies_to(subtype, parts) for r in records)
+
+    present = adapter.column_names(actual)
+    for column, name, parts in written:
+        if column not in present:
+            failures.append(f"values: '{column}' is missing from {subclass.__name__}'s result")
+        elif not _same(adapter.column_values(expected, column), adapter.column_values(actual, column)):
+            if not covered(name, parts):
+                failures.append(
+                    f"values: '{column}' differs from {parent.__name__} "
+                    f"and {subclass.__name__} declares no divergence for it"
+                )
+    known = adapter.column_names(expected)
+    for column, name, parts in _written(adapter, data, actual, names):
+        if column not in known and name in wrote and not covered(name, parts):
+            failures.append(
+                f"values: '{column}' is missing from {parent.__name__}'s result "
+                f"and {subclass.__name__} declares no divergence for it"
+            )
+    return failures
+
+
+def check_subclass_scope(
+    subclass: type[FeatureGroup],
+    parent: type[FeatureGroup],
+    selecting: Options,
+    requests: Sequence[str] | None = None,
+    *,
+    input_data: TypedTestData | None = None,
+    adapter: FrameworkAdapter | None = None,
+    require_run: bool = False,
+    free: Collection[str] = (),
+) -> CheckResult:
+    """Check subclass replaces parent only with the selecting options (and values); only these two classes count.
+
+    Keys in free configure the subclass but get no other-value probe.
+    With input_data it also compares the requested output columns with the parent's, in both directions,
+    assuming identical row order.
+    With require_run, a rule exclusion, a missing serving Implementation, a route block or no rows is a failure.
+    """
+    free_keys = frozenset((free,) if isinstance(free, str) else free)
+    failures = _run(subclass, parent, selecting, requests, free_keys)
+    notes: list[str] = []
+    if free_keys and not any(f.startswith(("setup:", "names:")) for f in failures):
+        notes.append(f"scope: {sorted(free_keys)} set but not probed with other values")
+    if input_data is None:
+        notes.append("values: not compared (no input_data)")
+    elif any(f.startswith(("setup:", "names:", "misses:")) for f in failures):
+        notes.append("values: not compared (resolution failed)")
+    else:
+        names = list(requests) if requests is not None else sorted(parent.feature_names_supported())
+        bound = _bound_keys(parent, names)
+        base = _base_options(parent, bound or {})
+        if base is not None:
+            failures += _value_failures(
+                subclass, parent, names, base, selecting, input_data, adapter or PythonDictAdapter(), notes, require_run
+            )
+    return CheckResult(check="subclass_scope", subject=subclass.__name__, failures=tuple(failures), notes=tuple(notes))
+
+
+def _bound_keys(parent: type[FeatureGroup], names: list[str]) -> dict[str, frozenset[str]] | None:
+    """The option keys each name binds; None when the names bind different key sets."""
+    bound = {k: v for k, v in ((n, _name_bound_keys(parent, n)) for n in names) if v is not None}
+    return bound if len(set(bound.values())) <= 1 else None
+
+
+def _run(
+    subclass: type[FeatureGroup],
+    parent: type[FeatureGroup],
+    selecting: Options,
+    requests: Sequence[str] | None,
+    free: frozenset[str] = frozenset(),
+) -> list[str]:
+    if not is_nominal_subclass(subclass, parent) or subclass is parent:
+        return [f"setup: {subclass.__name__} is not a proper subclass of {parent.__name__}"]
+    declared = sorted(parent.feature_names_supported())
+    names = list(requests) if requests is not None else declared
+    if not names:
+        if requests is not None:
+            return ["names: no requests to check"]
+        return ["names: parent declares no feature names; pass requests="]
+    bound = _bound_keys(parent, names)
+    if bound is None:
+        return ["names: the requested names bind different option keys; check them in separate calls"]
+    base = _base_options(parent, bound)
+    if base is None:
+        return ["setup: cannot build a request for the parent; declare allowed_values or default"]
+    present = sorted({*selecting.group, *selecting.context} & {*base.group, *base.context})
+    if present:
+        return [f"setup: selecting keys {present} are already in the base options and would mask a steal"]
+    name_bound = frozenset().union(*bound.values())
+    selecting_keys = {*selecting.group, *selecting.context}
+    if not free <= selecting_keys:
+        return [f"setup: free keys {sorted(free - selecting_keys)} are not selecting keys"]
+    reserved = {k.value for k in DefaultOptionKeys}
+    if free and not selecting_keys - free - reserved - name_bound:
+        return ["setup: free leaves no selecting key to probe"]
+    return _scope_failures(subclass, parent, names, base, selecting, name_bound | free, free)
+
+
+def assert_subclass_scope(
+    subclass: type[FeatureGroup],
+    parent: type[FeatureGroup],
+    selecting: Options,
+    requests: Sequence[str] | None = None,
+    *,
+    input_data: TypedTestData | None = None,
+    adapter: FrameworkAdapter | None = None,
+    require_run: bool = True,
+    free: Collection[str] = (),
+) -> None:
+    """Fail the running pytest test if the subclass scope check reports failures; require_run defaults to True."""
+    result = check_subclass_scope(
+        subclass,
+        parent,
+        selecting,
+        requests,
+        input_data=input_data,
+        adapter=adapter,
+        require_run=require_run,
+        free=free,
+    )
+    assert_passed(result)

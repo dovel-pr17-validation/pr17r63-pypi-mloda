@@ -1,0 +1,626 @@
+"""
+Spark Framework Tests
+
+This module contains comprehensive tests for the Spark compute framework implementation.
+
+Requirements:
+- PySpark must be installed (pip install pyspark)
+- Java 17+ must be installed and JAVA_HOME environment variable must be set
+
+Environment Setup:
+- JAVA_HOME: Must point to a valid Java installation
+- SKIP_SPARK_INSTALLATION_TEST: Set to "true" to skip installation validation tests
+
+Test Structure:
+- TestSparkFrameworkAvailability: Tests framework availability detection
+- TestSparkInstallation: Validates PySpark and Java setup
+- TestSparkFrameworkComputeFramework: Core framework functionality tests
+
+The tests use a shared SparkSession fixture to avoid Java gateway conflicts and
+ensure proper resource management across all test methods.
+"""
+
+import os
+from collections.abc import Iterator
+from types import SimpleNamespace
+from typing import Any
+from mloda._testing.compute_framework.dtype_suite import DataTypeValidatorSuite, DtypeExtractionSuite
+from mloda._testing.compute_framework.frame_suite import AppendColumnsSuite, EmptyResultSuite
+from mloda._testing.compute_framework.output_schema_suite import OutputSchemaSuite
+from mloda.provider import Cause
+from mloda._testing.framework_adapter import FrameworkAdapter, SparkAdapter
+from mloda.user import JoinType
+import pytest
+from mloda_plugins.compute_framework.base_implementations.spark.spark_framework import SparkFramework
+from mloda.user import FeatureName
+from mloda.user import ParallelizationMode
+from mloda.user import Index
+from tests.helpers.availability_test_helper import (
+    assert_unavailable_when_import_blocked,
+)
+
+# Import shared fixtures and availability flags from conftest.py
+from tests.test_plugins.compute_framework.base_implementations.spark.conftest import (
+    PYSPARK_AVAILABLE,
+    SKIP_REASON,
+)
+from mloda._testing.compute_framework.merge_suite import make_merge_link
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Import PySpark types for type checking (only if available)
+if PYSPARK_AVAILABLE:
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import (
+        StructType,
+        StructField,
+        StringType,
+        IntegerType,
+        LongType,
+        FloatType,
+        DoubleType,
+        TimestampType,
+    )
+    import pyspark
+else:
+    SparkSession = None
+    StructType = None
+    StructField = None
+    StringType = None
+    IntegerType = None
+    LongType = None
+    FloatType = None
+    DoubleType = None
+    TimestampType = None
+    pyspark = None
+
+
+class TestSparkFrameworkAvailability:
+    def test_is_available_when_pyspark_not_installed(self) -> None:
+        """Test that is_available() returns False when pyspark import fails."""
+        assert_unavailable_when_import_blocked(SparkFramework, ["pyspark.sql"])
+
+
+class TestSparkInstallation:
+    @pytest.mark.skipif(
+        os.getenv("SKIP_SPARK_INSTALLATION_TEST", "false").lower() == "true",
+        reason="Spark installation test is disabled by environment variable",
+    )
+    def test_spark_is_installed(self, spark_session: Any) -> None:
+        """Test that PySpark is properly installed and can be imported."""
+        try:
+            import pyarrow as pa  # noqa: F401
+
+            # Test basic functionality using the shared spark_session fixture
+            data = [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+            df = spark_session.createDataFrame(data)
+            result = df.collect()
+            assert len(result) == 2
+        except ImportError:
+            pytest.fail("PySpark is not installed but is required for this test environment")
+
+
+@pytest.mark.skipif(not PYSPARK_AVAILABLE, reason=SKIP_REASON or "PySpark is not available")
+class TestSparkFrameworkComputeFramework:
+    def test_expected_data_framework(self, spark_session: Any) -> None:
+        from pyspark.sql import DataFrame
+
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        assert spark_framework.expected_data_framework() == DataFrame
+
+    def test_transform_dict_to_dataframe(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        dict_data = {"column1": [1, 2, 3], "column2": [4, 5, 6]}
+        result = spark_framework.transform(dict_data, [])
+        result_data = result.collect()
+
+        expected_data = spark_session.createDataFrame(
+            [{"column1": 1, "column2": 4}, {"column1": 2, "column2": 5}, {"column1": 3, "column2": 6}]
+        )
+        expected_data_collected = expected_data.collect()
+
+        # Compare the data (order might be different)
+        assert len(result_data) == len(expected_data_collected)
+        assert set(result.columns) == set(expected_data.columns)
+
+    def test_transform_invalid_data(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        with pytest.raises(ValueError):
+            spark_framework.transform(data=["a"], feature_names=[])
+
+    def test_select_data_by_column_names(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+        expected_data = spark_session.createDataFrame(
+            [{"column1": 1, "column2": 4}, {"column1": 2, "column2": 5}, {"column1": 3, "column2": 6}]
+        )
+        data = spark_framework.select_data_by_column_names(expected_data, [FeatureName("column1")])
+        assert data.columns == ["column1"]
+
+    def test_set_column_names(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+        expected_data = spark_session.createDataFrame(
+            [{"column1": 1, "column2": 4}, {"column1": 2, "column2": 5}, {"column1": 3, "column2": 6}]
+        )
+        spark_framework.data = expected_data
+        spark_framework.set_column_names()
+        assert spark_framework.column_names == {"column1", "column2"}
+
+    def test_merge_inner(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        left_data = spark_session.createDataFrame([{"idx": 1, "col1": "a"}, {"idx": 3, "col1": "b"}])
+        right_data = spark_session.createDataFrame([{"idx": 1, "col2": "x"}, {"idx": 2, "col2": "z"}])
+        idx = Index(("idx",))
+
+        spark_framework.data = left_data
+        merge_engine_class = spark_framework.merge_engine()
+        framework_connection = spark_framework.get_framework_connection_object()
+        merge_engine = merge_engine_class(framework_connection)
+        result = merge_engine.merge(left_data, right_data, make_merge_link(JoinType.INNER, idx, idx))
+
+        # Check that we got a result and it has the expected structure
+        assert result is not None
+        result_count = result.count()
+        assert result_count == 1  # Should have 1 matching row
+
+    def test_merge_left(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        left_data = spark_session.createDataFrame([{"idx": 1, "col1": "a"}, {"idx": 3, "col1": "b"}])
+        right_data = spark_session.createDataFrame([{"idx": 1, "col2": "x"}, {"idx": 2, "col2": "z"}])
+        idx = Index(("idx",))
+
+        spark_framework.data = left_data
+        framework_connection = spark_framework.get_framework_connection_object()
+        merge_engine_class = spark_framework.merge_engine()
+        merge_engine = merge_engine_class(framework_connection)
+        result = merge_engine.merge(left_data, right_data, make_merge_link(JoinType.LEFT, idx, idx))
+
+        # Check that we got a result with all left rows
+        assert result is not None
+        result_count = result.count()
+        assert result_count == 2  # Should have 2 rows (all from left)
+
+    def test_merge_append(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        left_data = spark_session.createDataFrame([{"idx": 1, "col1": "a"}, {"idx": 3, "col1": "b"}])
+        right_data = spark_session.createDataFrame([{"idx": 1, "col2": "x"}, {"idx": 2, "col2": "z"}])
+        idx = Index(("idx",))
+
+        spark_framework.data = left_data
+        framework_connection = spark_framework.get_framework_connection_object()
+        merge_engine_class = spark_framework.merge_engine()
+        merge_engine = merge_engine_class(framework_connection)
+        result = merge_engine.merge(left_data, right_data, make_merge_link(JoinType.APPEND, idx, idx))
+
+        # Check that we got a result with combined rows
+        assert result is not None
+        result_count = result.count()
+        assert result_count == 4  # Should have 2 + 2 rows
+
+    def test_merge_union(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        left_data = spark_session.createDataFrame([{"idx": 1, "col1": "a"}, {"idx": 3, "col1": "b"}])
+        right_data = spark_session.createDataFrame([{"idx": 1, "col2": "x"}, {"idx": 2, "col2": "z"}])
+        idx = Index(("idx",))
+
+        spark_framework.data = left_data
+        framework_connection = spark_framework.get_framework_connection_object()
+        merge_engine_class = spark_framework.merge_engine()
+        merge_engine = merge_engine_class(framework_connection)
+        result = merge_engine.merge(left_data, right_data, make_merge_link(JoinType.UNION, idx, idx))
+
+        # Check that we got a result (union removes duplicates)
+        assert result is not None
+        result_count = result.count()
+        # The exact count depends on duplicate handling, but should be <= 4
+        assert result_count <= 4
+
+    def test_framework_connection_object(self, spark_session: Any) -> None:
+        """Test that framework connection object is properly set and retrieved."""
+        framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        framework.set_framework_connection_object(spark_session)
+
+        connection = framework.get_framework_connection_object()
+        assert connection is not None
+        if PYSPARK_AVAILABLE:
+            assert isinstance(connection, SparkSession)
+
+    def test_framework_connection_object_invalid_type(self, spark_session: Any) -> None:
+        """Test that setting invalid connection object raises error."""
+        framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+        with pytest.raises(ValueError, match="Expected a SparkSession object"):
+            framework.set_framework_connection_object("invalid")
+
+    def test_transform_empty_dict(self, spark_session: Any) -> None:
+        """Test transformation of empty dictionary."""
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        result = spark_framework.transform({}, [])
+        assert result is not None
+        assert result.count() == 0
+
+    def test_add_column_preserves_existing_user_row_num_column(self, spark_session: Any) -> None:
+        """add_column must not clobber a pre-existing user column literally named ``__row_num``.
+
+        The add-column path uses an internal row-number helper column to align new values with
+        existing rows. A DataFrame that already owns ``__row_num`` must keep it intact alongside
+        the newly added feature column.
+        """
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+
+        existing = spark_session.createDataFrame(
+            [
+                {"__row_num": 100, "other": "a"},
+                {"__row_num": 200, "other": "b"},
+                {"__row_num": 300, "other": "c"},
+            ]
+        )
+        spark_framework.data = spark_framework._pinned_frame = existing
+
+        result = spark_framework.transform([10, 20, 30], ["new_feature"])
+        rows = result.collect()
+
+        by_other = {row["other"]: row for row in rows}
+        assert set(by_other.keys()) == {"a", "b", "c"}
+        # (a) the new column exists with the expected values, aligned per original row
+        assert by_other["a"]["new_feature"] == 10
+        assert by_other["b"]["new_feature"] == 20
+        assert by_other["c"]["new_feature"] == 30
+        # (b) the original __row_num column survives with its original distinctive values
+        assert "__row_num" in result.columns
+        assert sorted(row["__row_num"] for row in rows) == [100, 200, 300]
+        assert {by_other["a"]["__row_num"], by_other["b"]["__row_num"], by_other["c"]["__row_num"]} == {100, 200, 300}
+
+    def test_add_column_case_variant_of_existing_raises(self, spark_session: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+        spark_framework.data = spark_framework._pinned_frame = spark_session.createDataFrame([{"Foo": 1}, {"Foo": 2}])
+
+        with pytest.raises(ValueError, match="Foo"):
+            spark_framework.transform([10, 20], ["foo"])
+
+    def test_add_column_case_variant_allowed_when_case_sensitive(self, spark_case_sensitive: Any) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_case_sensitive)
+        spark_framework.data = spark_framework._pinned_frame = spark_case_sensitive.createDataFrame(
+            [{"Foo": 1}, {"Foo": 2}]
+        )
+
+        result = spark_framework.transform([10, 20], ["foo"])
+
+        assert {"Foo", "foo"} <= set(result.columns)
+        assert {(r["Foo"], r["foo"]) for r in result.collect()} == {(1, 10), (2, 20)}
+
+    @pytest.mark.parametrize("feature", ["__mloda_rn0__", "__MLODA_RN0__"])
+    def test_add_column_named_like_row_number_helper_keeps_values(self, spark_session: Any, feature: str) -> None:
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        spark_framework.set_framework_connection_object(spark_session)
+        spark_framework.data = spark_framework._pinned_frame = spark_session.createDataFrame(
+            [{"other": "a"}, {"other": "b"}, {"other": "c"}]
+        )
+
+        result = spark_framework.transform([10, 20, 30], [feature])
+
+        assert {r["other"]: r[feature] for r in result.collect()} == {"a": 10, "b": 20, "c": 30}
+
+    def test_infer_spark_type(self, spark_session: Any) -> None:
+        """Test Spark type inference."""
+        from pyspark.sql.types import BooleanType, IntegerType, DoubleType, StringType
+
+        spark_framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+        assert isinstance(spark_framework._infer_spark_type(True), BooleanType)
+        assert isinstance(spark_framework._infer_spark_type(42), IntegerType)
+        assert isinstance(spark_framework._infer_spark_type(3.14), DoubleType)
+        assert isinstance(spark_framework._infer_spark_type("test"), StringType)
+
+
+class TestSparkDtypeExtractionSuite(DtypeExtractionSuite):
+    adapter_class = SparkAdapter
+
+    @pytest.fixture
+    def adapter(self, spark_session: Any) -> Iterator[FrameworkAdapter]:
+        """SparkAdapter borrows the active session, so spark_session must exist first."""
+        spark_adapter = self.adapter_class()
+        with spark_adapter:
+            yield spark_adapter
+
+
+_NO_UNSIGNED = (Cause.BACKEND, "Spark has no unsigned integer types")
+_INSTANT_TIMESTAMP = (
+    Cause.BACKEND,
+    "Spark TimestampType is kept as TIMESTAMP_MICROS for compatibility "
+    "(it is the instant type; TimestampNTZType is the naive one)",
+)
+_ONE_TIMESTAMP = "Spark has only one TimestampType (microseconds); millisecond cannot be expressed"
+
+
+class TestSparkDataTypeValidatorSuite(DataTypeValidatorSuite):
+    adapter_class = SparkAdapter
+    unsupported_cases = {
+        "uint8_col": _NO_UNSIGNED,
+        "uint64_col": _NO_UNSIGNED,
+        "uint16_col": _NO_UNSIGNED,
+        "uint32_col": _NO_UNSIGNED,
+        "timestamp_us_tz_col": _INSTANT_TIMESTAMP,
+        "timestamp_ns_tz_col": _INSTANT_TIMESTAMP,
+    }
+    switched_off = {
+        "test_timestamp_ms_column_strict_ms_passes": Cause.BACKEND,
+        "test_timestamp_us_column_strict_ms_raises": Cause.BACKEND,
+    }
+
+    @pytest.fixture
+    def adapter(self, spark_session: Any) -> Iterator[FrameworkAdapter]:
+        """SparkAdapter borrows the active session, so spark_session must exist first."""
+        spark_adapter = self.adapter_class()
+        with spark_adapter:
+            yield spark_adapter
+
+    @pytest.mark.skip(reason=_ONE_TIMESTAMP)
+    def test_timestamp_ms_column_strict_ms_passes(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+    @pytest.mark.skip(reason=_ONE_TIMESTAMP)
+    def test_timestamp_us_column_strict_ms_raises(self, adapter: FrameworkAdapter, framework_instance: Any) -> None: ...
+
+
+class TestSparkEmptyResultSuite(EmptyResultSuite):
+    adapter_class = SparkAdapter
+
+    @pytest.fixture
+    def adapter(self, spark_session: Any) -> Iterator[FrameworkAdapter]:
+        """SparkAdapter borrows the active session, so spark_session must exist first."""
+        spark_adapter = self.adapter_class()
+        with spark_adapter:
+            yield spark_adapter
+
+
+class TestSparkAppendColumnsSuite(AppendColumnsSuite):
+    adapter_class = SparkAdapter
+    needs_pinned_frame = True
+    case_folds_names = True
+
+    @pytest.fixture
+    def adapter(self, spark_session: Any) -> Iterator[FrameworkAdapter]:
+        """SparkAdapter borrows the active session, so spark_session must exist first."""
+        spark_adapter = self.adapter_class()
+        with spark_adapter:
+            yield spark_adapter
+
+    def single_column(self, values: list[Any]) -> Any | None:
+        return values
+
+    def joined_frame(self, adapter: FrameworkAdapter) -> Any:
+        session = adapter.connection
+        left = session.createDataFrame([{"a": 1}, {"a": 2}, {"a": 3}])
+        right = session.createDataFrame([{"a": 3, "b": 30}, {"a": 1, "b": 10}, {"a": 2, "b": 20}])
+        return left.join(right, on="a")
+
+
+from mloda._testing.compute_framework.connection_suite import ConnectionPickSuite  # noqa: E402
+from tests.test_plugins.compute_framework.base_implementations.spark.spark_session_adapter import (  # noqa: E402
+    SparkSessionAdapter,
+)
+
+_NO_PER_DATA_CONNECTION = "Spark data does not carry its own connection; no per-data connection check"
+
+
+class TestSparkTfsConnectionInit(SparkSessionAdapter, ConnectionPickSuite):
+    switched_off = {
+        "test_adopt_connection_rejects_data_on_another_connection_than_the_bound_one": Cause.BACKEND,
+        "test_adopt_connection_accepts_the_bound_connection_and_adopts_when_unbound": Cause.BACKEND,
+        "test_missing_connection_error_names_the_dac_and_connection_handle": Cause.BACKEND,
+    }
+
+    def second_connection(self, second_adapter: FrameworkAdapter) -> Any:
+        from unittest.mock import Mock
+
+        return Mock(spec=SparkSession)
+
+    @pytest.mark.skip(reason=_NO_PER_DATA_CONNECTION)
+    def test_adopt_connection_rejects_data_on_another_connection_than_the_bound_one(
+        self, *args: Any, **kwargs: Any
+    ) -> None: ...
+
+    @pytest.mark.skip(reason=_NO_PER_DATA_CONNECTION)
+    def test_adopt_connection_accepts_the_bound_connection_and_adopts_when_unbound(
+        self, *args: Any, **kwargs: Any
+    ) -> None: ...
+
+    @pytest.mark.skip(reason=_NO_PER_DATA_CONNECTION)
+    def test_missing_connection_error_names_the_dac_and_connection_handle(self, *args: Any, **kwargs: Any) -> None: ...
+
+
+class _AnalysisExceptionStandIn(Exception):
+    """Stand-in for PySpark's AnalysisException carrying an error condition."""
+
+    def __init__(self, condition: str | None) -> None:
+        super().__init__("boom")
+        self._condition = condition
+
+    def getCondition(self) -> str | None:
+        return self._condition
+
+
+class TestSparkIsMissingColumnErrorStandIn:
+    @pytest.fixture(autouse=True)
+    def _patch_analysis_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "mloda_plugins.compute_framework.base_implementations.spark.spark_framework.AnalysisException",
+            _AnalysisExceptionStandIn,
+        )
+
+    def test_unresolved_column_condition_is_a_missing_column(self) -> None:
+        error = _AnalysisExceptionStandIn("UNRESOLVED_COLUMN.WITH_SUGGESTION")
+        assert SparkFramework.is_missing_column_error(error) is True
+
+    def test_other_condition_is_not_a_missing_column(self) -> None:
+        assert SparkFramework.is_missing_column_error(_AnalysisExceptionStandIn("TABLE_OR_VIEW_NOT_FOUND")) is False
+
+    def test_missing_condition_is_not_a_missing_column(self) -> None:
+        assert SparkFramework.is_missing_column_error(_AnalysisExceptionStandIn(None)) is False
+
+
+@pytest.mark.skipif(not PYSPARK_AVAILABLE, reason=SKIP_REASON or "PySpark is not available")
+class TestSparkIsMissingColumnError:
+    def test_analysis_error_without_unresolved_column_condition_is_not_a_missing_column(self) -> None:
+        from pyspark.errors import AnalysisException
+
+        error = AnalysisException(message="boom")
+        assert SparkFramework.is_missing_column_error(error) is False
+
+
+_SPARK_FRAMEWORK_MODULE = "mloda_plugins.compute_framework.base_implementations.spark.spark_framework"
+
+
+class _FakeSparkFrame:
+    """Stand-in for a Spark DataFrame whose attribute lookup falls through ``__getattr__``."""
+
+    def filter(self) -> None:
+        pass
+
+    def __getattr__(self, name: str) -> Any:
+        return object.__getattribute__(self, name)
+
+
+class _FakePySparkAttributeError(AttributeError):
+    """Stand-in for PySparkAttributeError carrying an error condition."""
+
+    def __init__(self, condition: str, name: str | None, obj: Any) -> None:
+        super().__init__("boom", name=name, obj=obj)
+        self._condition = condition
+
+    def getCondition(self) -> str:
+        return self._condition
+
+
+def _attribute_read_error(obj: Any, name: str, condition: str) -> _FakePySparkAttributeError:
+    """Build the stand-in error from a real failed attribute lookup so ``name`` and ``obj`` are set."""
+    with pytest.raises(AttributeError) as excinfo:
+        getattr(obj, name)
+    return _FakePySparkAttributeError(condition, excinfo.value.name, excinfo.value.obj)
+
+
+class TestSparkIsMissingColumnErrorAttributeRead:
+    @pytest.fixture(autouse=True)
+    def _patch_pyspark_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            f"{_SPARK_FRAMEWORK_MODULE}.PySparkAttributeError", _FakePySparkAttributeError, raising=False
+        )
+        monkeypatch.setattr(f"{_SPARK_FRAMEWORK_MODULE}.DataFrame", _FakeSparkFrame, raising=False)
+
+    def test_attribute_not_supported_on_a_frame_is_a_missing_column(self) -> None:
+        error = _attribute_read_error(_FakeSparkFrame(), "x", "ATTRIBUTE_NOT_SUPPORTED")
+        assert SparkFramework.is_missing_column_error(error) is True
+
+    def test_plain_attribute_error_with_default_message_is_a_missing_column(self) -> None:
+        with pytest.raises(AttributeError) as excinfo:
+            getattr(_FakeSparkFrame(), "x")
+        assert type(excinfo.value) is AttributeError
+        assert SparkFramework.is_missing_column_error(excinfo.value) is True
+
+    def test_jvm_attribute_not_supported_is_not_a_missing_column(self) -> None:
+        error = _attribute_read_error(_FakeSparkFrame(), "x", "JVM_ATTRIBUTE_NOT_SUPPORTED")
+        assert SparkFramework.is_missing_column_error(error) is False
+
+    def test_misspelled_method_is_not_a_missing_column(self) -> None:
+        error = _attribute_read_error(_FakeSparkFrame(), "fliter", "ATTRIBUTE_NOT_SUPPORTED")
+        assert SparkFramework.is_missing_column_error(error) is False
+
+    def test_attribute_error_on_a_non_frame_is_not_a_missing_column(self) -> None:
+        error = _attribute_read_error(object(), "x", "ATTRIBUTE_NOT_SUPPORTED")
+        assert SparkFramework.is_missing_column_error(error) is False
+
+
+class TestSparkOutputSchemaSuite(OutputSchemaSuite):
+    adapter_class = SparkAdapter
+
+    @pytest.fixture
+    def adapter(self, spark_session: Any) -> Iterator[FrameworkAdapter]:
+        """SparkAdapter borrows the active session, so spark_session must exist first."""
+        spark_adapter = self.adapter_class()
+        with spark_adapter:
+            yield spark_adapter
+
+
+def _spark_types() -> Any:
+    return pytest.importorskip("pyspark.sql.types")
+
+
+def _jvm_free_spark_frame(spark_type: Any) -> Any:
+    """A JVM-free stand-in for a one-column Spark DataFrame."""
+    t = _spark_types()
+    return SimpleNamespace(columns=["c"], schema=t.StructType([t.StructField("c", spark_type)]))
+
+
+_SPARK_FOLDS = [
+    (lambda t: t.ShortType(), "INT32"),
+    (lambda t: t.DecimalType(10, 2), "DECIMAL"),
+    (lambda t: t.DecimalType(38, 18), "DECIMAL"),
+    (lambda t: t.TimestampType(), "TIMESTAMP_MICROS"),
+    (lambda t: t.TimestampNTZType(), "TIMESTAMP_MICROS"),
+]
+
+
+@pytest.mark.parametrize("make_type, expected", _SPARK_FOLDS)
+def test_extract_column_data_type_folds_inexact_types_jvm_free(make_type: Any, expected: str) -> None:
+    from mloda.user import DataType
+
+    frame = _jvm_free_spark_frame(make_type(_spark_types()))
+    framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+    assert framework._extract_column_data_type(frame, "c") == DataType[expected]
+
+
+_SPARK_EXACT = [
+    (lambda t: t.ByteType(), "INT8"),
+    (lambda t: t.ShortType(), None),
+    (lambda t: t.IntegerType(), "INT32"),
+    (lambda t: t.LongType(), "INT64"),
+    (lambda t: t.FloatType(), "FLOAT"),
+    (lambda t: t.DoubleType(), "DOUBLE"),
+    (lambda t: t.BooleanType(), "BOOLEAN"),
+    (lambda t: t.StringType(), "STRING"),
+    (lambda t: t.StringType("UTF8_LCASE"), "STRING"),
+    (lambda t: t.BinaryType(), "BINARY"),
+    (lambda t: t.DateType(), "DATE"),
+    (lambda t: t.TimestampNTZType(), "TIMESTAMP_MICROS"),
+    (lambda t: t.TimestampType(), "TIMESTAMP_MICROS_TZ"),
+    (lambda t: t.ArrayType(t.LongType()), "LIST"),
+    (lambda t: t.DecimalType(38, 18), "DECIMAL"),
+    (lambda t: t.DecimalType(10, 2), None),
+]
+
+
+@pytest.mark.parametrize("make_type, expected", _SPARK_EXACT)
+def test_spark_type_to_exact_data_type(make_type: Any, expected: str | None) -> None:
+    from mloda.user import DataType
+
+    result = SparkFramework._spark_type_to_exact_data_type(make_type(_spark_types()))
+    assert result == (DataType[expected] if expected else None)
+
+
+def test_exact_column_data_type_jvm_free() -> None:
+    from mloda.user import DataType
+
+    framework = SparkFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+    frame = _jvm_free_spark_frame(_spark_types().TimestampType())
+    assert framework._exact_column_data_type(frame, "c") == DataType.TIMESTAMP_MICROS_TZ
+    assert framework._exact_column_data_type(frame, "nope") is None

@@ -1,0 +1,83 @@
+"""FeatureGroupStep execute behavior."""
+
+from unittest.mock import MagicMock
+from uuid import uuid4
+
+import pytest
+
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+from mloda.core.abstract_plugins.components.plan_freeze import FrozenPlanError
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.core.step.feature_group_step import FeatureGroupStep
+from mloda.core.runtime.worker.multiprocessing_worker import _handle_command_result
+from mloda.user import Feature, Options
+
+
+class MockFeatureGroup(FeatureGroup):
+    """A mock feature group for testing error messages."""
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return None
+
+
+@pytest.mark.parametrize("need_to_upload", [True, False], ids=["upload", "no-upload"])
+@pytest.mark.parametrize("shape", ["finished", "native"])
+def test_step_and_worker_upload_a_requested_result_once(need_to_upload: bool, shape: str) -> None:
+    features = MagicMock(spec=FeatureSet)
+    features.features = set()
+    features.artifact_to_save = None
+    features.runtime_parameters = ()
+    features.get_initial_requested_features.return_value = {"requested"}
+    step = FeatureGroupStep(MockFeatureGroup, features, set(), ComputeFramework)
+    step.need_to_upload = need_to_upload
+
+    cfw_register = MagicMock()
+    cfw_register.get_location.return_value = "flight-location"
+    cfw_register.get_artifact_binding.return_value = None
+    features.for_run.return_value = features
+    cfw = MagicMock(spec=ComputeFramework)
+    cfw.uuid = "framework-id"
+
+    native = {"col": [1, 2]}
+
+    def run_calculation(*_: object) -> object:
+        if shape == "finished":
+            cfw.data = "object-id"
+            cfw.upload_finished_data("flight-location")
+            return "object-id"
+        cfw.data = native
+        return native
+
+    cfw.run_calculation.side_effect = run_calculation
+
+    data = step.execute(cfw_register, cfw)
+    _handle_command_result(step, cfw, "flight-location", data, MagicMock())
+
+    cfw.upload_finished_data.assert_called_once_with("flight-location")
+
+
+def test_frozen_step_rejects_attribute_writes_and_freezes_its_feature_set() -> None:
+    feature_set = FeatureSet()
+    feature_set.add(Feature("a_col"))
+    step = FeatureGroupStep(MockFeatureGroup, feature_set, set(), ComputeFramework)
+    step.freeze()
+    with pytest.raises(FrozenPlanError, match="need_to_upload"):
+        step.need_to_upload = True
+    with pytest.raises(FrozenPlanError):
+        step.features.save_artifact = "x"
+    with pytest.raises(FrozenPlanError):
+        feature_set.add(Feature("b_col"))
+
+
+def test_frozen_step_sets_reject_in_place_writes() -> None:
+    feature_set = FeatureSet()
+    feature_set.add(Feature("a_col"))
+    step = FeatureGroupStep(MockFeatureGroup, feature_set, {uuid4()}, ComputeFramework)
+    step.tfs_ids.add(uuid4())
+    step.freeze()
+    with pytest.raises(FrozenPlanError):
+        step.required_uuids.add(uuid4())
+    with pytest.raises(FrozenPlanError):
+        step.tfs_ids.add(uuid4())

@@ -1,0 +1,1282 @@
+"""Tests for WorkerManager class that manages thread/process lifecycle for parallel execution."""
+
+import logging
+import multiprocessing
+import os
+import pickle  # nosec B403
+import queue
+import threading
+import time
+from typing import Any, cast
+from unittest.mock import MagicMock, Mock, patch
+from uuid import UUID, uuid4
+
+import pytest
+
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+from mloda.core.abstract_plugins.components.log_masking import (
+    DISABLE_LOG_MASKING_COMMAND,
+    ENABLE_PROCESS_WIDE_LOG_MASKING_COMMAND,
+)
+from mloda.core.core.step.feature_group_step import FeatureGroupStep
+from mloda.core.core.step.transform_frame_work_step import TransformFrameworkStep
+from mloda.core.runtime import mp_context
+from mloda.core.runtime.mp_context import mp_start_context
+from mloda.core.runtime.worker_manager import WorkerManager
+from mloda.provider import FeatureGroup
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+
+
+def _noop_target(*args: Any, **kwargs: Any) -> None:
+    """Picklable no-op target for forkserver multiprocessing (Python 3.14+ default on Linux)."""
+    return None
+
+
+def _loop_forever_target(command_queue: Any, result_queue: Any, worker_index: int) -> None:
+    """Picklable worker matching create_worker_process's signature; signals READY, never drains its command queue."""
+    result_queue.put("READY")
+    while True:
+        time.sleep(0.1)
+
+
+def _report_target(command_queue: Any, result_queue: Any, tag: str, worker_index: int) -> None:
+    """Reports tag and worker_index on the result queue."""
+    result_queue.put(f"{tag}:{worker_index}")
+
+
+class TestWorkerManagerInit:
+    """Test WorkerManager initialization."""
+
+    def test_init_creates_empty_state(self) -> None:
+        """WorkerManager should initialize with empty collections."""
+        manager = WorkerManager()
+
+        assert manager.tasks == []
+        assert manager.process_register == {}
+        assert manager.result_queues_collection == set()
+        assert manager.result_uuids_collection == set()
+
+
+class TestWorkerManagerThreadTasks:
+    """Test thread task management."""
+
+    def test_add_thread_task_appends_to_tasks(self) -> None:
+        """add_thread_task should append thread to tasks list."""
+        manager = WorkerManager()
+        mock_thread = Mock(spec=threading.Thread)
+
+        manager.add_thread_task(mock_thread)
+
+        assert len(manager.tasks) == 1
+        assert manager.tasks[0] == mock_thread
+
+    def test_add_thread_task_starts_thread(self) -> None:
+        """add_thread_task should call start() on the thread."""
+        manager = WorkerManager()
+        mock_thread = Mock(spec=threading.Thread)
+
+        manager.add_thread_task(mock_thread)
+
+        mock_thread.start.assert_called_once()
+
+    def test_add_multiple_thread_tasks(self) -> None:
+        """Should be able to add multiple thread tasks."""
+        manager = WorkerManager()
+        mock_thread1 = Mock(spec=threading.Thread)
+        mock_thread2 = Mock(spec=threading.Thread)
+
+        manager.add_thread_task(mock_thread1)
+        manager.add_thread_task(mock_thread2)
+
+        assert len(manager.tasks) == 2
+        assert mock_thread1 in manager.tasks
+        assert mock_thread2 in manager.tasks
+
+
+class TestWorkerManagerProcessCreation:
+    """Test worker process creation and registration."""
+
+    def test_create_worker_process_creates_process(self) -> None:
+        """create_worker_process should create a new Process."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = _noop_target
+        args = ("arg1", "arg2")
+
+        process, cmd_queue, result_queue = manager.create_worker_process(cfw_uuid, target_func, args)
+
+        assert isinstance(process, multiprocessing.process.BaseProcess)
+        # Queues have put/get methods - verify interface
+        assert hasattr(cmd_queue, "put") and hasattr(cmd_queue, "get")
+        assert hasattr(result_queue, "put") and hasattr(result_queue, "get")
+
+    def test_create_worker_process_registers_in_process_register(self) -> None:
+        """create_worker_process should register process with CFW UUID."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = _noop_target
+        args = ("arg1", "arg2")
+
+        process, cmd_queue, result_queue = manager.create_worker_process(cfw_uuid, target_func, args)
+
+        assert cfw_uuid in manager.process_register
+        registered_process, registered_cmd_queue, registered_result_queue = manager.process_register[cfw_uuid]
+        assert registered_process == process
+        assert registered_cmd_queue == cmd_queue
+        assert registered_result_queue == result_queue
+
+    def test_create_worker_process_adds_result_queue_to_collection(self) -> None:
+        """create_worker_process should add result queue to collection."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = _noop_target
+        args = ("arg1", "arg2")
+
+        process, cmd_queue, result_queue = manager.create_worker_process(cfw_uuid, target_func, args)
+
+        assert result_queue in manager.result_queues_collection
+
+    def test_create_worker_process_adds_process_to_tasks(self) -> None:
+        """create_worker_process should add process to tasks list."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = _noop_target
+        args = ("arg1", "arg2")
+
+        process, cmd_queue, result_queue = manager.create_worker_process(cfw_uuid, target_func, args)
+
+        assert process in manager.tasks
+
+    def test_create_worker_process_starts_process(self) -> None:
+        """create_worker_process should start the process."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = Mock()
+        args = ("arg1", "arg2")
+
+        mock_process = Mock()
+        mock_ctx = Mock()
+        mock_ctx.Process.return_value = mock_process
+        mock_ctx.Queue.return_value = Mock()
+
+        with patch(
+            "mloda.core.runtime.worker_manager.mp_start_context",
+            return_value=mock_ctx,
+        ):
+            manager.create_worker_process(cfw_uuid, target_func, args)
+
+        mock_process.start.assert_called_once()
+
+    def test_create_worker_process_passes_daemon_true(self) -> None:
+        """Worker processes must be daemonic so they are reaped if the parent interpreter exits."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = Mock()
+        args = ("arg1", "arg2")
+
+        mock_process = Mock()
+        mock_ctx = Mock()
+        mock_ctx.Process.return_value = mock_process
+        mock_ctx.Queue.return_value = Mock()
+
+        with patch(
+            "mloda.core.runtime.worker_manager.mp_start_context",
+            return_value=mock_ctx,
+        ):
+            manager.create_worker_process(cfw_uuid, target_func, args)
+
+        assert mock_ctx.Process.call_args.kwargs.get("daemon") is True
+
+
+def _mock_ctx(*processes: Any) -> Mock:
+    ctx = Mock()
+    ctx.Process.side_effect = list(processes) if processes else None
+    ctx.Queue.side_effect = lambda: MagicMock()
+    return ctx
+
+
+def _live_process() -> Mock:
+    process = Mock()
+    process.is_alive.return_value = True
+    return process
+
+
+class TestWorkerManagerStandbyWorkers:
+    """prestart_workers spawns unbound standbys that create_worker_process binds instead of spawning."""
+
+    def test_prestart_spawns_n_unbound_processes(self) -> None:
+        manager = WorkerManager()
+        processes = [_live_process(), _live_process(), _live_process()]
+        ctx = _mock_ctx(*processes)
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(3, _noop_target)
+
+        assert ctx.Process.call_count == 3
+        assert all(p.start.call_count == 1 for p in processes)
+        assert len(manager.standby) == 3
+        assert len(manager.tasks) == 3
+        assert manager.process_register == {}
+        assert manager.result_queues_collection == set()
+
+    def test_prestart_targets_get_their_own_queues(self) -> None:
+        manager = WorkerManager()
+        ctx = _mock_ctx(_live_process(), _live_process())
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(2, _noop_target)
+
+        (_, first_cmd, first_res), (_, second_cmd, second_res) = manager.standby
+        assert len({id(first_cmd), id(first_res), id(second_cmd), id(second_res)}) == 4
+        assert ctx.Process.call_args_list[0].kwargs["args"] == (first_cmd, first_res)
+
+    def test_prestart_appends_extra_args_after_the_queues(self) -> None:
+        manager = WorkerManager()
+        ctx = _mock_ctx(_live_process())
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(1, _noop_target, (("pandas",),))
+
+        ((_, first_cmd, first_res),) = manager.standby
+        assert ctx.Process.call_args_list[0].kwargs["args"] == (first_cmd, first_res, ("pandas",))
+
+    @pytest.mark.parametrize("count", [0, -1])
+    def test_prestart_with_non_positive_count_spawns_nothing(self, count: int) -> None:
+        manager = WorkerManager()
+        ctx = _mock_ctx()
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(count, _noop_target)
+
+        ctx.Process.assert_not_called()
+        assert manager.standby == []
+
+    def test_stop_standbys_terminates_joins_and_clears_unbound_standbys(self) -> None:
+        manager = WorkerManager()
+        processes = [_live_process(), _live_process()]
+        ctx = _mock_ctx(*processes)
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(2, _noop_target)
+
+        manager.stop_standbys()
+
+        assert all(p.terminate.call_count == 1 and p.join.call_count == 1 for p in processes)
+        assert manager.standby == []
+
+    def test_terminate_alive_processes_terminates_then_joins_only_alive_processes(self) -> None:
+        manager = WorkerManager()
+        alive = Mock(spec=multiprocessing.Process)
+        alive.is_alive.return_value = True
+        exited = Mock(spec=multiprocessing.Process)
+        exited.is_alive.return_value = False
+        thread = Mock(spec=threading.Thread)
+        manager.tasks.extend([alive, exited, thread])
+        order = Mock()
+        order.attach_mock(alive.terminate, "terminate")
+        order.attach_mock(alive.join, "join")
+
+        manager.terminate_alive_processes()
+
+        assert [c[0] for c in order.mock_calls] == ["terminate", "join"]
+        exited.terminate.assert_not_called()
+        exited.join.assert_not_called()
+        thread.join.assert_not_called()
+
+    def test_stop_standbys_leaves_an_inherited_standby_alone_and_still_clears_the_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager = WorkerManager()
+        inherited, own = _live_process(), _live_process()
+        ctx = _mock_ctx(inherited, own)
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(2, _noop_target)
+        monkeypatch.setitem(mp_context._daemon_processes, cast(Any, inherited), os.getpid() + 1)
+
+        manager.stop_standbys()
+
+        inherited.terminate.assert_not_called()
+        inherited.join.assert_not_called()
+        own.terminate.assert_called_once()
+        own.join.assert_called_once()
+        assert manager.standby == []
+
+    def test_terminate_alive_processes_leaves_an_inherited_process_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = WorkerManager()
+        inherited = Mock(spec=multiprocessing.Process)
+        inherited.is_alive.return_value = True
+        own = Mock(spec=multiprocessing.Process)
+        own.is_alive.return_value = True
+        manager.tasks.extend([inherited, own])
+        monkeypatch.setitem(mp_context._daemon_processes, cast(Any, inherited), os.getpid() + 1)
+        order = Mock()
+        order.attach_mock(own.terminate, "terminate")
+        order.attach_mock(own.join, "join")
+
+        manager.terminate_alive_processes()
+
+        inherited.is_alive.assert_not_called()
+        inherited.terminate.assert_not_called()
+        inherited.join.assert_not_called()
+        assert [c[0] for c in order.mock_calls] == ["terminate", "join"]
+
+    def test_stop_standbys_is_a_noop_without_standbys(self) -> None:
+        manager = WorkerManager()
+
+        manager.stop_standbys()
+
+        assert manager.standby == []
+
+    def test_create_worker_process_reuses_a_standby(self) -> None:
+        manager = WorkerManager()
+        standby_process = _live_process()
+        ctx = _mock_ctx(standby_process)
+        cfw_uuid = uuid4()
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(1, _noop_target)
+            standby = manager.standby[0]
+            registered = manager.create_worker_process(cfw_uuid, _noop_target, ("a", 1))
+
+        assert ctx.Process.call_count == 1
+        assert registered == standby
+        assert manager.process_register[cfw_uuid] == standby
+        assert standby[2] in manager.result_queues_collection
+        assert manager.standby == []
+        assert manager.tasks.count(standby_process) == 1
+        payload = standby[1].put.call_args.args[0]
+        assert isinstance(payload, bytes)
+        assert pickle.loads(payload) == (_noop_target, ("a", 1), 0)  # nosec B301
+
+    def test_standbys_are_bound_first_in_first_out(self) -> None:
+        manager = WorkerManager()
+        ctx = _mock_ctx(_live_process(), _live_process())
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(2, _noop_target)
+            first, second = manager.standby
+            bound = manager.create_worker_process(uuid4(), _noop_target, ())
+
+        assert bound == first
+        assert manager.standby == [second]
+        assert pickle.loads(first[1].put.call_args.args[0])[2] == 0  # nosec B301
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            second_bound = manager.create_worker_process(uuid4(), _noop_target, ())
+
+        assert second_bound == second
+        assert pickle.loads(second[1].put.call_args.args[0])[2] == 1  # nosec B301
+
+    def test_dead_standby_is_skipped_and_a_fresh_process_is_spawned(self, caplog: pytest.LogCaptureFixture) -> None:
+        manager = WorkerManager()
+        dead = Mock()
+        dead.is_alive.return_value = False
+        dead.exitcode = 137
+        fresh = _live_process()
+        ctx = _mock_ctx(dead, fresh)
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(1, _noop_target)
+            with caplog.at_level(logging.WARNING):
+                process, _, _ = manager.create_worker_process(uuid4(), _noop_target, ())
+
+        assert process is fresh
+        assert any(r.levelno == logging.WARNING and "137" in r.getMessage() for r in caplog.records)
+        fresh.start.assert_called_once()
+        assert dead in manager.tasks
+        assert manager.standby == []
+
+    def test_dead_standby_is_skipped_in_favor_of_the_next_live_one(self) -> None:
+        manager = WorkerManager()
+        dead = Mock()
+        dead.is_alive.return_value = False
+        live = _live_process()
+        ctx = _mock_ctx(dead, live)
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(2, _noop_target)
+            process, _, _ = manager.create_worker_process(uuid4(), _noop_target, ())
+
+        assert process is live
+        assert ctx.Process.call_count == 2
+
+    @pytest.mark.parametrize("make_arg", [lambda: lambda: None, threading.Lock], ids=["lambda", "lock"])
+    def test_unpicklable_arg_raises_in_the_parent_on_the_standby_path(self, make_arg: Any) -> None:
+        manager = WorkerManager()
+        ctx = _mock_ctx(_live_process())
+
+        with patch("mloda.core.runtime.worker_manager.mp_start_context", return_value=ctx):
+            manager.prestart_workers(1, _noop_target)
+            standby = manager.standby[0]
+            with pytest.raises((TypeError, AttributeError, pickle.PicklingError)):
+                manager.create_worker_process(uuid4(), _noop_target, (make_arg(),))
+
+        assert manager.standby == [standby]
+        assert manager.process_register == {}
+
+
+class TestWorkerManagerProcessRetrieval:
+    """Test retrieving existing process information."""
+
+    def test_get_process_queues_returns_existing_process(self) -> None:
+        """get_process_queues should return existing process/queues."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = _noop_target
+        args = ()
+
+        original_process, original_cmd_queue, original_result_queue = manager.create_worker_process(
+            cfw_uuid, target_func, args
+        )
+
+        retrieved = manager.get_process_queues(cfw_uuid)
+
+        assert retrieved is not None
+        process, cmd_queue, result_queue = retrieved
+        assert process == original_process
+        assert cmd_queue == original_cmd_queue
+        assert result_queue == original_result_queue
+
+    def test_get_process_queues_returns_none_for_unknown_uuid(self) -> None:
+        """get_process_queues should return None for unknown CFW UUID."""
+        manager = WorkerManager()
+        unknown_uuid = uuid4()
+
+        result = manager.get_process_queues(unknown_uuid)
+
+        assert result is None
+
+
+_SECRET = "zz-wm-secret-value-42"
+
+
+class _LeakyHolder:
+    """Unpicklable (holds a lock) and its repr is a distinctive secret."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+
+    def __repr__(self) -> str:
+        return _SECRET
+
+
+class _PlainStep:
+    def __init__(self) -> None:
+        self.uuid = uuid4()
+        self.holder = _LeakyHolder()
+
+
+def _feature_group_step_with_holder() -> FeatureGroupStep:
+    class _WmSendFeatureGroup(FeatureGroup):
+        pass
+
+    step = FeatureGroupStep(_WmSendFeatureGroup, FeatureSet([Feature("f")]), set(), PandasDataFrame)
+    step.holder = _LeakyHolder()
+    return step
+
+
+class TestWorkerManagerCommandSending:
+    """Test sending commands to worker processes."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            pytest.param({"action": "execute", "data": "test"}, id="dict"),
+            pytest.param(DISABLE_LOG_MASKING_COMMAND, id="disable-log-masking"),
+            pytest.param(ENABLE_PROCESS_WIDE_LOG_MASKING_COMMAND, id="enable-process-wide-log-masking"),
+            pytest.param(("a", 1, {"x": [1, 2]}), id="picklable-tuple"),
+        ],
+    )
+    def test_send_command_puts_command_in_queue(self, command: Any) -> None:
+        """send_command should put command in process command queue unchanged."""
+        manager, cfw_uuid, mock_cmd_queue = self._registered()
+
+        manager.send_command(cfw_uuid, command)
+
+        mock_cmd_queue.put.assert_called_once_with(command)
+
+    def test_send_command_raises_for_unknown_uuid(self) -> None:
+        """send_command should raise ValueError for unknown CFW UUID."""
+        manager = WorkerManager()
+        unknown_uuid = uuid4()
+        command = {"action": "execute"}
+
+        with pytest.raises(ValueError, match="No process found for CFW UUID"):
+            manager.send_command(unknown_uuid, command)
+
+    def _registered(self) -> tuple[WorkerManager, UUID, MagicMock]:
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        mock_cmd_queue = MagicMock()
+        manager.process_register[cfw_uuid] = (Mock(spec=multiprocessing.Process), mock_cmd_queue, MagicMock())
+        return manager, cfw_uuid, mock_cmd_queue
+
+    @pytest.mark.parametrize(
+        "make_step, fragments",
+        [
+            pytest.param(
+                _feature_group_step_with_holder, ("FeatureGroupStep", "_WmSendFeatureGroup"), id="feature-group-step"
+            ),
+            pytest.param(_PlainStep, ("_PlainStep",), id="plain-step"),
+        ],
+    )
+    def test_send_command_refuses_an_unpicklable_step_naming_its_type(
+        self, make_step: Any, fragments: tuple[str, ...]
+    ) -> None:
+        manager, cfw_uuid, mock_cmd_queue = self._registered()
+        step = make_step()
+
+        with pytest.raises(ValueError) as excinfo:
+            manager.send_command(cfw_uuid, (step, {"k": "v"}))
+
+        message = str(excinfo.value)
+        for fragment in fragments:
+            assert fragment in message
+        assert _SECRET not in message
+        mock_cmd_queue.put.assert_not_called()
+
+    def test_send_command_refuses_an_unpicklable_grant_slot_naming_the_step_type(self) -> None:
+        manager, cfw_uuid, mock_cmd_queue = self._registered()
+        step = FeatureGroupStep(FeatureGroup, FeatureSet([Feature("f")]), set(), PandasDataFrame)
+
+        with pytest.raises(ValueError) as excinfo:
+            manager.send_command(cfw_uuid, (step, _LeakyHolder()))
+
+        message = str(excinfo.value)
+        assert "FeatureGroupStep" in message
+        assert _SECRET not in message
+        mock_cmd_queue.put.assert_not_called()
+
+    def test_send_command_refuses_an_unpicklable_transform_framework_step_naming_its_feature_groups(self) -> None:
+        class _WmFromFeatureGroup(FeatureGroup):
+            pass
+
+        class _WmToFeatureGroup(FeatureGroup):
+            pass
+
+        manager, cfw_uuid, mock_cmd_queue = self._registered()
+        step = TransformFrameworkStep(PandasDataFrame, PyArrowTable, set(), _WmFromFeatureGroup, _WmToFeatureGroup)
+        step.holder = _LeakyHolder()
+
+        with pytest.raises(ValueError) as excinfo:
+            manager.send_command(cfw_uuid, (step, {"k": "v"}))
+
+        message = str(excinfo.value)
+        for fragment in ("TransformFrameworkStep", "_WmFromFeatureGroup", "_WmToFeatureGroup"):
+            assert fragment in message
+        assert _SECRET not in message
+        mock_cmd_queue.put.assert_not_called()
+
+
+class TestWorkerManagerResultPolling:
+    """Test polling result queues for completed steps."""
+
+    def test_poll_result_queues_collects_uuids_from_all_queues(self) -> None:
+        """poll_result_queues should collect UUIDs from all result queues."""
+        manager = WorkerManager()
+
+        # Create mock queues with UUIDs
+        uuid1 = str(uuid4())
+        uuid2 = str(uuid4())
+
+        mock_queue1 = MagicMock()
+        mock_queue1.get.side_effect = [uuid1, queue.Empty()]
+
+        mock_queue2 = MagicMock()
+        mock_queue2.get.side_effect = [uuid2, queue.Empty()]
+
+        manager.result_queues_collection.add(mock_queue1)
+        manager.result_queues_collection.add(mock_queue2)
+
+        manager.poll_result_queues()
+
+        assert UUID(uuid1) in manager.result_uuids_collection
+        assert UUID(uuid2) in manager.result_uuids_collection
+
+    def test_poll_result_queues_handles_empty_queues(self) -> None:
+        """poll_result_queues should handle empty queues gracefully."""
+        manager = WorkerManager()
+
+        mock_queue = MagicMock()
+        mock_queue.get.side_effect = queue.Empty()
+
+        manager.result_queues_collection.add(mock_queue)
+
+        # Should not raise exception
+        manager.poll_result_queues()
+
+        assert len(manager.result_uuids_collection) == 0
+
+    def test_poll_result_queues_is_non_blocking(self) -> None:
+        """poll_result_queues should use non-blocking get."""
+        manager = WorkerManager()
+
+        mock_queue = MagicMock()
+        mock_queue.get.side_effect = queue.Empty()
+        manager.result_queues_collection.add(mock_queue)
+
+        manager.poll_result_queues()
+
+        mock_queue.get.assert_called_with(block=False)
+
+    def test_poll_result_queues_accumulates_over_multiple_calls(self) -> None:
+        """poll_result_queues should accumulate UUIDs across multiple calls."""
+        manager = WorkerManager()
+
+        uuid1 = str(uuid4())
+        uuid2 = str(uuid4())
+
+        mock_queue = MagicMock()
+        manager.result_queues_collection.add(mock_queue)
+
+        # First poll
+        mock_queue.get.side_effect = [uuid1, queue.Empty()]
+        manager.poll_result_queues()
+
+        # Second poll
+        mock_queue.get.side_effect = [uuid2, queue.Empty()]
+        manager.poll_result_queues()
+
+        assert UUID(uuid1) in manager.result_uuids_collection
+        assert UUID(uuid2) in manager.result_uuids_collection
+        assert len(manager.result_uuids_collection) == 2
+
+    def test_poll_result_queues_drains_multiple_messages_in_a_single_call(self) -> None:
+        """A single poll_result_queues() call must drain every queued message, not just the first."""
+        manager = WorkerManager()
+        uuid1 = str(uuid4())
+        uuid2 = str(uuid4())
+        uuid3 = str(uuid4())
+
+        mock_queue = MagicMock()
+        mock_queue.get.side_effect = [
+            uuid1,
+            uuid2,
+            uuid3,
+            queue.Empty(),
+        ]
+        manager.result_queues_collection.add(mock_queue)
+
+        manager.poll_result_queues()
+
+        assert manager.result_uuids_collection == {UUID(uuid1), UUID(uuid2), UUID(uuid3)}
+        # One get() per queued item, plus the Empty that ends the drain.
+        assert mock_queue.get.call_count == 4
+
+    def test_poll_result_queues_drains_real_multiprocessing_queue_without_blocking(self) -> None:
+        """Drain-to-empty must hold for a real (non-mocked) multiprocessing.Queue too, and return promptly."""
+        manager = WorkerManager()
+        mp_queue: Any = mp_start_context().Queue()
+
+        uuid1 = str(uuid4())
+        uuid2 = str(uuid4())
+        uuid3 = str(uuid4())
+
+        mp_queue.put(uuid1)
+        mp_queue.put(uuid2)
+        mp_queue.put(uuid3)
+
+        manager.result_queues_collection.add(mp_queue)
+
+        try:
+            # put() flushes via a background feeder thread, so a single poll can race an
+            # empty pipe. Retry with a short sleep instead of one fixed delay, bounded by
+            # a wall-clock deadline so a real hang still fails the test.
+            start_time = time.time()
+            deadline = start_time + 3.0
+            expected = {UUID(uuid1), UUID(uuid2), UUID(uuid3)}
+            while time.time() < deadline:
+                manager.poll_result_queues()
+                if expected <= manager.result_uuids_collection:
+                    break
+                time.sleep(0.01)
+            elapsed = time.time() - start_time
+
+            assert elapsed < 3.0
+            assert manager.result_uuids_collection == expected
+            with pytest.raises(queue.Empty):
+                mp_queue.get(timeout=0.1)
+        finally:
+            mp_queue.close()
+            mp_queue.join_thread()
+
+
+class TestWorkerManagerStepCompletion:
+    """Test checking if steps are completed."""
+
+    def test_is_step_done_returns_true_for_completed_step(self) -> None:
+        """is_step_done should return True if step UUID is in collection."""
+        manager = WorkerManager()
+        step_uuid = uuid4()
+        manager.result_uuids_collection.add(step_uuid)
+
+        assert manager.is_step_done(step_uuid) is True
+
+    def test_is_step_done_returns_false_for_incomplete_step(self) -> None:
+        """is_step_done should return False if step UUID not in collection."""
+        manager = WorkerManager()
+        step_uuid = uuid4()
+
+        assert manager.is_step_done(step_uuid) is False
+
+
+class TestWorkerManagerDeadWorkerDetection:
+    """Test detection of abnormally-terminated worker processes (e.g. OOM SIGKILL)."""
+
+    @pytest.mark.timeout(30)
+    def test_find_dead_workers_detects_sigkilled_worker(self) -> None:
+        """find_dead_workers must report a worker that died abnormally.
+
+        A worker SIGKILL'd by the OOM killer never emits its step UUID and
+        never runs its except block (so no error is set on cfw_register). The
+        only observable signal is the process exitcode, which is non-zero
+        (``-9`` for SIGKILL). find_dead_workers must surface it as a
+        (cfw_uuid, exitcode) entry so the run loop can abort instead of
+        spinning forever.
+        """
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        process, _, _ = manager.create_worker_process(cfw_uuid=cfw_uuid, target=_loop_forever_target, args=())
+        process.kill()
+        process.join(timeout=5)
+
+        # Sanity: the real process died abnormally (non-zero, non-None exit).
+        assert process.exitcode is not None
+        assert process.exitcode != 0
+
+        dead = manager.find_dead_workers()
+
+        assert any(entry[0] == cfw_uuid for entry in dead)
+
+    def test_find_dead_workers_ignores_alive_and_clean_workers(self) -> None:
+        """find_dead_workers must return [] when every worker is healthy.
+
+        A healthy worker is either still alive (exitcode is None) or exited
+        cleanly via STOP (exitcode 0). Neither counts as a dead worker.
+        """
+        manager = WorkerManager()
+
+        alive_process = MagicMock()
+        alive_process.exitcode = None
+        alive_process.is_alive.return_value = True
+        manager.process_register[uuid4()] = (alive_process, MagicMock(), MagicMock())
+
+        clean_process = MagicMock()
+        clean_process.exitcode = 0
+        clean_process.is_alive.return_value = False
+        manager.process_register[uuid4()] = (clean_process, MagicMock(), MagicMock())
+
+        assert manager.find_dead_workers() == []
+
+
+class TestWorkerManagerOrphanedStepDetection:
+    """A worker that exits while steps are still assigned to it must be detectable.
+
+    find_dead_workers only reports a non-zero exitcode. The data-drop path breaks the
+    worker loop and the process exits with code 0, so it is invisible there while the steps
+    dispatched to it stay in currently_running_steps with no result ever arriving.
+    """
+
+    @staticmethod
+    def _exited(manager: WorkerManager, exitcode: int) -> UUID:
+        """Register a worker whose process has already exited with *exitcode*."""
+        cfw_uuid = uuid4()
+        process = MagicMock()
+        process.exitcode = exitcode
+        process.is_alive.return_value = False
+        manager.process_register[cfw_uuid] = (process, MagicMock(), MagicMock())
+        return cfw_uuid
+
+    def test_a_clean_exit_owing_a_step_is_reported(self) -> None:
+        """Exitcode 0 is the case find_dead_workers cannot see, so it is the case that matters."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        step_uuid = uuid4()
+        manager.record_assignment(cfw_uuid, {step_uuid})
+
+        # Premise: the existing check stays silent, which is why this one has to exist.
+        assert manager.find_dead_workers() == []
+
+        assert manager.find_orphaned_steps() == [(cfw_uuid, 0, [step_uuid])]
+
+    def test_an_abnormal_exit_owing_a_step_is_reported_too(self) -> None:
+        """Any exitcode counts: an exited process will never answer, whatever the code."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, -9)
+        step_uuid = uuid4()
+        manager.record_assignment(cfw_uuid, {step_uuid})
+
+        assert manager.find_orphaned_steps() == [(cfw_uuid, -9, [step_uuid])]
+
+    def test_a_step_whose_result_already_arrived_is_not_reported(self) -> None:
+        """The worker finished its work and then exited; nothing was lost."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        step_uuid = uuid4()
+        manager.record_assignment(cfw_uuid, {step_uuid})
+        manager.result_uuids_collection.add(step_uuid)
+
+        assert manager.find_orphaned_steps() == []
+
+    def test_only_the_steps_still_owed_are_named(self) -> None:
+        """A partially-drained worker reports the remainder, not everything it was sent."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        done, pending = uuid4(), uuid4()
+        manager.record_assignment(cfw_uuid, {done, pending})
+        manager.result_uuids_collection.add(done)
+
+        assert manager.find_orphaned_steps() == [(cfw_uuid, 0, [pending])]
+
+    def test_a_live_worker_is_never_orphaned(self) -> None:
+        """A running worker still owes results; that is work in progress, not a loss."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        process = MagicMock()
+        process.exitcode = None
+        process.is_alive.return_value = True
+        manager.process_register[cfw_uuid] = (process, MagicMock(), MagicMock())
+        manager.record_assignment(cfw_uuid, {uuid4()})
+
+        assert manager.find_orphaned_steps() == []
+
+    def test_an_exited_worker_with_no_assignments_is_not_reported(self) -> None:
+        """A worker stopped after draining its queue exits owing nothing."""
+        manager = WorkerManager()
+        self._exited(manager, 0)
+
+        assert manager.find_orphaned_steps() == []
+
+    def test_record_assignment_accumulates_across_dispatches(self) -> None:
+        """multi_execute_step runs once per step, so assignments must union, not replace."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        first, second = uuid4(), uuid4()
+        manager.record_assignment(cfw_uuid, {first})
+        manager.record_assignment(cfw_uuid, {second})
+
+        assert manager.assigned_steps[cfw_uuid] == {first, second}
+        assert manager.find_orphaned_steps() == [(cfw_uuid, 0, sorted([first, second], key=str))]
+
+    def test_each_exited_worker_is_reported_separately(self) -> None:
+        """The run loop names every affected cfw, not only the first one found."""
+        manager = WorkerManager()
+        first_cfw = self._exited(manager, 0)
+        second_cfw = self._exited(manager, 0)
+        manager.record_assignment(first_cfw, {uuid4()})
+        manager.record_assignment(second_cfw, {uuid4()})
+
+        assert {entry[0] for entry in manager.find_orphaned_steps()} == {first_cfw, second_cfw}
+
+
+class TestWorkerManagerJoinAll:
+    """Test joining and terminating all tasks."""
+
+    def test_join_all_terminates_processes(self) -> None:
+        """join_all should terminate all multiprocessing processes."""
+        manager = WorkerManager()
+
+        mock_process1 = Mock(spec=multiprocessing.Process)
+        mock_process2 = Mock(spec=multiprocessing.Process)
+
+        manager.tasks.append(mock_process1)
+        manager.tasks.append(mock_process2)
+
+        manager.join_all()
+
+        mock_process1.terminate.assert_called_once()
+        mock_process2.terminate.assert_called_once()
+
+    def test_join_all_joins_all_tasks(self) -> None:
+        """join_all should call join() on all tasks."""
+        manager = WorkerManager()
+
+        mock_thread = Mock(spec=threading.Thread)
+        mock_process = Mock(spec=multiprocessing.Process)
+
+        manager.tasks.append(mock_thread)
+        manager.tasks.append(mock_process)
+
+        manager.join_all()
+
+        mock_thread.join.assert_called_once_with()
+        mock_process.join.assert_called_once()
+
+    def test_join_all_does_not_terminate_threads(self) -> None:
+        """join_all should not call terminate on threads (only processes)."""
+        manager = WorkerManager()
+
+        mock_thread = Mock(spec=threading.Thread)
+        manager.tasks.append(mock_thread)
+
+        manager.join_all()
+
+        # Threads don't have terminate method, should only join
+        assert not hasattr(mock_thread, "terminate") or mock_thread.terminate.call_count == 0
+        mock_thread.join.assert_called_once_with()
+
+    def test_abandon_threads_joins_threads_with_a_deadline_and_still_terminates_processes(self) -> None:
+        manager = WorkerManager()
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = False
+        mock_process = Mock(spec=multiprocessing.Process)
+        manager.tasks.extend([mock_thread, mock_process])
+
+        manager.join_all(graceful_timeout=5.0, abandon_threads=True)
+
+        mock_thread.join.assert_called_once()
+        assert mock_thread.join.call_args.args == ()
+        timeout = mock_thread.join.call_args.kwargs["timeout"]
+        assert isinstance(timeout, float)
+        assert 0 <= timeout <= 5.0
+        mock_process.terminate.assert_called_once()
+        mock_process.join.assert_called_once_with()
+
+    @pytest.mark.timeout(30)
+    def test_abandon_threads_leaves_a_blocked_daemon_thread_running_and_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = WorkerManager()
+        release = threading.Event()
+        blocked = threading.Thread(target=release.wait, daemon=True)
+        manager.add_thread_task(blocked)
+        try:
+            start = time.time()
+            with caplog.at_level(logging.WARNING):
+                manager.join_all(graceful_timeout=0.2, abandon_threads=True)
+            elapsed = time.time() - start
+
+            assert elapsed < 5.0
+            assert blocked.is_alive()
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert "Abandoned 1 step thread" in warnings[0].getMessage()
+        finally:
+            release.set()
+            blocked.join(timeout=5)
+
+    def test_abandon_threads_with_infinite_timeout_does_not_raise(self) -> None:
+        manager = WorkerManager()
+        quick = threading.Thread(target=lambda: None, daemon=True)
+        manager.add_thread_task(quick)
+
+        manager.join_all(graceful_timeout=float("inf"), abandon_threads=True)
+
+        assert not quick.is_alive()
+
+    def test_join_all_handles_join_errors(self) -> None:
+        """join_all should handle errors during join and raise exception."""
+        manager = WorkerManager()
+
+        mock_process = Mock(spec=multiprocessing.Process)
+        mock_process.join.side_effect = Exception("Join failed")
+
+        manager.tasks.append(mock_process)
+
+        with pytest.raises(Exception, match="Error while joining tasks"):
+            manager.join_all()
+
+    def test_join_all_continues_after_single_join_error(self) -> None:
+        """join_all should continue joining other tasks even if one fails."""
+        manager = WorkerManager()
+
+        mock_process1 = Mock(spec=multiprocessing.Process)
+        mock_process1.join.side_effect = Exception("Join failed")
+
+        mock_process2 = Mock(spec=multiprocessing.Process)
+
+        manager.tasks.append(mock_process1)
+        manager.tasks.append(mock_process2)
+
+        with pytest.raises(Exception, match="Error while joining tasks"):
+            manager.join_all()
+
+        # Second process should still be joined despite first failure
+        mock_process2.terminate.assert_called_once()
+        mock_process2.join.assert_called_once()
+
+    @pytest.mark.timeout(30)
+    def test_join_all_terminates_real_worker_process(self) -> None:
+        """join_all should terminate a real worker and return promptly.
+
+        create_worker_process builds workers from the configured start context, so they are
+        SpawnProcess or ForkServerProcess instances, which subclass BaseProcess
+        and are NOT instances of multiprocessing.Process. join_all's isinstance
+        check therefore never calls terminate() on real workers, and join() blocks
+        forever on a worker that does not exit on its own (GitHub issue #514).
+        """
+        manager = WorkerManager()
+        process, _, result_queue = manager.create_worker_process(cfw_uuid=uuid4(), target=_loop_forever_target, args=())
+
+        join_thread = threading.Thread(target=manager.join_all, daemon=True)
+        try:
+            assert result_queue.get(timeout=5) == "READY"
+            assert process.is_alive(), "worker exited before join_all() could terminate it"
+            assert process.exitcode is None
+            join_thread.start()
+            deadline = time.time() + 5.0
+            while join_thread.is_alive() and time.time() < deadline:
+                join_thread.join(timeout=0.1)
+
+            assert not join_thread.is_alive(), "join_all() did not terminate the worker process; it hung"
+        finally:
+            # Never leak the worker or hang the suite: kill it directly so the
+            # daemon join_all thread can finish its blocking join().
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            if join_thread.ident is not None:
+                join_thread.join(timeout=1.0)
+
+    @pytest.mark.timeout(30)
+    def test_join_all_terminates_an_unbound_real_standby(self) -> None:
+        from mloda.core.runtime.worker.multiprocessing_worker import standby_worker
+
+        manager = WorkerManager()
+        manager.prestart_workers(1, standby_worker)
+        process = manager.standby[0][0]
+        try:
+            assert process.is_alive()
+
+            manager.join_all(graceful_timeout=0.3)
+
+            assert not process.is_alive()
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+
+    @pytest.mark.timeout(30)
+    def test_real_standby_bound_to_a_target_runs_it_with_the_worker_index(self) -> None:
+        from mloda.core.runtime.worker.multiprocessing_worker import standby_worker
+
+        manager = WorkerManager()
+        manager.prestart_workers(2, standby_worker)
+        try:
+            _, _, first_results = manager.create_worker_process(uuid4(), _report_target, ("one",))
+            _, _, second_results = manager.create_worker_process(uuid4(), _report_target, ("two",))
+
+            assert first_results.get(timeout=20) == "one:0"
+            assert second_results.get(timeout=20) == "two:1"
+        finally:
+            manager.join_all(graceful_timeout=0.3)
+
+    def test_join_all_sends_graceful_stop_to_registered_processes_before_final_terminate(self) -> None:
+        """Sends a graceful STOP to every alive registered process, and the final
+        terminate-fallback loop over self.tasks still runs afterward."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        mock_process = Mock(spec=multiprocessing.Process)
+        mock_process.is_alive.return_value = True
+        mock_command_queue = MagicMock()
+        mock_result_queue = MagicMock()
+        manager.process_register[cfw_uuid] = (mock_process, mock_command_queue, mock_result_queue)
+        manager.tasks.append(mock_process)
+
+        manager.join_all()
+
+        mock_command_queue.put.assert_called_once_with("STOP", block=False)
+        mock_process.terminate.assert_called_once()
+
+    def test_join_all_leaves_an_inherited_process_alone_and_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = WorkerManager()
+        inherited = Mock(spec=multiprocessing.Process)
+        inherited.is_alive.return_value = True
+        own = Mock(spec=multiprocessing.Process)
+        own.is_alive.return_value = True
+        inherited_queue, own_queue = MagicMock(), MagicMock()
+        manager.process_register[uuid4()] = (inherited, inherited_queue, MagicMock())
+        manager.process_register[uuid4()] = (own, own_queue, MagicMock())
+        manager.tasks.extend([inherited, own])
+        monkeypatch.setitem(mp_context._daemon_processes, cast(Any, inherited), os.getpid() + 1)
+
+        with caplog.at_level(logging.ERROR):
+            manager.join_all()
+
+        inherited_queue.put.assert_not_called()
+        inherited.is_alive.assert_not_called()
+        inherited.terminate.assert_not_called()
+        inherited.join.assert_not_called()
+        own_queue.put.assert_called_once_with("STOP", block=False)
+        own.terminate.assert_called_once()
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    @pytest.mark.timeout(30)
+    def test_join_all_terminates_after_graceful_timeout_when_worker_ignores_stop(self) -> None:
+        """A worker that never drains its command queue must still be terminated once
+        graceful_timeout elapses."""
+        manager = WorkerManager()
+        process, _, _ = manager.create_worker_process(cfw_uuid=uuid4(), target=_loop_forever_target, args=())
+        try:
+            start_time = time.time()
+            manager.join_all(graceful_timeout=0.3)
+            elapsed = time.time() - start_time
+
+            assert not process.is_alive()
+            assert elapsed < 10.0
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+
+
+class TestWorkerManagerJoinAllScrubsCredentials:
+    """join_all's three error-log sites must not leak a credential carried in the underlying exception text."""
+
+    _LEAK_MARKER = "hunter2z9"
+
+    def test_graceful_stop_put_error_is_scrubbed(self, caplog: pytest.LogCaptureFixture) -> None:
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        mock_process = Mock(spec=multiprocessing.Process)
+        mock_process.is_alive.return_value = True
+        mock_command_queue = MagicMock()
+        mock_command_queue.put.side_effect = Exception(f"queue broken for postgres://u:{self._LEAK_MARKER}@h/db")
+        manager.process_register[cfw_uuid] = (mock_process, mock_command_queue, MagicMock())
+
+        with caplog.at_level(logging.ERROR):
+            manager.join_all()
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records, "expected an ERROR record for the failed graceful STOP"
+        assert not any(self._LEAK_MARKER in r.getMessage() for r in error_records), (
+            f"credential leaked into an ERROR record: {[r.getMessage() for r in error_records]}"
+        )
+
+    def test_graceful_shutdown_join_error_is_scrubbed(self, caplog: pytest.LogCaptureFixture) -> None:
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        mock_process = Mock(spec=multiprocessing.Process)
+        mock_process.is_alive.return_value = False
+        mock_process.join.side_effect = Exception(f"join broken for postgres://u:{self._LEAK_MARKER}@h/db")
+        manager.process_register[cfw_uuid] = (mock_process, MagicMock(), MagicMock())
+
+        with caplog.at_level(logging.ERROR):
+            manager.join_all()
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records, "expected an ERROR record for the failed graceful shutdown join"
+        assert not any(self._LEAK_MARKER in r.getMessage() for r in error_records), (
+            f"credential leaked into an ERROR record: {[r.getMessage() for r in error_records]}"
+        )
+
+    def test_task_join_error_is_scrubbed_in_log_and_raised_exception(self, caplog: pytest.LogCaptureFixture) -> None:
+        manager = WorkerManager()
+
+        mock_process = Mock(spec=multiprocessing.Process)
+        mock_process.join.side_effect = Exception(f"task join broken for postgres://u:{self._LEAK_MARKER}@h/db")
+        manager.tasks.append(mock_process)
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(Exception) as exc_info:
+                manager.join_all()
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records, "expected an ERROR record for the failed task join"
+        assert not any(self._LEAK_MARKER in r.getMessage() for r in error_records), (
+            f"credential leaked into an ERROR record: {[r.getMessage() for r in error_records]}"
+        )
+        assert self._LEAK_MARKER not in str(exc_info.value), (
+            f"credential leaked into the raised exception text: {exc_info.value}"
+        )
+
+
+class TestWorkerManagerIntegration:
+    """Integration tests for WorkerManager with multiple operations."""
+
+    def test_complete_workflow_with_process(self) -> None:
+        """Test complete workflow: create process, send command, poll results, join."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        # Create a mock worker process
+        target_func = _noop_target
+        process, cmd_queue, result_queue = manager.create_worker_process(cfw_uuid, target_func, ())
+
+        # Verify process is registered and started
+        assert cfw_uuid in manager.process_register
+        assert process in manager.tasks
+        assert result_queue in manager.result_queues_collection
+
+        # Send command
+        command = {"action": "test"}
+        manager.send_command(cfw_uuid, command)
+
+        # Simulate result - use a mock queue for reliable testing
+        step_uuid = uuid4()
+        mock_result_queue = MagicMock()
+        mock_result_queue.get.side_effect = [str(step_uuid), queue.Empty()]
+        manager.result_queues_collection.clear()
+        manager.result_queues_collection.add(mock_result_queue)
+
+        # Poll results
+        manager.poll_result_queues()
+        assert manager.is_step_done(step_uuid)
+
+        # Join all
+        manager.join_all()
+
+    def test_multiple_processes_for_different_cfws(self) -> None:
+        """Test managing multiple processes for different CFWs."""
+        manager = WorkerManager()
+
+        cfw_uuid1 = uuid4()
+        cfw_uuid2 = uuid4()
+
+        target_func = _noop_target
+
+        # Create two processes
+        process1, cmd_queue1, result_queue1 = manager.create_worker_process(cfw_uuid1, target_func, ())
+        process2, cmd_queue2, result_queue2 = manager.create_worker_process(cfw_uuid2, target_func, ())
+
+        # Verify both are registered separately
+        assert len(manager.process_register) == 2
+        assert len(manager.tasks) == 2
+        assert len(manager.result_queues_collection) == 2
+
+        # Verify we can retrieve each independently
+        retrieved1 = manager.get_process_queues(cfw_uuid1)
+        retrieved2 = manager.get_process_queues(cfw_uuid2)
+
+        assert retrieved1 is not None
+        assert retrieved2 is not None
+        assert retrieved1[0] == process1
+        assert retrieved2[0] == process2
+
+    def test_mixed_threads_and_processes(self) -> None:
+        """Test managing both threads and processes together."""
+        manager = WorkerManager()
+
+        # Add threads
+        mock_thread1 = Mock(spec=threading.Thread)
+        mock_thread2 = Mock(spec=threading.Thread)
+        manager.add_thread_task(mock_thread1)
+        manager.add_thread_task(mock_thread2)
+
+        # Add process
+        cfw_uuid = uuid4()
+        target_func = _noop_target
+        process, cmd_queue, result_queue = manager.create_worker_process(cfw_uuid, target_func, ())
+
+        # Verify all are tracked
+        assert len(manager.tasks) == 3
+        assert mock_thread1 in manager.tasks
+        assert mock_thread2 in manager.tasks
+        assert process in manager.tasks
+
+        # Join should handle both types
+        manager.join_all()

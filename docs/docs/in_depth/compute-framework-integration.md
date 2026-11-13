@@ -1,0 +1,444 @@
+# Feature Group Compute Framework Integration
+
+## Overview
+
+One of mloda's key strengths is its ability to decouple feature definitions from specific computation technologies. This document explains how feature groups integrate with different compute frameworks.
+
+## Core Concepts
+
+### Compute Framework Specification
+
+Feature groups specify which compute frameworks they support through the `compute_framework_rule` method:
+
+```py
+@classmethod
+def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+    """Define the compute frameworks this feature group supports."""
+    return {PandasDataFrame}  # Support only Pandas
+    # Or return True to support all available compute frameworks
+```
+
+### Declaring an Operation Unsupported on a Framework
+
+`compute_framework_rule` is a static, class-level set: it cannot say "this
+feature group runs on SQLite in general, but *this particular operation* is
+unsupported there." For that, override `supports_compute_framework`, a
+per-feature hook evaluated at match time:
+
+```py
+@classmethod
+def supports_compute_framework(cls, feature_name, options, compute_framework, *, part=None) -> bool:
+    """Reject an operation on a specific framework. Default returns True."""
+    if compute_framework is SqliteFramework and is_median_op(feature_name, options):
+        return False  # median is unsupported on SQLite
+    return True
+```
+
+Returning `False` removes that framework from the candidate set **for this
+feature only**:
+
+- If another framework can still run the operation, the matcher routes around
+  the rejected one silently (no error).
+- If the only remaining candidate is the rejected framework (for example, the
+  user pinned the feature to it), resolution fails with the standard
+  "No feature groups found" error, which names the near-miss feature group and
+  why it dropped, one line per eliminated candidate under a
+  "Feature group(s) eliminated while matching '...'" block, e.g.
+
+```
+No feature groups found for feature name: 'X'.
+Feature group(s) eliminated while matching 'X':
+  - MedianFeatureGroup (compute framework pin): pinned compute framework 'SqliteFramework' is not among its supported ['DuckDBFramework', 'PandasDataFrame']
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+The rejected framework is named as a near-miss with its reason rather than
+vanishing into a generic "unknown feature" message. Prefer this hook over
+raising a generic error from inside `calculate_feature`: the rejection happens
+during planning rather than at compute time, and the message is built for you.
+
+The debug inspector `resolve_feature(name)` reflects the hook too, because it
+runs the **same matcher over the same candidate universe as the engine** (it
+delegates to `IdentifyFeatureGroupClass`). Its `ResolvedFeature` result carries
+`supported_compute_frameworks` and `unsupported_compute_frameworks` (evaluated
+under default options unless you pass `options=`, see
+[Discover Plugins](discover-plugins.md)).
+
+Two distinct gaps both resolve to `feature_group=None` rather than appearing
+runnable:
+
+- **Unsupported on every framework.** The feature matches a group, but
+  `supports_compute_framework` rejects every installed framework. Resolution
+  fails with the capability error above.
+- **Uninstalled framework.** The only framework a matching group declares is not
+  installed (its backend library is absent, so `is_available()` is `False`). The
+  candidate universe drops unavailable frameworks before matching, so the group
+  maps to an empty framework set and resolution fails closed with the ordinary
+  `No feature groups found for feature name: '<name>'.` error. It does **not**
+  read as runnable on a framework you cannot actually run.
+- **Install hint.** When a user names a framework in `compute_frameworks` or `output_framework`,
+  or pins it on a requested feature or an input feature, and it is unavailable, the error shows its `INSTALL_HINT` (for example
+  `pip install "my-plugin[backend]"`). Subclasses inherit it.
+
+### Declaring capability per subtype
+
+This section covers ordinary feature groups; operation groups declare it on their implementations (`supported`).
+
+Families with multiple subtypes declare per-backend capability as data
+instead of a hand-written `supports_compute_framework`.
+
+**The data provider** declares the dimension once with `SUBTYPES`:
+
+```py
+class RankFeatureGroup(FeatureChainParserMixin, FeatureGroup):
+    SUBTYPES = SubtypeDeclaration(
+        key="rank_type",
+        parametric_families={"ntile": "N-tile bucketing"},
+        supported={"PythonDictFramework": {"dense", "ordinal"}},
+    )
+    PREFIX_PATTERN = r".*__(?P<rank_type>[\w]+)_rank$"
+    PROPERTY_MAPPING = {
+        "rank_type": property_spec(
+            "Rank subtype.",
+            strict=True,
+            allowed_values={"dense": "Dense ranking", "ordinal": "Ordinal ranking"},
+        ),
+    }
+```
+
+Two shapes, enforced at class definition; a half declaration fails at import:
+
+- Shape A: `key` names a `PROPERTY_MAPPING` key with an enumerable value
+  space; `parametric_families` join the universe by family name.
+- Shape B (multi-axis families collapsed into one subtype id): declare the
+  universe explicitly with a resolver:
+
+```py
+def resolve_window(feature_name: str, options: Options) -> str | None:
+    return options.get("window_function")
+
+SUBTYPES = SubtypeDeclaration(universe={"median", "sum"}, resolver=resolve_window)
+```
+
+`supported` is a sparse per-framework override: frameworks absent from it
+keep the full universe. A key naming no declared framework is a silent no-op
+for matching but raises from `subtype_support_matrix()`, so a typo surfaces
+as `subtype_error` in the audit. The derived
+`supports_compute_framework` canonicalizes parametric instances (`ntile_2`
+becomes `ntile`) and gates declared subtypes by the declaration; undeclared
+subtypes and features without one stay open.
+
+**The data steward** audits capability via `subtype_support_matrix()`
+(supported subtypes per framework from `compute_framework_definition()`;
+empty for abstract bases; for an operation group read from its
+implementations) and `get_feature_group_docs()` (`subtype_key`, `subtypes`,
+`parametric_subtypes`, `subtype_support`, `subtype_error`). A
+hand-overridden `supports_compute_framework` (ordinary or operation group)
+yields no declared matrix and surfaces as `subtype_error`. An operation group's
+matrix is its implementations' `supported` intersected with the group's
+`SUBTYPES.supported`, whose keys are checked against the frameworks its loaded
+implementations serve; `accepts` narrows features at match time without
+showing there. `resolve_feature(name, options=...)` gives the exact answer.
+
+**The data user** sees the outcome on `resolve_feature(name, options=...)`:
+`subtype` (e.g. `ntile_2`) and `subtype_family` (`ntile`, parametric
+instances only).
+
+### Empty Results
+
+The contract is: a **final** requested feature must return a *schema-bearing*
+result, meaning at least one column. **Zero rows is a valid result; zero columns
+is not.** A filter that excludes every row, a join with no matches, or a time
+window with no events all return a well-typed frame with the right columns and
+no rows, and mloda passes these through unchanged.
+
+The error fires only when a final requested result carries *no schema at all*. If
+`calculate_feature` produces a result with no columns,
+`ComputeFramework.run_validate_output_features` raises:
+
+```
+EmptyResultError: Result carries no schema (no columns): <FeatureGroupClassName>. ...
+```
+
+`EmptyResultError` is a `ValueError` subclass and is importable from the public
+API: `from mloda.provider import EmptyResultError`. Intermediate feature groups
+(those whose output feeds another feature group rather than the caller directly)
+are never subject to this check, but an intermediate step must still return a
+column for every feature it computes.
+
+#### The schema-presence gate
+
+The guard detects a missing schema via the framework's existing
+`ComputeFramework.extract_column_names(data) -> set[str]` (a classmethod): an empty set
+means no schema, which is the error condition. Every framework already implements
+this off schema metadata, so it works on a zero-row frame and costs nothing extra
+(no row scan, collect, or count). No per-framework opt-in is needed when you
+implement a new compute framework, as long as `extract_column_names` returns the
+columns for a zero-row frame. Feature groups can call
+`<Framework>.extract_column_names(data)` without an instance to resolve available columns.
+
+There is one representational caveat. The schema-bearing frameworks (PyArrow,
+Pandas, Polars, DuckDB, SQLite, Spark, Iceberg) carry their schema as metadata
+even at zero rows, so a zero-row result keeps its columns and passes. The
+PythonDict framework represents data as a columnar `dict[str, list]`, where the
+schema is the set of keys and is present even at zero rows: `{"col": []}` is a
+valid schema-bearing zero-row frame, while `{}` (zero columns) is the only
+schema-less value. Emptiness is judged purely on schema presence, with no
+opt-in: a zero-column result raises `EmptyResultError` uniformly on every
+framework. One consequence: on a schema-less result (a zero-column frame),
+column selection returns the result as is, so a misspelled requested column on
+schema-less data does not produce a "column not found" error.
+
+#### Filter column validation
+
+`_validate_filter_columns` skips its column-presence and dtype checks only when
+the data is the schema-less empty result (in practice PythonDict's `{}`).
+Filtering an empty result is a no-op, so neither the column check nor row
+elimination has anything to do. Data on which the framework cannot see columns
+but that is not an empty result still fails the missing-filter-column check
+loudly.
+
+#### Undeclared column reads
+
+A `KeyError` from `calculate_feature`, or an exception for which a framework's
+`is_missing_column_error()` returns true (it must not raise), becomes a
+`ValueError` pointing at `input_features()`, with the original as `__cause__`.
+Code that caught the backend exception around `run_all` now gets that `ValueError`.
+Matched errors are translated from `calculate_feature` through final-filter validation and column-name resolution, so lazy plans failing on schema resolution are covered.
+
+Matched per framework:
+
+-   Polars (eager and lazy): `ColumnNotFoundError`, and an attribute read (`df.x`, Polars has no attribute column access); execution errors at the final collect are not translated.
+-   Pandas: `UndefinedVariableError` from `query` / `eval`, except local-variable references, and an attribute read (`df.x`).
+-   PyArrow and Iceberg: `ArrowInvalid` for an unmatched field reference.
+-   Iceberg native projection: pyiceberg's `Could not find column` error from `Schema.select`.
+-   DuckDB: `BinderException` for a column missing from the relation, and `MissingRelationColumnError`.
+-   SQLite: `OperationalError` for a missing column, and `MissingRelationColumnError`.
+-   Spark: `AnalysisException` with an `UNRESOLVED_COLUMN` condition, and an attribute read (`df.x`, `ATTRIBUTE_NOT_SUPPORTED`).
+-   PythonDict: only the `KeyError` path.
+
+Attribute reads exclude private names, method names, near-misses of a method name for names of six or more characters (such as `df.fliter`), and errors with a non-default message (e.g. a removed-API hint). Lazy Polars cannot check columns, so a declared column read as an attribute also gets the hint.
+
+A native Iceberg `scan(row_filter=...)` on a missing field is not translated: its pyiceberg error (`Could not find field with name ...`) carries no `KeyError` cause, so it cannot be told apart from other `ValueError`s.
+
+### Column name case sensitivity
+
+mloda matches column and feature names exactly (case-sensitive) in every lookup, match and presence check; engines that resolve names differently add the rules below.
+
+-   DuckDB and SQLite compare identifiers ignoring ASCII case only (`val` and `VAL` are one column; `é` and `É` are two), and mloda's checks for new and helper column names fold case the same way. A join, as-of merge, union, append, `from_arrow` or `from_dict` whose output names differ only in case, or repeat a name exactly, raises `ValueError`; rename one side upstream.
+-   On those engines, mask primitives, the `partition_by` / `order_by` columns of `with_row_number` / `window`, merge keys, as-of `by` and time columns, `select` names and SQLite `order` names must be exact column names. SQLite also accepts its `rowid` / `oid` / `_rowid_` pseudo-columns in `select`, `order`, `with_row_number` and `window`. Raw SQL fragments (`filter` conditions, `project` expressions, the `window` function, DuckDB `order`) bind through the engine and stay case-insensitive. On SQLite (Python 3.12+) a quoted unknown name there raises `no such column` like an unquoted one. On Python 3.11 it is still read as a string literal.
+-   Spark column resolution follows `spark.sql.caseSensitive` (default `false`, folding like Python's `str.lower`, Unicode included). The Spark as-of merge and adding a feature column in `transform` raise `ValueError` on names that collide under that setting; Spark joins, union and append are not checked. Spark as-of time columns must match exactly; other Spark lookups (keys, masks, filters) bind through Spark's resolver.
+
+### Row count for observability
+
+`ComputeFramework._row_count(self, data) -> int | None` supplies the row counts extenders read
+off `HookContext` (`rows_in`/`rows_out`) on the `FEATURE_GROUP_CALCULATE_FEATURE` and
+`INPUT_DATA_LOAD` hooks (see [Extender](../chapter1/extender.md)). The default,
+`HookContext.row_count(data)`, is a best-effort `len(data)` that already counts a columnar
+`dict[str, list]` by its first column, so `PythonDictFramework` needs no override. Override
+`_row_count` only when the native type's `__len__` is missing, wrong, or would materialize or
+query the data: `DuckDBFramework` and `SqliteFramework` both return `None` for their relation
+objects, since `len()` on either runs a real `COUNT(*)` query rather than reading metadata.
+
+### Timezone and unit validation (merge and filter engines)
+
+A custom compute framework's merge and filter engines can opt into the
+[comparison contract](comparison-contract.md), which rejects incompatible
+timezone/unit combinations in equi-joins, as-of joins, and datetime filter bounds.
+The guard is **opt-in**: set `provides_column_semantics = True` on your
+`BaseMergeEngine` / `BaseFilterEngine` subclass and implement
+`_column_semantics(data, column)` to report the column's native semantics. Leave the
+flag at its default `False` (for a framework with no temporal intent) and the guard
+is skipped entirely, so you are never forced to implement the hook. An engine that
+opts in but forgets the hook raises a clear error rather than silently skipping
+validation. As-of joins always require `_column_semantics` regardless of the flag,
+since ordered time columns are intrinsic to the operation.
+
+### Operation Groups: one group, one Implementation per framework
+
+An operation is written once as an `OperationFeatureGroup` (naming, options, input features) and served by one `Implementation` per compute framework. Both come from `mloda.provider`. `AggregatedFeatureGroup`, `TimeWindowFeatureGroup`, `MissingValueFeatureGroup`, `TextCleaningFeatureGroup`, `GeoDistanceFeatureGroup`, `ScalingFeatureGroup`, `EncodingFeatureGroup`, `SklearnPipelineFeatureGroup`, `ClusteringFeatureGroup`, `DimensionalityReductionFeatureGroup`, `NodeCentralityFeatureGroup` and `ForecastingFeatureGroup` are built this way.
+
+```py
+class MyOperation(OperationFeatureGroup):
+    ...  # naming, PROPERTY_MAPPING, input_features
+
+class PandasMyOperation(Implementation[MyOperation]):
+    feature_group = MyOperation
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def calculate(
+        cls, group: type[MyOperation], data: Any, features: FeatureSet, framework: ComputeFramework | None
+    ) -> Any:
+        ...  # group is the matched feature group class
+```
+
+An `Implementation[G]` serves both operation groups (`data` is the input frame) and source groups (`data` is the `SourceMatch`). `feature_group` must be `G` or a subclass of it; a mismatch raises `TypeError` at class definition.
+
+- **Framework set**: the frameworks that have an implementation (a framework subclass is served by its parent's implementation), intersected with `compute_framework_rule()`. A group with no implementation has no framework and never matches.
+- **Shared loop**: put the shared per-feature loop on the group as a classmethod that takes the per-framework pieces as keyword-only callables (`AggregatedFeatureGroup.aggregate(data, features, perform=..., add_column=..., columns=...)`). Each implementation's `calculate` hands its own methods over through the `group` it is called with, never through `cls.feature_group`, so a subclass of the group is served with its overrides. An `Implementation` subclass that leaves `calculate` abstract is ignored when implementations are loaded.
+- **Capability**: `supported` (a frozenset of subtypes, `None` means all) and the classmethod `accepts(feature_name, options, *, part=None)` (default `True`) decide whether an implementation can run a feature. A framework whose implementation rejects it is not a candidate for that feature. `subtype_support_matrix()` reflects the implementations' `supported` and the group's `SUBTYPES.supported`, but not `accepts`, so a restriction made in `accepts` (e.g. on a second option) does not show there; `resolve_feature(name, options=...)` gives the exact answer.
+- **Divergence**: `divergences` is a tuple of `Divergence` records (`mloda.provider`) for where the result differs from the group's reference contract. A record has a `kind` (`DivergenceKind.VALUE`, `TYPE`, `VARIANT` or `GAP`), a `cause` (`Cause`), a one-line `reason` (required unless the cause is `NOT_IMPLEMENTED`), and optional `subtypes` or `outputs` (not both; neither means the whole plugin; `outputs` names literal parts, never `*`). `VARIANT` needs a `variant` name and cause `OTHER` needs `docs`. A record applies when its subtype matches or, for `outputs`, when the feature is requested whole or for one of its parts. Every kind except `GAP` ranks the implementation below a matching one; `GAP` is only recorded. Implementations on a source group are not ranked. Divergence is declared, not detected from the data. A FeatureGroup declares `DIVERGENCES` with the same record; the planner does not rank by it. A group may set `CONTRACT_VERSION` (an int of at least 1) for the reference contract it follows; an operation group must, or `check_operation_group_shape` fails. The stamped, credential-scrubbed records and the version show on `PlanStep` (and so in `explain`), in the plan lock, on `HookContext` and on `FeatureGroupInfo`.
+- **Variants**: a group lists the variant names its contract allows in `VARIANTS`; a `VARIANT` record naming an unlisted variant fails at class definition. The default behavior is the reference: an Implementation that follows a variant is chosen only when the feature allows it with the group option `allow_variants` (a string or a collection of strings, forwarded to inputs like any group option). Without it that implementation is not a candidate; when it is the only fit (a framework or implementation pin) resolution fails at stage `rule variant`, and the error prints the `allow_variants` option to add. When several frameworks fit, the default-behavior one keeps the lead. A group's own `DIVERGENCES` `VARIANT` records are listed but not gated. An inherited Implementation that follows a variant the subclass does not list in `VARIANTS` cannot be allowed: it stays blocked and the error offers no option. A pin on a chained step that a variant blocks raises `ImplementationPinError` with the same reason, naming the options of the requested feature. The option is read from the group options only, not the context options.
+- **Loading**: an operation group's implementations are found by import, so call `PluginLoader.all()` (or import the implementation modules) before running.
+- **Contract**: the loop's keyword-only callables are the group's contract and mypy checks the `aggregate`, `window`, `impute`, `clean`, `measure`, `scale`, `encode`, `run_pipeline`, `cluster`, `reduce`, `centrality` or `forecast` call inside each implementation's `calculate`.
+
+### Choosing among implementations
+
+When several frameworks can run a step, the choice order is: frameworks the step must run on (pins, a single allowed framework), then an implementation that matches the reference contract before one that differs, then fewer conversions, then converting later, then the run's `compute_frameworks` list order, then the default order. The recorded reason says what happened:
+
+- `prefers a matching version`: a divergent implementation was skipped although it would otherwise have won.
+- `reads in place`: a source read from a connection in the collection costs one conversion when served off a framework that accepts that connection, so the work stays in the database ahead of list order.
+- `loads natively`: without a `compute_frameworks` list, a source whose group declares `neutral_type` pays one conversion off a framework that takes that type (or serves the group through an Implementation); a step such a source pulls onto its framework reports it too. `ApiDataFG` is a stock source declaring it.
+- `<reason>; runs a version that differs: skips NaN in sum`: the step runs a divergent implementation (only option, pinned, or no matching alternative). A reasonless `NOT_IMPLEMENTED` record reads `not implemented`.
+
+### Pinning an implementation
+
+```py
+Feature("sales__sum_aggr", implementation="PandasAggregation")
+Feature("sales__sum_aggr", implementation=PandasAggregation)
+Feature("x__sum_aggr__max_aggr", implementation=["PandasAggregation", "PyArrowAggregation"])
+```
+
+`implementation=` takes a class name (or `module:qualname`), an `Implementation` class, or a list of either. One entry pins every step of that group in the feature's chain; a list of N entries pins N steps of the same group in input order (inner step first). The pin is part of the feature's identity and is not passed to input features. In a feature config use the `implementation` key. Pinned steps get the reason `pinned`.
+
+An unknown name, a name shared by two loaded classes, an implementation that is disabled, denied or whose framework is unavailable, one that conflicts with `compute_framework=`, a wrong entry count, or two requests pinning one step differently raises `ImplementationPinError` (a `ValueError`) naming the feature and the class.
+
+### Migrating from per-framework classes
+
+- `PandasAggregatedFeatureGroup`, `PyArrowAggregatedFeatureGroup` and `PolarsLazyAggregatedFeatureGroup` are replaced by `AggregatedFeatureGroup` with `PandasAggregation`, `PyArrowAggregation` and `PolarsLazyAggregation`.
+- The per-framework time window, missing value, text cleaning, geo distance and sklearn scaling, encoding and pipeline classes are replaced by `TimeWindowFeatureGroup` (`PandasTimeWindow`, `PyArrowTimeWindow`), `MissingValueFeatureGroup` (`PandasMissingValueImputation`, `PyArrowMissingValueImputation`, `PythonDictMissingValueImputation`), `TextCleaningFeatureGroup` (`PandasTextCleaning`, `PythonDictTextCleaning`), `GeoDistanceFeatureGroup` (`PandasGeoDistance`), `ScalingFeatureGroup` (`PandasScaling`), `EncodingFeatureGroup` (`PandasEncoding`) and `SklearnPipelineFeatureGroup` (`PandasSklearnPipeline`). The replaced sklearn classes are `PandasScalingFeatureGroup`, `PandasEncodingFeatureGroup` and `PandasSklearnPipelineFeatureGroup`. Artifact declaration, save and load stay on the group; an `Implementation` has no artifact hooks and reaches the artifact through the `FeatureSet`.
+- `PandasClusteringFeatureGroup`, `PandasDimensionalityReductionFeatureGroup`, `PandasNodeCentralityFeatureGroup` and `PandasForecastingFeatureGroup` are replaced by `ClusteringFeatureGroup` (`PandasClustering`), `DimensionalityReductionFeatureGroup` (`PandasDimensionalityReduction`), `NodeCentralityFeatureGroup` (`PandasNodeCentrality`) and `ForecastingFeatureGroup` (`PandasForecasting`). Names, options and results are unchanged, and forecasting artifacts saved before the move still load.
+- A subclass of one of these group bases that implemented the abstract methods for another framework now gets no framework: write an `Implementation[<group>]` for that framework instead.
+- Implementations are found by import: import the implementation modules or call `PluginLoader.all()`.
+- An allow or deny list that names an old class must name the group or the implementation instead.
+- Plan locks recorded before the move no longer match.
+- A subclass of an old per-framework class must subclass the group (or the implementation) instead.
+- Aggregations and time windows treat NaN like null on every framework: skipped, and not counted by `count`; time window first and last keep it.
+- Time window: a sum over no values gives 0 on Pandas and PyArrow, like aggregations (single-column windows used to give NaN on Pandas and null on PyArrow, and PyArrow multi-column rows NaN).
+- PythonDict text cleaning turns NaN into an empty string, like Pandas.
+- PyArrow and PythonDict imputation treat NaN as missing (skipped in statistics and filled) and break `mode` ties by the smallest value, like Pandas; string ties change too.
+- Grouped imputation leaves rows with a null or NaN group key out of every group: statistics fill them from the column, `ffill`/`bfill` leave them. PythonDict used to group those keys, and Pandas `ffill`/`bfill` erased their values. PythonDict now also treats NaT, `pd.NA`, numpy and Decimal NaN as missing, in keys and values.
+- PyArrow `std` and `var` windows use the sample statistic like Pandas, so a one-row window is null for a single column and NaN for a multi-column feature.
+- `feature_group="<old per-framework class>"` becomes `implementation="<implementation>"`, or `compute_framework=...`, for every moved family.
+- A steward disables one implementation with `PluginCollector.add_disabled_implementation_classes`.
+- A provider overrides a step in one of three places. On an implementation subclass (the most derived implementation for a group and framework serves it): the computation (for example `_perform_aggregation`, `_perform_window_operation`, `_perform_imputation`, `_apply_operation`, `_calculate_distance`, `_extract_training_data`, `_apply_scaler`, `_apply_encoder`, `_apply_pipeline`, `_perform_clustering`, `_perform_reduction`, `_calculate_centrality`, `_perform_forecasting`), `_add_result_to_data` (the loop's `add_column`), and `calculate` for any other callable it passes, such as `column_semantics`. On a `ComputeFramework` subclass: `extract_column_names` (the `columns` callable of `aggregate`, `window`, `impute`, `cluster` and `forecast`, the loops that resolve `~` multi-column sources), seen only by runs on that framework. On a group subclass: the loop (`aggregate`, `window`, `impute`, `clean`, `measure`, `scale`, `encode`, `run_pipeline`, `cluster`, `reduce`, `centrality`, `forecast`). Core checks every declared input before `calculate_feature`, so the loops do not check source columns themselves.
+
+## Framework Selection Process
+
+mloda picks one compute framework per step group (the features of one FeatureGroup that run as one step) in one planning step, before link joins are resolved.
+
+- **Allowed set**: the framework must fit the FeatureGroup (`compute_framework_rule`, `supports_compute_framework`), any pin via `Feature(compute_framework=...)`, and the run's enabled frameworks.
+- **Connection skip**: a `REQUIRED` framework (DuckDB, SQLite) is a candidate for a feature, roots included, when the DataAccessCollection resolves a connection for it: by the feature's `connection_handle` option, or as the single matching connection. Two matching connections without a handle drop it, with a reason naming the handles. A non-root feature can also use the connection a parent carries, so the framework is kept when every parent can run on it; parents carrying different connections keep the step off that framework. Connections come only from the DataAccessCollection. A connection alone does not select DuckDB or SQLite: pin the feature or restrict the run with `compute_frameworks=[DuckDBFramework]`. A source read from that connection (`DuckdbFG`) is the exception, see `reads in place` below.
+- **Bound connection**: the resolved connection is bound to every step that needs it, roots included. Parents on two different handles never share a DuckDB or SQLite consumer; a consumer pinned or restricted to that framework fails at planning naming both handles.
+- **Joins**: a link's child runs on one of its two sides. RIGHT joins run on the right side's framework, unless the consumers cannot run there, then on the left side's (only for links joining two different FeatureGroups). APPEND and UNION on the left. Children of one link agree on the side.
+- **Filters**: a filter pinned to a framework moves its host feature onto that framework.
+- **Conversions**: a transformer chain must exist between every parent and child on different frameworks.
+- **Choice among valid plans**: lowest cost first (one point per conversion, plus one point when a source read from a connection in the DataAccessCollection runs off a framework that accepts that connection, ranked before any conversion; reason `reads in place`; without a `compute_frameworks` list, a source group declaring `neutral_type` likewise pays one conversion off a framework that takes that type or serves the group through an Implementation, reason `loads natively`; with a list, its order decides), then the plan that converts later (a conversion deeper in the feature graph, by longest path from a root, of the features that convert, or at the end into `output_framework`), then the order of the run's `compute_frameworks` list, then the default order. The default order puts Pandas, Polars, PyArrow before `SELF_MANAGED` frameworks (Spark, Iceberg), before `REQUIRED` ones (DuckDB, SQLite), then class name.
+- **Reason**: each step records why it got its framework: `pinned`, `only allowed framework`, `rules exclude preferred frameworks`, `saves N conversion(s)`, `converts later`, `reads in place`, `loads natively`, `your list order` or `default order`. "saves N conversions" counts the conversions added by moving only that step to a preferred framework. Frameworks dropped for the step's connection or file source follow as `<Framework>: <why>` clauses, separated by `; `.
+- **Plans equal in cost and lateness**: blocks are settled in a fixed order (by FeatureGroup and feature names), each taking the most preferred framework still possible.
+- **Both ways**: a Polars-only consumer pulls its unrestricted source onto Polars, and a Polars-only source pulls its unrestricted consumers, so no transform step is needed.
+- **No valid plan**: planning raises an error naming the features and their allowed sets.
+
+List order is a tie-break after cost, not "first listed wins". To force a framework, pin the feature or restrict the run's list.
+
+`Feature.get_compute_framework()` returns the chosen framework. On a feature that allows several frameworks and was never planned, it raises.
+
+Framework authors declare the connection rule by overriding `connection_requirement()` (default `ConnectionRequirement.NONE`). A `REQUIRED` framework also overrides `connection_of(data)` to return the connection its native data carries, so a step after a parent on the same framework needs no connection of its own.
+
+## Appending Results
+
+Override `_append_columns(data, columns)` to append a non-root dict result to the frame. The default returns `None`, which replaces the frame. Frameworks holding a lazy plan with unstable row order override the classmethod `_positional_append_needs_pinned_frame` to return `True`, which appends only onto a frame mloda built itself.
+
+A single returned column (a list or Series) follows the same rule: on such a framework `transform` raises a `ValueError` naming the feature unless the frame is pinned. The fix is to return the column inside the frame the feature group received, in the framework's own data type. A frame counts as pinned when it was built from a dict, converted by a transformer in a step or at a framework transfer, appended onto a pinned frame, filtered from one, or passed unchanged through a same-framework hop from a pinned frame. The output of a framework's own `transform()` for a non-native result is treated as pinned too, so it must not reorder rows. A feature group that returns its own native frame leaves it unpinned for the next feature group on that frame.
+
+## Data Transformation
+
+When data needs to move between compute frameworks:
+
+1. The `transform` method converts data between frameworks
+2. Each framework defines how to transform data to and from other frameworks
+3. The system automatically handles these transformations when needed
+
+For more details on how data transformation works between compute frameworks, see [Framework Transformers](framework-transformers.md).
+
+## Framework Notes
+
+- **DuckDB**: a step gets its connection from the DataAccessCollection (select one with the `connection_handle` option), or from the relation its parents hand in; a connection object in a feature option raises at planning. mloda validates it and pins its session timezone to UTC but never opens or closes it. A transform into DuckDB or SQLite needs a matching connection in the DataAccessCollection, otherwise planning (prepare, explain, run_all) fails with an error naming the step. An `output_framework` of DuckDB or SQLite needs one only when a requested step runs on another framework and its result is converted. mloda reuses the supplied connection for its lazy relations without per-thread cursors, and the live connection cannot cross a process boundary. It runs in SYNC mode only, so its steps stay in the parent process under a MULTIPROCESSING run.
+- **SQLite**: mloda registers a `REGEXP` function and, on Python 3.12+ with SQLite 3.29+, turns off double-quoted string literals for DML on the connection it is given. The setting persists on that connection after the run, so SQL run on it afterwards, including existing views, must use single-quoted string literals. Python 3.11 keeps SQLite's default. mloda reuses the supplied connection, which Python's default `check_same_thread=True` restricts to its creating thread; the live connection also cannot cross a process boundary, so SQLite steps run in SYNC mode only.
+- **Spark**: requires PySpark 4.0+ and a Java 17+ runtime (`JAVA_HOME`). mloda can auto-create a local `SparkSession`; for production, supply a configured one through the data access collection. The session stays in the parent process, so Spark steps run in SYNC or THREADING mode, never in a multiprocessing worker; Spark's own distributed processing covers scale-out.
+- **Iceberg**: needs a catalog supplied through the data access collection. The catalog stays in the parent process, so Iceberg steps run in SYNC or THREADING mode, never in a multiprocessing worker.
+
+A run requesting only `{ParallelizationMode.MULTIPROCESSING}` drops these frameworks at setup; a run left with no usable framework, or a feature pinned to a dropped one, raises. Request `{SYNC, MULTIPROCESSING}` or `{THREADING, MULTIPROCESSING}` to combine them with worker-dispatched frameworks.
+
+## SQL Relation Helpers (DuckDB / SQLite)
+
+The DuckDB and SQLite frameworks expose a relation object (`DuckdbRelation`, `SqliteRelation`) inside `calculate_feature`. Both share the same helper surface so a feature group can be written once against either.
+
+### Result type
+
+A requested feature computed on DuckDB or SQLite comes back as a `pa.Table`, fetched in full when the result is selected. With `output_framework=DuckDBFramework` or `output_framework=SqliteFramework`, a step that ran on that framework returns the relation it computed, on the connection the step used. The relation is lazy: every read runs the query again, the connection must stay open, and SQLite leaves one temporary view on it. A result converted from another framework is loaded as a new relation onto the matching connection in the DataAccessCollection. A run whose requested steps all run on the output framework needs no such connection.
+
+Framework authors: `select_native_data_by_column_names` returns the selection in the framework's own type (the default delegates to `select_data_by_column_names`). A framework whose `select_data_by_column_names` returns another framework's data type must also override `result_framework()` to name that framework. With that framework as `output_framework`, a run calls `select_native_data_by_column_names` instead of `select_data_by_column_names`, so a subclass that customizes one should customize the other.
+
+### Reading column types
+
+The `.types` property returns column types aligned with `.columns`. The element type differs by backend:
+
+- `DuckdbRelation.types` returns DuckDB-native dtype objects.
+- `SqliteRelation.types` returns PyArrow `pa.DataType` objects (from propagated hints, falling back to SQLite affinity inference).
+
+```py
+relation.columns   # ["user_id", "amount"]
+relation.types     # backend-specific dtype objects, same order as columns
+```
+
+`SqliteRelation.to_arrow_table()` types a column by its propagated hint, else by its non-null values (int and float mixed gives float64, any other mix gives string, with numbers as text).
+A computed column without a non-null value takes the type its SQL expression yields for two placeholder rows, so its type is the same with and without rows unless the expression's type depends on the values; a projection reading `rowid` cannot be probed and is string.
+A relation mloda did not build falls back to the declared column affinity when it has no rows. In a table, a typeless or `NUMERIC`-affinity column (`NUMERIC`, `DECIMAL`, `BOOLEAN`, `DATE`) is then string, like an all-null column; with rows, its values decide. The relation's `select`, `filter`, `limit`, `order`, `join`, and `append_columns` results keep these types, as do union, append, and as-of merge results. Any other view reports the affinity SQLite gives its columns, so a typeless column there is large_binary when it has no rows.
+A column Arrow cannot build (for example bytes that are not UTF-8 in a text column, or text that is not a date in a date column) raises a `ValueError` naming it.
+
+### Window functions
+
+`with_row_number` appends a `ROW_NUMBER()` column; `window` appends an arbitrary window expression. Rows keep their input order. Both quote every identifier and raise `ValueError` if the new `alias` collides with an existing column (the comparison ignores ASCII case) or if a `partition_by` / `order_by` column is not an exact column name.
+
+```py
+from mloda_plugins.compute_framework.base_implementations.sql.sql_window import (
+    OrderBy,
+    WindowFrame,
+    Preceding,
+    CurrentRow,
+)
+
+# ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts)
+ranked = relation.with_row_number(
+    "rn",
+    partition_by=["user_id"],
+    order_by=[OrderBy("ts")],
+)
+
+# SUM(amount) OVER (PARTITION BY user_id ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+rolling = relation.window(
+    "SUM(amount)",
+    "amount_rolling",
+    partition_by=["user_id"],
+    order_by=[OrderBy("ts")],
+    frame=WindowFrame(kind="rows", start=Preceding(2), end=CurrentRow()),
+)
+```
+
+`order_by` accepts plain column-name strings or `OrderBy(column, descending=..., nulls="first"|"last")`. The `func` passed to `window` is inlined verbatim as raw SQL, so never build it from user-controlled input.
+
+!!! warning "SQLite version requirement"
+    On SQLite, `with_row_number` and `window` require SQLite >= 3.28.0; using `NULLS` placement in `order_by` additionally requires SQLite >= 3.30.0. Both raise `ValueError` on older runtimes. DuckDB has no such gate.
+
+## Testing
+
+Use `assert_compute_framework_shape` (or `check_compute_framework_shape`) from `mloda._testing.compute_framework_shape` to verify a framework. The constructor must work with no arguments and accept a `uuid=` keyword, keeping it as `.uuid`. Accessors are skipped when `is_available()` is False, `applicable_aspects` lists which of filter, mask and merge it serves, and dtype is not covered.
+
+### Pipeline result policies
+
+A pipeline result policy is a rule or FeatureGroup-level flag that changes how the pipeline treats a result. It ships a suite on `RunAllSuite` from `mloda._testing.compute_framework.run_all_suite`, covering every built-in framework in SYNC plus THREADING; a framework without THREADING declares `sync_only_reason` on its adapter. Each case is a `PolicySuccess` or a `PolicyRaises`. `EmptyResultRunAllSuite` is the worked example, and a host only sets `adapter_class`.
+
+Drive the policy through `run_all` rather than testing one enforcement surface: the retired `allow_empty_result()` flag had three, and the one in `DataLifecycleManager.get_result_data` shipped broken while unit tests of the other two passed, and only the full `run_all` on every framework and mode caught it. A framework adapter's `rows` / `row_count` must read the frame its framework's `run_all` returns.

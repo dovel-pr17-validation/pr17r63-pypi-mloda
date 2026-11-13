@@ -1,0 +1,246 @@
+"""HookContext: the delivery seam handed to Extender implementations.
+
+Pins the ambient current()/activate() scope, row_count's __len__ gating,
+and instrument's timing/status bookkeeping around a wrapped call.
+"""
+
+import functools
+import threading
+import time
+from collections.abc import Callable, Mapping
+from contextvars import ContextVar, Token
+from dataclasses import FrozenInstanceError, dataclass
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+from mloda.core.abstract_plugins.components.credential_grant import read_recorder
+from mloda.core.abstract_plugins.components.credential_scrub import redact_escaping_exception
+from mloda.core.abstract_plugins.components.divergence import Divergence
+from mloda.core.abstract_plugins.components.declared_attributes import scalar_attributes
+from mloda.core.abstract_plugins.components.failed_rows import FailedRows, current_failed_rows_collector
+from mloda.core.abstract_plugins.components.read_only_dict import _frozen_dict
+from mloda.core.abstract_plugins.components.utils import safe_field
+from mloda.core.abstract_plugins.components.var_scope import VarScope
+from mloda.core.abstract_plugins.components.validators.missing_input_validator import InputCheck
+from mloda.core.abstract_plugins.function_extender import ExtenderHook
+
+if TYPE_CHECKING:
+    from mloda.core.abstract_plugins.components.input_data.claim_route import DataAccessReader
+    from mloda.core.abstract_plugins.components.link import AsOfJoinConfig
+
+_current_hook_context: ContextVar["HookContext | None"] = ContextVar("_current_hook_context", default=None)
+
+OutputSchema = tuple[tuple[str, str | None], ...]
+
+_WRITABLE_FIELDS = frozenset({"rows_out", "output_schema", "duration_seconds", "status"})
+
+_gate_scopes = 0
+_gate_scopes_lock = threading.Lock()
+_result_attributes_lock = threading.Lock()
+_in_gate_scope: ContextVar[bool] = ContextVar("mloda_in_input_data_load_gate_scope", default=False)
+
+
+class input_data_load_gate_scope:  # noqa: N801
+    """Count one active INPUT_DATA_LOAD gate calculation process-wide; a class so a frozen exception keeps its type."""
+
+    def __init__(self) -> None:
+        self._tokens: list[Token[bool]] = []
+
+    def __enter__(self) -> None:
+        global _gate_scopes
+        with _gate_scopes_lock:
+            _gate_scopes += 1
+        self._tokens.append(_in_gate_scope.set(True))
+
+    def __exit__(self, exc_type: object, exc: BaseException | None, tb: object) -> None:
+        global _gate_scopes
+        _in_gate_scope.reset(self._tokens.pop())
+        with _gate_scopes_lock:
+            _gate_scopes -= 1
+
+
+def carried_gate_scope(active: bool) -> VarScope[bool]:
+    """Set the context-scoped gate flag for a worker block, leaving the process-wide count alone."""
+    return VarScope(_in_gate_scope, active)
+
+
+def in_input_data_load_gate_scope() -> bool:
+    """True inside a gated calculation in this context, including work nested under it."""
+    return _in_gate_scope.get()
+
+
+def input_data_load_gate_scopes_active() -> int:
+    with _gate_scopes_lock:
+        return _gate_scopes
+
+
+@dataclass(kw_only=True)
+class HookContext:
+    """Ambient, per-call context describing an Extender hook invocation."""
+
+    hook: ExtenderHook
+    feature_group_class: str | None
+    feature_group_version: str | None
+    plugin_version: str | None = None
+    feature_names: tuple[str, ...] = ()
+    specialized_from: tuple[str, ...] = ()
+    input_features: frozenset[str] | None = None
+    input_feature_edges: dict[str, tuple[str, ...]] | None = None
+    input_check: InputCheck | None = None
+    compute_framework_name: str | None
+    rows_in: int | None = None
+    rows_out: int | None = None
+    output_schema: OutputSchema | None = None
+    duration_seconds: float | None = None
+    status: str | None = None
+    run_id: str | None = None
+    plan_id: str | None = None
+    structure_hash: str | None = None
+    step_uuid: UUID | None = None
+    data_access_identity: str | None = None
+    data_access_identity_is_fallback: bool | None = None
+    tenant_id: str | None = None
+    project_id: str | None = None
+    principal: str | None = None
+    carrier: dict[str, str] | None = None
+    worker_index: int | None = None
+    data_access_format: str | None = None
+    data_access_dataset_version: str | None = None
+    data_access_loader: str | None = None
+    implementation: str | None = None
+    implementation_version: str | None = None
+    divergences: tuple[Divergence, ...] = ()
+    contract_version: int | None = None
+    allowed_variants: tuple[str, ...] = ()
+    join_type: str | None = None
+    join_keys: tuple[str, ...] | None = None
+    asof_config: "AsOfJoinConfig | None" = None
+    join_left_feature_group: str | None = None
+    join_right_feature_group: str | None = None
+    plan_feature_count: int | None = None
+    plan_node_count: int | None = None
+    plan_depth: int | None = None
+    declared_attributes: dict[str, str | int | float | bool] | None = None
+    reader_class: "DataAccessReader | None" = None
+    result_attributes: dict[str, str | int | float | bool] | None = None
+    failed_rows: tuple[FailedRows, ...] = ()
+    credential_handles: tuple[str, ...] = ()
+    bound_credential_handle: str | None = None
+    credentials_read: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Hand-built contexts get the same portable-scalar guarantee publish_result_attributes gives the dispatch path.
+        if self.result_attributes is not None:
+            self.result_attributes = _frozen_dict(
+                scalar_attributes(self.result_attributes, "result_attributes", "must be a Mapping")
+            )
+        if self.declared_attributes is not None:
+            self.declared_attributes = _frozen_dict(
+                scalar_attributes(self.declared_attributes, "declared_attributes", "must be a Mapping")
+            )
+        # Copy on ingest so a hook mutating the carrier or input_feature_edges never reaches the caller's dict.
+        if self.carrier is not None:
+            self.carrier = _frozen_dict(self.carrier)
+        if self.input_feature_edges is not None:
+            self.input_feature_edges = _frozen_dict(self.input_feature_edges)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if self.__dict__.get("_sealed") and name not in _WRITABLE_FIELDS:
+            raise FrozenInstanceError(f"cannot assign to field {name!r}")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if self.__dict__.get("_sealed"):
+            raise FrozenInstanceError(f"cannot delete field {name!r}")
+        object.__delattr__(self, name)
+
+    @staticmethod
+    def row_count(data: Any) -> int | None:
+        """Return len(data) when the TYPE declares __len__; a dict counts its first column's rows
+        (a scalar str/bytes or a nested dict first value is not a column).
+        """
+        if isinstance(data, dict):
+            if not data:
+                return 0
+            first = next(iter(data.values()))
+            if isinstance(first, (str, bytes, dict)):
+                return None
+            return HookContext.row_count(first)
+        if callable(getattr(type(data), "__len__", None)):
+            return len(data)
+        return None
+
+    @classmethod
+    def current(cls) -> "HookContext | None":
+        """Return the HookContext active in the current activate() scope, else None.
+
+        Thread-scoped: a contextvars variable, invisible to another thread unless it shares the copied context.
+        """
+        return _current_hook_context.get()
+
+    @classmethod
+    def publish_result_attributes(cls, attributes: Mapping[Any, Any]) -> None:
+        """Merge validated scalar attributes into the current context's result_attributes; no-op without one."""
+        validated = scalar_attributes(attributes, "result_attributes", "must be a Mapping")
+        current = cls.current()
+        if current is None:
+            return
+        with _result_attributes_lock:
+            merged = _frozen_dict({**(current.result_attributes or {}), **validated})
+            object.__setattr__(current, "result_attributes", merged)
+
+    def activate(self) -> VarScope["HookContext | None"]:
+        """Make this instance the current() context for the scope, restoring the previous one on exit."""
+        return VarScope(_current_hook_context, self)
+
+
+def _no_schema(data: Any) -> OutputSchema | None:
+    """output_schema stand-in for hooks whose return value carries no schema semantics."""
+    return None
+
+
+def _no_rows(data: Any) -> int | None:
+    """row_count stand-in for hooks whose return value carries no row semantics."""
+    return None
+
+
+def instrument(
+    context: HookContext,
+    func: Callable[..., Any],
+    row_count: Callable[[Any], int | None] = HookContext.row_count,
+    output_schema: Callable[[Any], OutputSchema | None] = _no_schema,
+) -> Callable[..., Any]:
+    """Wrap func, updating context.status/duration_seconds/rows_out/output_schema around the call."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        context.rows_out = None
+        context.output_schema = None
+        object.__setattr__(context, "result_attributes", None)
+        object.__setattr__(context, "failed_rows", ())
+        object.__setattr__(context, "credentials_read", ())
+        collector = current_failed_rows_collector()
+        seen = 0 if collector is None else len(collector.entries)
+        succeeded = False
+        start = time.perf_counter()
+        with read_recorder() as reads:
+            try:
+                # Mask here, the innermost wrap, so no extender sees a registered credential in the exception.
+                with redact_escaping_exception():
+                    result = func(*args, **kwargs)
+                succeeded = True
+            finally:
+                context.duration_seconds = time.perf_counter() - start
+                context.status = "success" if succeeded else "error"
+                object.__setattr__(context, "credentials_read", tuple(sorted(set(reads))))
+                if collector is not None:
+                    object.__setattr__(context, "failed_rows", tuple(collector.entries[seen:]))
+        context.rows_out = safe_field(lambda: row_count(result), None)
+        context.output_schema = safe_field(lambda: output_schema(result), None)
+        return result
+
+    if hasattr(func, "__self__"):
+        wrapper.__self__ = func.__self__  # type: ignore[attr-defined]
+
+    return wrapper
