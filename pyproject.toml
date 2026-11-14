@@ -58,7 +58,7 @@ test = [
 # Every group that pulls in pyarrow needs >=14.0.1 (CVE-2023-47248).
 pyarrow = ["pyarrow>=14.0.1"]
 pandas = ["pandas"]
-polars = ["polars>=1.21"]
+polars = ["polars>=2.1.0"]
 numpy = ["numpy"]
 yaml = ["pyyaml"]
 # DuckDB 1.x and 2.x are supported; the duckdb1 tox env covers 1.x.
